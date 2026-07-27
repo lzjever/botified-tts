@@ -248,6 +248,14 @@ cancel、engine error 或客户端发送失败时不得提交未完整生成的 
 - 服务层 request/session ID 不进入 Nano 公共模型协议。
 - 服务使用一个进程内 admission counter，最多接纳 16 个 HTTP 合成请求或
   WebSocket session；Nano `max_num_seqs=16` 只控制执行 batch，不承担入口限流。
+- `VoxCPMEngine.wait_for_fatal()` 只委托 Nano AsyncPool 的同名公开接口，不轮询
+  health，不读取 Nano 私有字段。
+
+顶层 runtime supervisor 同时监督 HTTP serve task 和
+`VoxCPMEngine.wait_for_fatal()`。Nano fatal 时先撤销 ready，再请求 HTTP server
+有界停服，最后重新抛出 `RuntimeError` 使进程非零退出。正常 shutdown 取消
+fatal waiter 后关闭 engine 并正常返回。不能只创建一个无人 await 的 background
+task，因为 task exception 本身不会可靠终止服务进程。
 
 ### 5.3 `VoiceStore`
 
@@ -419,10 +427,11 @@ ready 时：
 }
 ```
 
-服务只在 CUDA preflight、模型加载和 warmup 成功后开始接受请求，因此
-`/health` 只返回 ready `200`。preflight 或模型加载失败时记录稳定错误码并退出，
-不启动一个专门返回 `503` 的后台状态服务。deploy 脚本通过容器退出或 health
-timeout 判断启动失败。
+服务只在 CUDA preflight、模型加载和 warmup 成功后开始接受请求。正常运行时
+`/health` 返回 ready `200`；runtime fatal 一经发现就撤销 ready 并开始有界
+停服，在退出窗口不得继续返回 ready。preflight 或模型加载失败时记录稳定错误码
+并退出，不启动一个长期返回 `503` 的后台状态服务。deploy 脚本通过容器退出或
+health timeout 判断启动失败。
 
 Nano `wait_for_ready()` 不包含首次 generation compile；warmup 必须实际完成一条
 固定短文本生成并丢弃结果，不能只等待 worker ready。
@@ -782,7 +791,10 @@ Botified 维护一个固定 commit 的最小 fork，只允许以下五项改动�
    cancel 到达实际 child request。
 4. child `srv.step()` exception 发出 fatal event 后退出；parent 同时监视 child
    意外退出。两条路径都设置唯一 fatal state，使 active streams、pending
-   operations 和后续 submit 有界失败。
+   operations 和后续 submit 有界失败。AsyncServer 使用同一个 sticky
+   `asyncio.Event` 公开 `wait_for_fatal() -> NoReturn`：fatal 前等待，fatal 后
+   立即抛出保存的 `RuntimeError`；normal stop 不触发。AsyncPool 公开同名接口，
+   使用 `FIRST_COMPLETED` 等待任一 child fatal，并清理其余 waiter。
 5. 从 fork `pyproject.toml` 删除 runtime/tests/deployment 均未使用的
    `torchcodec`，并删除 `.github/workflows/ci.yml` 中只为它存在的 version
    字段、安装步骤和 matrix 维度。
@@ -799,12 +811,15 @@ Nano cancel 在当前 engine step 结束后的命令处理边界生效即可接�
 fatal 不是 completion 或可恢复的 stream event。Nano 让 async generator 抛出
 `RuntimeError`；服务对当前客户端 best-effort 映射 `engine_error` 后进入 fatal
 状态并非零退出，由容器 restart policy 重启。Nano 内不 restart worker，不做
-retry、fallback 或故障迁移。
+retry、fallback 或故障迁移。宿主只 await 公开的 `wait_for_fatal()`；不轮询
+health，不读取 `_fatal_error`、`recv_task` 或 `servers`，不增加 callback。
 
-fork 的 focused tests 只证明两项本项目新增行为：关闭 AsyncPool outer stream
-确实关闭 inner stream；step exception/child exit 会使 active、pending 和后续
-submit 全部有界失败。cancel 的实际 child 释放只在同一份真实 GPU smoke 中验证，
-不再复制等价测试。
+fork 的 focused tests 只证明本项目新增的边界行为：关闭 AsyncPool outer stream
+确实关闭 inner stream；step exception/child exit 会使 active、pending、后续
+submit 和 fatal waiter 全部有界失败。waiter 同时覆盖 fatal 前等待、fatal 后
+立即失败、AsyncPool 任一 child fatal 和 normal stop 不误报。cancel 的实际
+child 释放和 idle child kill 只在同一份真实 GPU 部署 smoke 中各验证一次，不再
+复制等价测试。
 
 fork 不包含：
 
@@ -1098,6 +1113,10 @@ HTTP 状态固定为：
 - 输入、queue 和 session 上限触发固定错误并释放 session。
 - CUDA preflight 失败时模型下载/加载函数没有被调用。
 
+Nano fork 的 focused unit tests 覆盖 `wait_for_fatal()` 的 wait-before-fatal、
+fatal-before-wait、AsyncPool 任一 child fatal，以及 normal stop 不触发 fatal。
+不在本项目重复模拟 Nano queue、process watcher 或 scheduler。
+
 ### 16.2 API 集成测试
 
 使用一个最小 fake Nano adapter，只验证本项目协议：
@@ -1107,6 +1126,8 @@ HTTP 状态固定为：
 - 生成期间仍可接收 append。
 - cancel 停止当前任务并清空队列。
 - 慢客户端触发有界失败而不是无限缓存。
+- idle 状态下 fake Nano fatal 无需下一请求即可使顶层 runner 撤销 ready 并抛错；
+  正常 shutdown 取消 waiter 并正常返回。
 
 fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部过程。
 
@@ -1123,8 +1144,9 @@ fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部
 7. WebSocket 增量文本；
 8. 两个以上 segment 的 continuation；
 9. AsyncPool outer `aclose()` 后 cancel 到达 child，且下一请求正常；
-10. RTF 小于 1；
-11. 每个音频 chunk 均为 7680 samples，输出频率为 6.25/s。
+10. 服务 idle 时终止 Nano child，无需下一请求即撤销 ready 并非零退出；
+11. RTF 小于 1；
+12. 每个音频 chunk 均为 7680 samples，输出频率为 6.25/s。
 
 不建设 8/16/32 并发矩阵、全语言矩阵、自动 WER/UTMOS 平台或 worker restart
 仿真。
@@ -1206,7 +1228,8 @@ botified-tts/
 - 使用第 11 节已验证的 full model target continuation，不保留 spoken-only
   分支；
 - 修复 AsyncPool outer→inner `aclose()` 后重新验证 cancel 到达 child；
-- 验证 step exception 和 child 意外退出均使 async 调用有界失败；
+- 验证 step exception 和 child 意外退出均使 async 调用有界失败，并可由公开
+  fatal waiter 在 idle 状态观测；
 - 测得 TTFB、RTF、实际 audio chunk 时长和显存占用。
 
 退出条件：
@@ -1215,7 +1238,7 @@ botified-tts/
 - continuation 无明显质量倒退；
 - controllable 与 faithful 模式行为和官方一致；
 - outer `aclose()` 能停止实际 child request；
-- child fatal 不留下悬挂 stream/future，服务随后非零退出；
+- child fatal 不留下悬挂 stream/future，active 或 idle 时服务随后均非零退出；
 - 对 Nano fork 的改动不超出第 12.2 节。
 
 如果 continuation 验证失败，先解决或明确模型限制，不用 crossfade、回滚状态机
@@ -1228,6 +1251,7 @@ botified-tts/
 - canonical schema；
 - VoiceStore；
 - SpeechService 与 Nano adapter；
+- 顶层 HTTP/fatal runtime supervisor；
 - segmenter 和 continuation；
 - `/health`、voice 创建/列表/删除、`POST /v1/speech`；
 - WebSocket；
@@ -1239,6 +1263,7 @@ botified-tts/
 - HTTP 和 WebSocket 共用同一核心；
 - 任意 text chunk 粒度不丢字不重字；
 - cancel 和慢客户端有界；
+- idle Nano fatal 无需下一请求即可使 runner 失败；
 - 单元与 API 集成测试通过。
 
 ### Phase 2：部署与 Botified 交付
@@ -1286,8 +1311,8 @@ botified-tts/
   click、异常静音、重复或截断音素。
 - [ ] cancel 到达实际 Nano child；输入超限和 send timeout 均能有界结束
   session。
-- [ ] Nano child fatal 使 active/pending 调用有界失败，服务不再 ready 并非零
-  退出；没有 worker restart 或 fallback。
+- [ ] Nano child fatal 使 active/pending 调用有界失败；即使服务 idle 且没有
+  下一请求，也会撤销 ready 并非零退出；没有 worker restart 或 fallback。
 - [ ] 默认日志不包含正文、reference、audio、latent 或 secret。
 - [ ] 单元、API、同一份真实 GPU smoke 和固定样本听测通过。
 - [ ] Agent Skill 可注册音色并生成 WAV。
