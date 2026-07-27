@@ -230,6 +230,15 @@ async def synthesize(
 HTTP adapter 收集该 iterator 并封装 WAV。WebSocket adapter 直接发送同一个
 iterator。不得为 HTTP 再实现一套非流式模型调用。
 
+Nano 的内部流由 waveform chunks 和一个正常结束时的 terminal completion
+组成；terminal completion 携带当前 segment 的完整 generated latents。
+`SpeechService` 消费 completion 并提交 continuation，对外仍只产生 PCM。
+cancel、engine error 或客户端发送失败时不得提交未完整生成的 continuation。
+
+`SpeechService` 在 `finally` 中显式关闭当前 Nano async generator。正常耗尽时
+关闭是幂等清理；提前退出时 `aclose()` 必须触发 Nano cancel，不能依赖 Python
+最终回收 async generator。
+
 ### 5.2 `VoxCPMEngine`
 
 - 只封装 Nano-vLLM-VoxCPM，不设计通用 engine interface。
@@ -237,6 +246,8 @@ iterator。不得为 HTTP 再实现一套非流式模型调用。
 - 同一 session 的 segment 串行提交。
 - 不同 session 的并发与 batching 使用 Nano 原生能力。
 - 服务层 request/session ID 不进入 Nano 公共模型协议。
+- 服务使用一个进程内 admission counter，最多接纳 16 个 HTTP 合成请求或
+  WebSocket session；Nano `max_num_seqs=16` 只控制执行 batch，不承担入口限流。
 
 ### 5.3 `VoiceStore`
 
@@ -245,6 +256,8 @@ iterator。不得为 HTTP 再实现一套非流式模型调用。
 - reference/prompt latents 只放进程内 cache，不持久化。
 - 重启后按需重新编码，避免 latent schema、fingerprint 和迁移体系。
 - 创建和删除使用临时目录加原子 rename，防止留下半写资源。
+- 请求开始时把 metadata 和标准化 reference WAV bytes 解析为不可变 snapshot；
+  后续编码不再依赖可能被删除的文件路径。
 
 ### 5.4 `StreamingSession`
 
@@ -328,7 +341,8 @@ DELETE /v1/voices/{id}
 - 名称可重复，调用始终使用唯一 ID。
 - update 不进入首版；需要修改时删除后重新创建。
 - delete 删除目录并清理该 voice 的进程内 latent cache。
-- 正在使用的 session 保持已加载的内存引用直到结束；新请求立即看不到该 ID。
+- 正在使用的请求/session 保持开始时取得的不可变 snapshot 直到结束；delete
+  原子地使新查询看不到该 ID，再删除目录和 cache，不影响已有 snapshot。
 
 本项目使用可信数据并运行在可信内网，Voice Profile 安全和授权治理不在范围内。
 
@@ -367,8 +381,16 @@ HTTP body 和 WebSocket `start` 共用一个 `SynthesisOptions`：
 | 字段 | 规则 |
 |---|---|
 | `voice` | 可选；省略表示普通无参考合成 |
-| `mode` | profile 可用：`controllable`（默认）或 `faithful` |
+| `mode` | 只允许 profile 使用；省略时为 `controllable`，也可显式使用 `faithful` |
 | `style` | 可选自然语言 instruction；faithful 禁止 |
+
+确定性校验规则：
+
+- 无 `voice` 或 `voice.type=design` 时出现 `mode`，返回 `invalid_request`。
+- profile 的 `faithful` 要求该 profile 有非空 exact transcript，否则返回
+  `invalid_request`。
+- `faithful + style` 返回 `invalid_request`。
+- design 必须有非空 `description`；profile 必须有存在的 `id`。
 
 HTTP body 是 `text + SynthesisOptions`；WebSocket `start` 只包含
 `SynthesisOptions`，文本由后续 `append` 提供。
@@ -572,6 +594,11 @@ cancel：
 - 若 Nano 原生 chunk 已大于 160 ms，直接发送，不再切碎；
 - 固定验收语料的平均值不超过每秒音频 10 个 binary message。
 
+waveform 到 PCM 的唯一转换为：拒绝 NaN/Inf，再执行
+`np.rint(np.clip(waveform, -1.0, 1.0) * 32767.0).astype("<i2")`。服务不做响度
+归一化、fade、重采样或第二次声道处理。HTTP WAV 和 WebSocket PCM 复用这一个
+转换函数。
+
 该约束是按“音频时长”计算，不要求服务器按墙钟时间定时发送。
 
 generate/send task 直接 await WebSocket send。发送超过 5 秒时取消 Nano，
@@ -601,14 +628,23 @@ buffer 的文本总量始终不超过 session 的 64 KiB 预算。
 
 每次 append 后循环提取零到多个 segment：
 
-1. 优先在 `。！？.!?` 等强句末标点后切分。
-2. 缓存达到最小稳定长度后，允许在 `，,；;：:` 或空格处切分。
-3. 达到 latency deadline 时，从最近的安全软边界切分。
-4. 达到 hard maximum 时，从上一个安全边界强制切分。
-5. `flush` 和 `finish` 提交剩余文本。
-6. 不在完整的官方 `[non-verbal tag]` 或小数中间切分；未闭合或未知的方括号
-   内容按普通文本处理。
-7. hard maximum 优先于其他边界规则。
+1. 优先在 `。！？!?` 后切分；`.` 只有确认不是数字小数点时才是强边界。
+2. digit 后且位于 buffer 尾部的 `.` 暂不提交；下一字符是 digit 时作为小数，
+   否则再把该 `.` 作为句末。
+3. 缓存达到软切分最小长度后，遇到 `，,；;：:` 或空格即可切分。
+4. buffer 达到目标最大字符数时，优先取不超过目标值的最后一个安全软边界；
+   没有安全边界则继续缓存到下一个强边界或 hard maximum。
+5. 达到 latency deadline 时，从最近的安全软边界切分；没有软边界且已达到
+   deadline 兜底最小长度时，从当前安全位置提交。
+6. 达到 hard maximum 时，从不超过 hard maximum 的最后安全位置强制切分；
+   没有标点时允许直接按字符位置切分。
+7. 官方 tag 的完整值及其跨 append 的可能前缀都是受保护区间。例如先收到
+   `[laugh`、再收到 `ing]` 时不得在其中切分。一个 `[` 开头的内容一旦不可能
+   匹配任何官方 tag，就按普通文本处理。
+8. `flush` 和 `finish` 提交剩余文本；此时尾部 `.` 或未完成的 tag 前缀按普通
+   文本处理。
+9. hard maximum 优先于普通边界选择，但必须先在受保护区间之前切分，不切断
+   已识别或仍可能成立的官方 tag。
 
 初始工程默认值：
 
@@ -648,10 +684,13 @@ timer。到期时主动调用 segmenter：
 | reference upload | 25 MiB | `invalid_request` |
 | WebSocket idle | 60 秒 | 结束 session |
 | WebSocket send | 5 秒 | `client_too_slow` 并结束 session |
-| 同时活动的 HTTP/WS generation | 16 | `service_busy` |
+| 同时接纳的 HTTP 请求/WS session | 16 | `service_busy` |
 
-这些是内部固定稳定性边界，不作为配置项。活动 generation 上限与 Nano
-`max_num_seqs` 使用同一个常量，不增加第二个 scheduler。
+这些是内部固定稳定性边界，不作为配置项。HTTP 在处理 body 前、WebSocket 在
+接受 `start` 时非阻塞获取同一个进程内 admission slot，并在请求/session 的
+`finally` 中释放。没有 slot 时立即返回 `service_busy`；不把请求排进 Nano 的
+无界 waiting queue。admission counter 与 Nano `max_num_seqs` 使用同一个常量，
+但它只是入口资源边界，不实现第二个 scheduler。
 
 ### 10.4 HTTP 复用
 
@@ -674,15 +713,25 @@ HTTP 将完整文本一次 feed 给相同分段器，再调用 `finish`。它不
 
 - generated latents 只包含当前 segment 新生成的 latent，不包含 reference、
   历史 prompt 或其他 conditioning；
-- `continuation_text` 是与这些 latents 对应的、commit 后不可修改的目标文本；
+- `continuation_text` 在 segment 正常完成后与 latents 一起 commit，之后不可
+  修改；
 - `[laughing]`、`[Uhm]` 等参与生成的原生文本表示保留；
-- 未发声的 style/voice control prefix 不进入 `continuation_text`。
 
 下一段分别把它们作为 Nano `prompt_latents` 和 `prompt_text`。
 
 Voice Design 和 controllable clone 的 style 只在首段作为显式 instruction 注入；
 后续段通过前一段音频 continuation 延续表达风格。faithful 模式始终不接受
 style。
+
+VoxCPM2 官方 prompt-cache 路径会保留传入模型的完整 target text，因此静态代码
+不能证明 `continuation_text` 应当只含 spoken segment，还是应包含首段未发声的
+style/voice control prefix。Phase 0 只做一次 focused GPU A/B：
+
+- A：`continuation_text = spoken segment`；
+- B：`continuation_text = 该段实际传给模型的完整 target text`。
+
+使用相同 seed 和至少四段固定语料比较丢字、重复/截断音素、音色及 style 漂移。
+确定结果后删除失败分支，产品和配置中不暴露该选择。
 
 不增加：
 
@@ -721,11 +770,20 @@ generated latents。
 因此 Botified 维护一个固定 commit 的最小 fork，只允许以下改动：
 
 1. `encode_latents(audio, role=reference|prompt)` 使用正确 padding。
-2. generation 完成时返回仅属于当前 segment 的最终 generated latents。
+2. payload 使用独立的 `generated_latents` list 逐 step 保存新 latent；正常结束
+   的 terminal completion 聚合并返回仅属于当前 segment 的 latents。
+
+不能从 payload 的 `feats` 切片推导生成结果：sequence 经 preemption 后重新
+prefill 时 Nano 会 concatenate `feats`，prompt/generated 边界会丢失。terminal
+completion 必须在最后一个 waveform chunk 之后到达；cancel 和 error 不返回
+completion。
 
 先用 focused GPU test 验证上游 cancel。只有确认 sequence、KV 或请求状态未释放
 时，才增加修复该缺陷所需的最小 patch。如果上游行为正确，不修改 cancel。上游
 合并等价能力后删除对应 fork patch。
+
+Nano cancel 在当前 engine step 结束后的命令处理边界生效即可接受，不增加 step
+内抢占。服务提前结束消费时必须 `aclose()` Nano generator。
 
 fork 不包含：
 
@@ -745,7 +803,12 @@ fork 不包含：
 - Python 系统版本、CUDA runtime、FFmpeg 和 OS 固定在 Dockerfile base image
   digest 与安装层。
 - Nano 使用不可变 git commit。
-- VoxCPM2 使用不可变 Hugging Face revision，并由应用默认值/Compose 固定。
+- Nano Git dependency 指向 Botified 最小 fork 的不可变 commit，不做运行时
+  monkey patch，也不把整个 Nano 源码复制进本仓库。
+- VoxCPM2 使用不可变 Hugging Face revision。容器通过 CUDA preflight 后，应用
+  调用 `snapshot_download(repo_id, revision=<immutable-sha>,
+  cache_dir=/data/model-cache)`，再把返回的本地 snapshot path 传给 Nano。
+  不把 repo ID 直接传给 Nano，因为当前 Nano 的下载路径不接受 revision。
 - 运行时不得 `pip install -U`。
 - 不建设逐文件 hash、processor fingerprint 或 release attestation 平台。
 - 每次升级只运行本项目的 focused GPU smoke 和 Botified 端到端验收。
@@ -757,28 +820,31 @@ fork 不包含：
 首版只支持：
 
 - Linux x86_64；
-- 满足 Phase 0 最低显存和 compute capability 基线的 NVIDIA GPU；
+- CUDA 可见且所选 device 有效的 NVIDIA GPU；
 - CUDA 12.x 兼容驱动；
 - Docker、Docker Compose 和 NVIDIA Container Toolkit；
 - 单个可见 GPU。
 
 不支持 CPU fallback、Apple Silicon、Windows 或 ROCm。
 
-Phase 0 必须把最低显存、最低 compute capability、验证 GPU 型号和对应的
-CUDA/PyTorch 组合写回 README 的支持表。`RTF < 1` 只承诺在表中指定的 reference
-GPU 上成立，不泛化到所有能被 CUDA 识别的设备。
+Phase 0 先记录当前可验证基线：RTX 4090 24 GiB、compute capability 8.9，以及
+实测 driver、CUDA、PyTorch 组合。没有对应低规格 GPU 的真实 smoke，不声称最低
+显存或最低 compute capability。`RTF < 1` 只承诺在表中指定的 reference GPU 上
+成立，不泛化到所有能被 CUDA 识别的设备。其他 CUDA GPU 可以启动尝试，但标记为
+未验证配置；部署脚本不根据未经实测的显存或 compute capability 阈值拒绝设备。
 
 ### 13.2 CUDA fail-fast
 
-`./scripts/deploy.sh` 在拉取镜像/启动前检查：
+`./scripts/deploy.sh` 在构建镜像/启动前检查：
 
 1. `docker`；
 2. `docker compose`；
 3. `nvidia-smi`；
-4. GPU 显存和 compute capability 是否达到已验证基线。
+4. 所选 GPU device 是否存在，并输出型号、显存和 compute capability 供故障
+   定位。
 
-固定应用镜像拉取完成后，容器 entrypoint 在 import/初始化 Nano 和下载
-VoxCPM2 权重前检查 Docker 内 GPU 可见性：
+应用镜像构建完成后，容器 entrypoint 在 import/初始化 Nano 和下载 VoxCPM2
+权重前检查 Docker 内 GPU 可见性：
 
 ```python
 torch.cuda.is_available()
@@ -804,14 +870,14 @@ selected_device_is_valid
 
 1. 完成 CUDA preflight；
 2. 生成或读取权限为 `0600` 的 `deploy/.env`；
-3. pull 固定 digest 的发布镜像；
+3. 使用固定 base image digest 的 Dockerfile 执行 `docker compose build`；
 4. `docker compose up -d`；
 5. 在有界 timeout 内等待 `/health` ready；
 6. 生成一条固定短文本 WAV 作为 smoke。
 
-Docker 内 GPU 检测可能需要先拉取应用镜像，但 CUDA 失败时不得下载 VoxCPM2
-模型权重。health timeout 或容器退出时，脚本输出容器状态和查看日志的命令并
-非零退出。
+host CUDA preflight 失败时不开始 build。Docker 内 GPU 检测失败时不得下载
+VoxCPM2 模型权重。health timeout 或容器退出时，脚本输出容器状态和查看日志的
+命令并非零退出。
 
 Compose 挂载 `/data` 持久卷：
 
@@ -825,7 +891,8 @@ Compose 挂载 `/data` 持久卷：
 
 不同时维护 systemd、Podman、裸机 pip 和 Kubernetes 安装器。
 
-本地开发可单独执行 Compose build，但它不是正式部署脚本的第二种模式。
+首版不依赖尚未定义的镜像 registry、发布 owner 或应用镜像 digest。未来若明确
+要求发布预构建镜像，原地替换唯一部署路径，不与本地 build 长期并存。
 
 ### 13.4 配置
 
@@ -927,6 +994,25 @@ REST 返回 JSON error envelope；WebSocket 使用同样的 code/message 放进
 `error` event。cancel 是正常的 `done(cancelled=true)`，不是错误码。内部异常
 不向客户端返回 traceback。
 
+HTTP 状态固定为：
+
+| 结果 | HTTP status |
+|---|---:|
+| speech、voice list、health 成功 | 200 |
+| voice create 成功 | 201 |
+| voice delete 成功 | 204 |
+| `invalid_api_key` | 401 |
+| `invalid_request` | 400 |
+| `invalid_voice` | 404 |
+| `input_too_large` | 413 |
+| `service_busy`、`engine_oom` | 503 |
+| `engine_error` | 500 |
+
+框架 schema validation 也统一映射为 `invalid_request` 400，不泄漏 FastAPI 的
+默认错误格式。`cuda_unavailable`、`cuda_device_invalid` 和
+`model_load_failed` 是启动日志/进程退出码，不会由已 ready 的 HTTP 服务返回。
+`client_too_slow` 只用于 WebSocket。
+
 ### 15.2 最小可观测性
 
 结构化日志记录：
@@ -958,11 +1044,16 @@ REST 返回 JSON error envelope；WebSocket 使用同样的 code/message 放进
 
 ### 16.1 单元测试
 
-- 分段器：逐字、小 chunk、大 chunk、多句、标点、deadline、flush、finish。
-- 不切断官方非语言标签和小数。
-- 请求 union 和 mode/style 约束。
-- VoiceStore 创建、list、delete 和半写失败清理。
-- PCM 以 160 ms 聚合，每个 segment 最多一个短尾包。
+- 分段器：逐字、小 chunk、大 chunk、多句、deadline、flush、finish、100/160
+  字符边界，以及跨 append 的尾部数字 `.` 和官方 tag 前缀。
+- 请求 union、mode/style 约束和固定 HTTP status 映射。
+- VoiceStore 创建、list、delete、半写失败清理，以及 delete 与已取得 immutable
+  snapshot 并发时已有请求仍可读取。
+- PCM 对固定 float vectors 执行 NaN/Inf 拒绝、clip、round 和 little-endian
+  int16 转换；160 ms 合并后每个 segment 最多一个短尾包。
+- `SpeechService` 只在 terminal completion 后 commit continuation，并在正常、
+  cancel 和 error 路径显式 `aclose()` Nano stream。
+- admission slot 满时立即 `service_busy`，所有 HTTP/WS 结束路径都释放 slot。
 - 输入、queue 和 session 上限触发固定错误并释放 session。
 - CUDA preflight 失败时模型下载/加载函数没有被调用。
 
@@ -1065,12 +1156,14 @@ botified-tts/
 
 - 将 VoxCPM2 HF revision、Nano commit、容器 base digest、Python、PyTorch、
   CUDA、FlashAttention 和 FFmpeg 版本固定到实际交付文件；
-- 写回最低显存、compute capability、验证 GPU 和 reference GPU 的支持表；
+- 写回 RTX 4090 24 GiB、compute capability 8.9 和实测软件组合的 verified
+  support baseline，不推断最低硬件；
 - target GPU 上完成普通、design、两种 clone 和 style；
 - 验证官方 non-verbal tag；
 - 实现并验证 role-aware latent encoding；
-- 让 Nano 返回最终 generated latents；
-- 验证上一段 continuation；
+- 让 Nano terminal completion 返回独立聚合的本 segment generated latents；
+- 对 continuation control prefix 做第 11 节唯一 A/B，删除失败分支后验证上一段
+  continuation；
 - 验证 cancel；
 - 测得 TTFB、RTF、实际 audio chunk 时长和显存占用。
 
