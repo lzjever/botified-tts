@@ -12,6 +12,7 @@ import wave
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -20,6 +21,7 @@ MIN_REFERENCE_SECONDS = 3
 MAX_REFERENCE_SECONDS = 60
 SUPPORTED_EXTENSIONS = {".wav", ".flac", ".mp3"}
 VOICE_ID_PATTERN = re.compile(r"voice_[0-9a-f]{32}")
+LatentRole = Literal["reference", "prompt"]
 
 
 class InvalidVoice(ValueError):
@@ -46,6 +48,7 @@ class VoiceStore:
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._latent_cache: dict[tuple[str, LatentRole], bytes] = {}
         self._remove_stale_work_directories()
 
     def create(
@@ -137,6 +140,30 @@ class VoiceStore:
                 reference_wav=reference_wav,
             )
 
+    def get_cached_latent(
+        self,
+        voice_id: str,
+        role: LatentRole,
+    ) -> bytes | None:
+        if not _valid_voice_id(voice_id):
+            return None
+        with self._lock:
+            return self._latent_cache.get((voice_id, role))
+
+    def cache_latent(
+        self,
+        voice_id: str,
+        role: LatentRole,
+        latents: bytes,
+    ) -> bool:
+        if not _valid_voice_id(voice_id):
+            return False
+        with self._lock:
+            if not (self._root / voice_id).is_dir():
+                return False
+            self._latent_cache[(voice_id, role)] = latents
+            return True
+
     def delete(self, voice_id: str) -> bool:
         if not _valid_voice_id(voice_id):
             return False
@@ -147,6 +174,8 @@ class VoiceStore:
                 os.rename(voice_path, deleting_path)
             except FileNotFoundError:
                 return False
+            self._latent_cache.pop((voice_id, "reference"), None)
+            self._latent_cache.pop((voice_id, "prompt"), None)
             shutil.rmtree(deleting_path)
             return True
 

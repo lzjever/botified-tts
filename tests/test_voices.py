@@ -122,9 +122,34 @@ def test_real_flac_create_persists_standard_wav_and_delete_preserves_snapshot(
 
     reopened = VoiceStore(root)
     assert reopened.get_snapshot(metadata.id) == snapshot
+    assert reopened.cache_latent(
+        metadata.id,
+        "reference",
+        b"reference-latents",
+    )
+    assert reopened.cache_latent(
+        metadata.id,
+        "prompt",
+        b"prompt-latents",
+    )
+    assert (
+        reopened.get_cached_latent(metadata.id, "reference")
+        == b"reference-latents"
+    )
+    assert (
+        reopened.get_cached_latent(metadata.id, "prompt")
+        == b"prompt-latents"
+    )
     assert reopened.delete(metadata.id) is True
     assert reopened.get(metadata.id) is None
     assert reopened.get_snapshot(metadata.id) is None
+    assert reopened.get_cached_latent(metadata.id, "reference") is None
+    assert reopened.get_cached_latent(metadata.id, "prompt") is None
+    assert not reopened.cache_latent(
+        metadata.id,
+        "reference",
+        b"late-reference-latents",
+    )
     assert reopened.delete(metadata.id) is False
     assert snapshot.reference_wav
     assert tuple(root.iterdir()) == ()
