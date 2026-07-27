@@ -870,8 +870,12 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
 
 - Python 包、PyTorch、FlashAttention 和 Nano Git dependency 固定在
   `pyproject.toml`/`uv.lock`。
-- Python 系统版本、CUDA runtime、FFmpeg 和 OS 固定在 Dockerfile base image
-  digest 与安装层。
+- Linux x86_64 容器固定使用
+  `nvidia/cuda:12.6.3-runtime-ubuntu24.04@sha256:2c8193530ecc423e0f123d0c85b68a15d1395adcddabfc943e2523dbfde172e1`。
+  Dockerfile 固定 `uv==0.9.26`，由 uv 安装 Python 3.12.13，并固定 Ubuntu
+  FFmpeg 包 `7:6.1.1-3ubuntu5`。
+- runtime 镜像保留 Triton JIT 所需的 `gcc` 和 `libc6-dev`；当前依赖均使用
+  已固定 wheel，不使用 CUDA devel 镜像，不安装 nvcc。
 - Nano 使用不可变 git commit。
 - Nano Git dependency 指向 Botified 最小 fork 的不可变 commit，不做运行时
   monkey patch，也不把整个 Nano 源码复制进本仓库。
@@ -879,6 +883,8 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
   顶层 `pyproject.toml` 固定 `numpy==2.4.6`、`numba==0.66.0` 和
   `llvmlite==0.48.0`，再生成唯一 `uv.lock`；不依赖解析器偶然回退。
 - `pyproject.toml` 和 `uv.lock` 不包含未使用的 torchcodec。
+- Hatch 仅为当前固定的 FlashAttention wheel direct reference 启用
+  `allow-direct-references`，不增加第二套依赖安装路径。
 - VoxCPM2 使用不可变 Hugging Face revision。容器通过 CUDA preflight 后，应用
   调用 `snapshot_download(repo_id, revision=<immutable-sha>,
   cache_dir=/data/model-cache)`，再把返回的本地 snapshot path 传给 Nano。
@@ -904,7 +910,8 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
 当前 verified baseline 为 RTX 4090 24,564 MiB、compute capability 8.9、driver
 575.64.05（driver CUDA capability 12.9）。隔离运行环境为 Python 3.12.13、
 PyTorch/torchaudio 2.9.0+cu126、Triton 3.5.0、FlashAttention 2.8.3，以及第
-12.3 节固定的 NumPy/Numba/llvmlite；模型 revision 为
+12.3 节固定的 CUDA 12.6.3 runtime、uv 0.9.26、FFmpeg 和
+NumPy/Numba/llvmlite；模型 revision 为
 `bffb3df5a29440629464e5e839f4d214c8714c3d`。
 
 该环境 warm generation 的 TTFB 为 0.1408 秒、生成阶段 RTF 为 0.1130；
@@ -923,6 +930,9 @@ capability。其他 CUDA GPU 可以启动尝试但标记为未验证；部署脚
 3. `nvidia-smi`；
 4. 所选 GPU device 是否存在，并输出型号、显存和 compute capability 供故障
    定位。
+
+host preflight 检查 `HOST_GPU` 指定的宿主物理设备；Compose 只把该设备暴露给
+容器，所以下面的容器 preflight 固定检查逻辑 device 0。
 
 应用镜像构建完成后，容器 entrypoint 在 import/初始化 Nano 和下载 VoxCPM2
 权重前检查 Docker 内 GPU 可见性：
@@ -950,11 +960,13 @@ selected_device_is_valid
 脚本：
 
 1. 完成 CUDA preflight；
-2. 生成或读取权限为 `0600` 的 `deploy/.env`；
+2. 自动生成或读取权限为 `0600` 的 `deploy/.env`；文件或 API key 不存在时
+   生成 32-byte 随机 ASCII key，不要求用户预先提供；
 3. 使用固定 base image digest 的 Dockerfile 执行 `docker compose build`；
-4. `docker compose up -d`；
-5. 在有界 timeout 内等待 `/health` ready；
-6. 生成一条固定短文本 WAV 作为 smoke。
+4. `docker compose up -d --wait --wait-timeout 900`；
+5. 通过容器 healthcheck 等待 `/health` ready；healthcheck 的 interval 和
+   timeout 均为 5 秒，最多重试 180 次；
+6. 在 180 秒 timeout 内生成一条固定短文本 WAV 作为 smoke。
 
 host CUDA preflight 失败时不开始 build。Docker 内 GPU 检测失败时不得下载
 VoxCPM2 模型权重。health timeout 或容器退出时，脚本输出容器状态和查看日志的
@@ -968,7 +980,9 @@ Compose 挂载 `/data` 持久卷：
 ```
 
 容器重建不重复下载模型或丢失注册音色。镜像包含 reference WAV/FLAC/MP3
-解码所需的 FFmpeg。
+解码所需的 FFmpeg。Compose 使用 NVIDIA `device_ids` 只暴露 `HOST_GPU`
+选择的一个宿主 GPU，使用 named volume 挂载 `/data`，并保留
+`restart: on-failure`；不增加容器内 worker restart。
 
 不同时维护 systemd、Podman、裸机 pip 和 Kubernetes 安装器。
 
@@ -977,7 +991,7 @@ Compose 挂载 `/data` 持久卷：
 
 ### 13.4 配置
 
-仅使用环境变量：
+应用进程仍且只读取以下八个环境变量：
 
 ```text
 BOTIFIED_TTS_HOST=0.0.0.0
@@ -989,6 +1003,18 @@ BOTIFIED_TTS_DATA_DIR=/data
 BOTIFIED_TTS_API_KEY=<secret>
 BOTIFIED_TTS_LOG_LEVEL=INFO
 ```
+
+`deploy/.env` 另允许两个只供 deploy script 和 Compose 插值的部署变量：
+
+```text
+HOST_GPU=0
+PUBLISHED_PORT=8000
+```
+
+它们不注入应用容器，也不使用 `BOTIFIED_TTS_` 前缀。Compose 用 `HOST_GPU`
+选择宿主物理 GPU、用 `PUBLISHED_PORT` 发布服务；容器只看到所选 GPU，因此固定
+`BOTIFIED_TTS_GPU_DEVICE=0`，并固定监听 `BOTIFIED_TTS_PORT=8000`。其他应用
+配置仍通过上列已有变量传入，不增加 host GPU 或 published port 的应用变量。
 
 不同时维护 YAML 和第二套 service config。Nano 内部调优值保留为代码中的已验证
 默认值，只有出现真实部署调优需求后才开放配置。
@@ -1209,6 +1235,8 @@ botified-tts/
 ├── uv.lock
 ├── src/botified_tts/
 │   ├── app.py
+│   ├── runtime.py
+│   ├── streaming.py
 │   ├── config.py
 │   ├── schemas.py
 │   ├── speech.py
@@ -1220,6 +1248,8 @@ botified-tts/
 │   ├── test_segmenter.py
 │   ├── test_speech.py
 │   ├── test_api.py
+│   ├── test_runtime.py
+│   ├── test_streaming.py
 │   └── gpu_smoke.py
 ├── deploy/
 │   ├── Dockerfile
