@@ -55,15 +55,12 @@ source = { editable = "." }
 dependencies = [
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "huggingface-hub", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "librosa", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "llvmlite", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nano-vllm-voxcpm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numba", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torchaudio", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 
 [package.dev-dependencies]
@@ -75,15 +72,12 @@ dev = [
 requires-dist = [
     { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "huggingface-hub", specifier = "==1.25.1" },
-    { name = "librosa", specifier = "==0.11.0" },
     { name = "llvmlite", specifier = "==0.48.0" },
     { name = "nano-vllm-voxcpm", git = "https://github.com/lzjever/nanovllm-voxcpm.git?rev=1ff870f8dd103a2d50aa9a68604a2d55fe5b4c60" },
     { name = "numba", specifier = "==0.66.0" },
     { name = "numpy", specifier = "==2.4.6" },
     { name = "torch", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchaudio", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "transformers", specifier = "==5.14.1" },
-    { name = "triton", specifier = "==3.5.0" },
 ]
 
 [package.metadata.requires-dev]

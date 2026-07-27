@@ -14,6 +14,7 @@ from botified_tts.config import Settings, require_cuda
 EngineErrorCode = Literal["model_load_failed", "engine_error"]
 WaveformChunk = NDArray[np.float32]
 WARMUP_TEXT = "你好。"
+WAVEFORM_SAMPLES = 7680
 
 
 class EngineError(RuntimeError):
@@ -59,6 +60,15 @@ class VoxCPMEngine:
             )
             engine = cls(pool)
             await pool.wait_for_ready()
+            model_info = await pool.get_model_info()
+            if (
+                model_info.get("sample_rate") != 48000
+                or model_info.get("channels") != 1
+            ):
+                raise EngineError(
+                    "model_load_failed",
+                    "VoxCPM2 model output format is incompatible",
+                )
             async for _ in engine.generate(
                 target_text=WARMUP_TEXT,
                 max_generate_length=80,
@@ -130,6 +140,7 @@ class VoxCPMEngine:
             seed=seed,
         )
         completion: GenerationCompletion | None = None
+        saw_waveform = False
         active_error: BaseException | None = None
         try:
             try:
@@ -140,11 +151,14 @@ class VoxCPMEngine:
                             "VoxCPM2 emitted data after completion",
                         )
                     if isinstance(item, np.ndarray):
-                        if item.dtype != np.float32 or item.ndim != 1:
+                        if item.dtype != np.float32 or item.shape != (
+                            WAVEFORM_SAMPLES,
+                        ):
                             raise EngineError(
                                 "engine_error",
                                 "VoxCPM2 emitted an invalid waveform chunk",
                             )
+                        saw_waveform = True
                         yield item
                         continue
                     if isinstance(item, dict) and item.get("type") == "completion":
@@ -175,6 +189,11 @@ class VoxCPMEngine:
                 raise EngineError(
                     "engine_error",
                     "VoxCPM2 stream ended without completion",
+                )
+            if not saw_waveform:
+                raise EngineError(
+                    "engine_error",
+                    "VoxCPM2 stream completed without audio",
                 )
             yield completion
         except BaseException as error:

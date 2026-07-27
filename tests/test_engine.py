@@ -19,6 +19,7 @@ from botified_tts.engine import (
 )
 
 MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d"
+WAVEFORM_SAMPLES = 7680
 
 
 def _settings(tmp_path: Path, *, device: int = 0) -> Settings:
@@ -66,8 +67,9 @@ class _RawStream:
 class _FakePool:
     instances: list[_FakePool] = []
     ready_error: BaseException | None = None
+    model_info: dict[str, int] = {"sample_rate": 48000, "channels": 1}
     warmup_items: list[object] = [
-        np.zeros(8, dtype=np.float32),
+        np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
         {"type": "completion", "generated_latents": b"warmup-latents"},
     ]
 
@@ -75,6 +77,7 @@ class _FakePool:
         self.kwargs = kwargs
         self.generate_calls: list[dict[str, object]] = []
         self.encode_calls: list[tuple[bytes, str, str]] = []
+        self.model_info_calls = 0
         self.streams: list[_RawStream] = []
         self.close_error: Exception | None = None
         self.stop_calls = 0
@@ -83,6 +86,10 @@ class _FakePool:
     async def wait_for_ready(self) -> None:
         if self.ready_error is not None:
             raise self.ready_error
+
+    async def get_model_info(self) -> dict[str, int]:
+        self.model_info_calls += 1
+        return dict(self.model_info)
 
     def generate(self, **kwargs: object) -> _RawStream:
         self.generate_calls.append(kwargs)
@@ -160,8 +167,9 @@ def test_create_downloads_exact_snapshot_and_completes_warmup(
     events: list[object] = []
     _FakePool.instances = []
     _FakePool.ready_error = None
+    _FakePool.model_info = {"sample_rate": 48000, "channels": 1}
     _FakePool.warmup_items = [
-        np.zeros(8, dtype=np.float32),
+        np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
         {"type": "completion", "generated_latents": b"warmup-latents"},
     ]
 
@@ -201,6 +209,7 @@ def test_create_downloads_exact_snapshot_and_completes_warmup(
         "gpu_memory_utilization": 0.8,
     }
     assert len(pool.generate_calls) == 1
+    assert pool.model_info_calls == 1
     assert pool.generate_calls[0]["target_text"]
     assert pool.streams[0].closed is True
 
@@ -217,11 +226,12 @@ def test_create_cleans_pool_and_reports_model_load_failure(
     _FakePool.ready_error = (
         RuntimeError("ready failed") if failure_stage == "ready" else None
     )
+    _FakePool.model_info = {"sample_rate": 48000, "channels": 1}
     _FakePool.warmup_items = (
-        []
+        [{"type": "completion", "generated_latents": b"warmup-latents"}]
         if failure_stage == "warmup"
         else [
-            np.zeros(8, dtype=np.float32),
+            np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
             {"type": "completion", "generated_latents": b"warmup-latents"},
         ]
     )
@@ -245,12 +255,48 @@ def test_create_cleans_pool_and_reports_model_load_failure(
         assert _FakePool.instances[0].stop_calls == 1
 
 
+@pytest.mark.parametrize(
+    "model_info",
+    [
+        {"sample_rate": 16000, "channels": 1},
+        {"sample_rate": 48000, "channels": 2},
+    ],
+)
+def test_create_rejects_incompatible_model_info(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model_info: dict[str, int],
+) -> None:
+    _FakePool.instances = []
+    _FakePool.ready_error = None
+    _FakePool.model_info = model_info
+    _FakePool.warmup_items = [
+        np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
+        {"type": "completion", "generated_latents": b"warmup-latents"},
+    ]
+    monkeypatch.setattr(engine_module, "require_cuda", lambda device: None)
+    _install_fake_runtime(
+        monkeypatch,
+        snapshot_download=lambda **kwargs: "/models/voxcpm2-snapshot",
+    )
+
+    with pytest.raises(EngineError) as caught:
+        asyncio.run(VoxCPMEngine.create(_settings(tmp_path)))
+
+    assert caught.value.code == "model_load_failed"
+    pool = _FakePool.instances[0]
+    assert pool.model_info_calls == 1
+    assert pool.generate_calls == []
+    assert pool.stop_calls == 1
+
+
 def test_create_cleans_pool_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     _FakePool.instances = []
     _FakePool.ready_error = asyncio.CancelledError()
+    _FakePool.model_info = {"sample_rate": 48000, "channels": 1}
     monkeypatch.setattr(engine_module, "require_cuda", lambda device: None)
     _install_fake_runtime(
         monkeypatch,
@@ -268,7 +314,7 @@ def test_create_cleans_pool_when_cancelled(
 
 def test_generate_forwards_conditioning_and_emits_terminal_completion() -> None:
     pool = _FakePool()
-    waveform = np.arange(8, dtype=np.float32)
+    waveform = np.arange(WAVEFORM_SAMPLES, dtype=np.float32)
     pool.warmup_items = [
         waveform,
         {"type": "completion", "generated_latents": b"generated"},
@@ -313,11 +359,16 @@ def test_generate_forwards_conditioning_and_emits_terminal_completion() -> None:
     "raw_items",
     [
         [],
-        [np.zeros(8, dtype=np.float64)],
-        [np.zeros((1, 8), dtype=np.float32)],
+        [np.zeros(WAVEFORM_SAMPLES, dtype=np.float64)],
+        [np.zeros((1, WAVEFORM_SAMPLES), dtype=np.float32)],
+        [
+            np.zeros(WAVEFORM_SAMPLES - 1, dtype=np.float32),
+            {"type": "completion", "generated_latents": b"done"},
+        ],
+        [{"type": "completion", "generated_latents": b"done"}],
         [
             {"type": "completion", "generated_latents": b"done"},
-            np.zeros(8, dtype=np.float32),
+            np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
         ],
         [
             {"type": "completion", "generated_latents": b"one"},
@@ -347,8 +398,8 @@ def test_generate_rejects_invalid_raw_protocol(raw_items: list[object]) -> None:
 def test_generate_closes_raw_stream_when_consumer_stops_early() -> None:
     pool = _FakePool()
     pool.warmup_items = [
-        np.zeros(8, dtype=np.float32),
-        np.ones(8, dtype=np.float32),
+        np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
+        np.ones(WAVEFORM_SAMPLES, dtype=np.float32),
         {"type": "completion", "generated_latents": b"done"},
     ]
     engine = VoxCPMEngine(pool)
@@ -367,7 +418,7 @@ def test_generate_closes_raw_stream_when_consumer_stops_early() -> None:
 def test_generate_maps_raw_stream_close_failure(close_early: bool) -> None:
     pool = _FakePool()
     pool.warmup_items = [
-        np.zeros(8, dtype=np.float32),
+        np.zeros(WAVEFORM_SAMPLES, dtype=np.float32),
         {"type": "completion", "generated_latents": b"done"},
     ]
     pool.close_error = RuntimeError("close failed")
