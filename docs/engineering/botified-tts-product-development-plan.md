@@ -424,6 +424,9 @@ ready 时：
 不启动一个专门返回 `503` 的后台状态服务。deploy 脚本通过容器退出或 health
 timeout 判断启动失败。
 
+Nano `wait_for_ready()` 不包含首次 generation compile；warmup 必须实际完成一条
+固定短文本生成并丢弃结果，不能只等待 worker ready。
+
 ### 8.2 合成
 
 ```http
@@ -720,25 +723,23 @@ HTTP 将完整文本一次 feed 给相同分段器，再调用 `finish`。它不
 
 - generated latents 只包含当前 segment 新生成的 latent，不包含 reference、
   历史 prompt 或其他 conditioning；
-- `continuation_text` 在 segment 正常完成后与 latents 一起 commit，之后不可
-  修改；
-- `[laughing]`、`[Uhm]` 等参与生成的原生文本表示保留；
+- `continuation_text` 是当前 segment 实际传给 Nano 的完整 model target text；
+- 首段的 style/Voice Design control prefix，以及 `[laughing]`、`[Uhm]` 等原生
+  tag 均按实际 target text 保留；
+- `continuation_text` 只在 segment 正常完成后与 latents 一起 commit，之后不可
+  修改。
 
 下一段分别把它们作为 Nano `prompt_latents` 和 `prompt_text`。
 
 Voice Design 和 controllable clone 的 style 只在首段作为显式 instruction 注入；
-后续段通过前一段音频 continuation 延续表达风格。faithful 模式始终不接受
-style。
+后续 segment 的新 target 不重复注入 prefix；prefix 只作为上一段真实生成历史
+进入 prompt。faithful 模式始终不接受 style。
 
-VoxCPM2 官方 prompt-cache 路径会保留传入模型的完整 target text，因此静态代码
-不能证明 `continuation_text` 应当只含 spoken segment，还是应包含首段未发声的
-style/voice control prefix。Phase 0 只做一次 focused GPU A/B：
-
-- A：`continuation_text = spoken segment`；
-- B：`continuation_text = 该段实际传给模型的完整 target text`。
-
-使用相同 seed 和至少四段固定语料比较丢字、重复/截断音素、音色及 style 漂移。
-确定结果后删除失败分支，产品和配置中不暴露该选择。
+该选择与 VoxCPM2 官方 `merge_prompt_cache()` 原样累积完整 `new_text` 的语义
+一致，也保证 Nano 的 `prompt_text` 与同次生成得到的 `prompt_latents` 来自同一
+条件历史。RTX 4090 focused 验证中，full-target continuation 的四段固定语料
+结果为 23 个音频块、3.68 秒，边界 sample jump 约 `1.42e-6`，未出现重复音素、
+截断或异常静音。spoken-only 分支已删除，不作为配置或备用路径保留。
 
 不增加：
 
@@ -769,39 +770,54 @@ style/voice control prefix。Phase 0 只做一次 focused GPU A/B：
 
 ### 12.2 薄 fork 边界
 
-当前审阅的 Nano 实现将 `encode_latents()` 统一做 left padding，而 VoxCPM2
-官方实现对 isolated reference 使用 right padding、对 continuation prompt 使用
-left padding；同时 Nano 的公开 generator 只返回 waveform，没有返回最终
-generated latents。
-
-因此 Botified 维护一个固定 commit 的最小 fork，只允许以下改动：
+当前 Nano 在 reference padding、continuation completion、AsyncPool cancel 传播
+和 child fatal 传播四处不能直接满足服务语义。因此 Botified 维护一个固定 commit
+的最小 fork，只允许以下四项改动：
 
 1. `encode_latents(audio, role=reference|prompt)` 使用正确 padding。
 2. payload 使用独立的 `generated_latents` list 逐 step 保存新 latent；正常结束
    的 terminal completion 聚合并返回仅属于当前 segment 的 latents。
+3. `AsyncVoxCPM2ServerPool.generate()` 显式持有 inner generator，并在 outer
+   `finally` 中 `await inner.aclose()`，确保 SpeechService 关闭 outer stream 时
+   cancel 到达实际 child request。
+4. child `srv.step()` exception 发出 fatal event 后退出；parent 同时监视 child
+   意外退出。两条路径都设置唯一 fatal state，使 active streams、pending
+   operations 和后续 submit 有界失败。
 
 不能从 payload 的 `feats` 切片推导生成结果：sequence 经 preemption 后重新
 prefill 时 Nano 会 concatenate `feats`，prompt/generated 边界会丢失。terminal
 completion 必须在最后一个 waveform chunk 之后到达；cancel 和 error 不返回
 completion。
 
-先用 focused GPU test 验证上游 cancel。只有确认 sequence、KV 或请求状态未释放
-时，才增加修复该缺陷所需的最小 patch。如果上游行为正确，不修改 cancel。上游
-合并等价能力后删除对应 fork patch。
-
 Nano cancel 在当前 engine step 结束后的命令处理边界生效即可接受，不增加 step
-内抢占。服务提前结束消费时必须 `aclose()` Nano generator。
+内抢占。服务提前结束消费时必须 `aclose()` Nano generator；AsyncPool 修复后
+必须重新用真实 GPU 验证 cancel 已到达 child 并释放 request。
+
+fatal 不是 completion 或可恢复的 stream event。Nano 让 async generator 抛出
+`RuntimeError`；服务对当前客户端 best-effort 映射 `engine_error` 后进入 fatal
+状态并非零退出，由容器 restart policy 重启。Nano 内不 restart worker，不做
+retry、fallback 或故障迁移。
+
+fork 的 focused tests 只证明两项本项目新增行为：关闭 AsyncPool outer stream
+确实关闭 inner stream；step exception/child exit 会使 active、pending 和后续
+submit 全部有界失败。cancel 的实际 child 释放只在同一份真实 GPU smoke 中验证，
+不再复制等价测试。
 
 fork 不包含：
 
+- Sync server/pool 修改；
 - HTTP/WebSocket DTO；
 - VoiceStore；
 - 文本分段；
 - 音频 codec；
 - 产品错误码；
 - session 状态；
+- completion shape/dtype metadata；latents 在固定模型链路内作为 opaque bytes
+  原样回传；
 - 多 GPU 调度；
 - artifact 或持久化。
+
+上游合并等价能力后，原地删除对应 fork 改动，不保留双路径。
 
 ### 12.3 固定依赖
 
@@ -837,11 +853,18 @@ fork 不包含：
 
 不支持 CPU fallback、Apple Silicon、Windows 或 ROCm。
 
-Phase 0 先记录当前可验证基线：RTX 4090 24 GiB、compute capability 8.9，以及
-实测 driver、CUDA、PyTorch 组合。没有对应低规格 GPU 的真实 smoke，不声称最低
-显存或最低 compute capability。`RTF < 1` 只承诺在表中指定的 reference GPU 上
-成立，不泛化到所有能被 CUDA 识别的设备。其他 CUDA GPU 可以启动尝试，但标记为
-未验证配置；部署脚本不根据未经实测的显存或 compute capability 阈值拒绝设备。
+当前 verified baseline 为 RTX 4090 24,564 MiB、compute capability 8.9、driver
+575.64.05（driver CUDA capability 12.9）。隔离运行环境为 Python 3.12.13、
+PyTorch/torchaudio 2.9.0+cu126、torchcodec 0.9.0+cu126、Triton 3.5.0、
+FlashAttention 2.8.3，以及第 12.3 节固定的 NumPy/Numba/llvmlite；模型 revision
+为 `bffb3df5a29440629464e5e839f4d214c8714c3d`。
+
+该环境 warm generation 的 TTFB 为 0.1408 秒、生成阶段 RTF 为 0.1130；
+`wait_for_ready()` 约 17.89 秒后首次 generation 仍有约 12.25 秒 compile，因此
+ready 前必须执行真实生成 warmup。`gpu_memory_utilization=0.8` 时观测峰值显存
+18,849 MiB。以上只证明当前 4090 配置，不代表最低显存或最低 compute
+capability。其他 CUDA GPU 可以启动尝试但标记为未验证；部署脚本不根据未经实测
+的硬件阈值拒绝设备。
 
 ### 13.2 CUDA fail-fast
 
@@ -1091,7 +1114,7 @@ fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部
 6. 非语言标签；
 7. WebSocket 增量文本；
 8. 两个以上 segment 的 continuation；
-9. cancel；
+9. AsyncPool outer `aclose()` 后 cancel 到达 child，且下一请求正常；
 10. RTF 小于 1；
 11. 每个音频 chunk 均为 7680 samples，输出频率为 6.25/s。
 
@@ -1172,9 +1195,10 @@ botified-tts/
 - 验证官方 non-verbal tag；
 - 实现并验证 role-aware latent encoding；
 - 让 Nano terminal completion 返回独立聚合的本 segment generated latents；
-- 对 continuation control prefix 做第 11 节唯一 A/B，删除失败分支后验证上一段
-  continuation；
-- 验证 cancel；
+- 使用第 11 节已验证的 full model target continuation，不保留 spoken-only
+  分支；
+- 修复 AsyncPool outer→inner `aclose()` 后重新验证 cancel 到达 child；
+- 验证 step exception 和 child 意外退出均使 async 调用有界失败；
 - 测得 TTFB、RTF、实际 audio chunk 时长和显存占用。
 
 退出条件：
@@ -1182,7 +1206,8 @@ botified-tts/
 - reference GPU 上 RTF < 1；
 - continuation 无明显质量倒退；
 - controllable 与 faithful 模式行为和官方一致；
-- cancel 能停止 request；
+- outer `aclose()` 能停止实际 child request；
+- child fatal 不留下悬挂 stream/future，服务随后非零退出；
 - 对 Nano fork 的改动不超出第 12.2 节。
 
 如果 continuation 验证失败，先解决或明确模型限制，不用 crossfade、回滚状态机
@@ -1231,7 +1256,7 @@ botified-tts/
 
 | 风险 | 最小处理 |
 |---|---|
-| Nano 上游差异 | role-aware encode 与 completion result 两个最小 patch |
+| Nano 上游差异 | 第 12.2 节固定四项薄 fork 改动 |
 | 分段质量 | 上一完整段 continuation + 固定听测 |
 | 资源积压 | 固定输入/队列上限、send timeout、cancel |
 | 环境不兼容 | 支持表、host/container preflight、固定依赖 |
@@ -1249,8 +1274,12 @@ botified-tts/
 - [ ] 输入 chunk 边界不造成丢字、重字或重排。
 - [ ] WebSocket 输出 48 kHz mono PCM s16le；固定验收语料平均每秒音频不超过
   10 个 binary chunks。
-- [ ] continuation 无明显 click、异常静音、重复或截断音素。
-- [ ] cancel、输入超限和 send timeout 均能有界结束 session。
+- [ ] continuation 使用上一段完整 model target text + generated latents，无明显
+  click、异常静音、重复或截断音素。
+- [ ] cancel 到达实际 Nano child；输入超限和 send timeout 均能有界结束
+  session。
+- [ ] Nano child fatal 使 active/pending 调用有界失败，服务不再 ready 并非零
+  退出；没有 worker restart 或 fallback。
 - [ ] 默认日志不包含正文、reference、audio、latent 或 secret。
 - [ ] 单元、API、同一份真实 GPU smoke 和固定样本听测通过。
 - [ ] Agent Skill 可注册音色并生成 WAV。
