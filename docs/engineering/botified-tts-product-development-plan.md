@@ -272,11 +272,13 @@ task，因为 task exception 本身不会可靠终止服务进程。
 每个 WebSocket 连接只保存：
 
 - 固定的 voice、mode、style 和 generation options；
-- 一个增量文本 buffer；
-- 一个受 session 64 KiB 总文本预算约束的 segment queue；
-- 当前 Nano generation task；
-- 上一个完整生成段的 model target text 和 generated latents；
-- cancelled/finished 状态。
+- 一个 `Segmenter` 和 segment queue；
+- 一个单调递增的已接受文本 UTF-8 byte 计数；
+- 当前唯一的 `SpeechService` PCM stream 和消费它的 task；
+- cancellation signal，以及由 session `run` 独占写入的协议状态。
+
+`StreamingSession` 不保存 Nano generator、Nano task、continuation text 或
+generated latents；这些均由 `SpeechService` 在其 stream 内拥有和清理。
 
 不保存客户端播放位置，不提供 session 恢复。
 
@@ -528,21 +530,22 @@ WS /v1/speech/stream
 `append` 可以在服务生成和发送前一 segment 音频时继续到达，这就是产品要求的
 双向流式。
 
-每个连接固定使用两个并发任务：
+每个连接的 `run` 在同一个 structured-concurrency scope 内监督两个并发 worker：
 
 ```text
 receive task
   -> 接收 append/flush/finish/cancel
-  -> 驱动 segmenter 和 deadline timer
-  -> 将不可变 segment 放入受 session 文本预算约束的 queue
+  -> 独占驱动 segmenter 和 800 ms absolute deadline
+  -> 将不可变 segment 放入 queue
 
 generate/send task
   -> 从 queue 串行取 segment
-  -> 调用 SpeechService/Nano
-  -> 将 Nano waveform chunk 转换为 PCM 并直接发送
+  -> 消费当前唯一的 SpeechService PCM stream
+  -> 将每个 PCM chunk 直接发送
 ```
 
-两者共享一个 cancellation signal。没有独立 audio queue。
+两者共享一个 cancellation signal。没有独立 audio queue，也没有第三个持久
+timer task 与 receive task 并发访问 `Segmenter`。
 
 ### 9.3 服务端消息
 
@@ -584,16 +587,27 @@ NEW --start--> ACTIVE --finish--> DRAINING --> DONE
 任意状态 --protocol/engine error----------> ERROR
 ```
 
-`ACTIVE` 内部只有 `IDLE` 和 `GENERATING`。voice、mode 和 style 在 `start`
-后固定；需要改变时建立新连接。
+`ACTIVE` 中可以正在生成，也可以只等待客户端消息；两种情况使用同一个 idle
+规则。voice、mode 和 style 在 `start` 后固定；需要改变时建立新连接。
+
+连接建立后 60 秒内必须收到有效的首个 `start`；这是 `NEW` 阶段的 handshake
+deadline。业务 idle 只在 `ACTIVE` 生效，从最后一条被服务接受的有效客户端消息
+开始计算 60 秒；服务端发送 `ready`、PCM 或其他消息都不续期。`finish` 进入
+`DRAINING` 后禁用 idle deadline，让已经接受的文本正常生成和发送完成。
+`ACTIVE` idle 到期与 `cancel` 使用同一路径，最终返回
+`done(cancelled=true)`；首个 `start` 超时也按同一取消结果结束。
+
+session `run` 是终态转换的唯一 owner：receive task、generate/send task 和
+deadline 只返回结果或设置 signal，不发送 terminal `done`/`error`，不关闭
+socket，也不释放 admission slot。`run` 汇总结果后只选择一个终态，至多发送一个
+terminal event，然后关闭连接并在 `finally` 中释放已经取得的 admission slot。
 
 cancel：
 
 1. 停止接收新文本；
-2. 取消当前 Nano request；
+2. 关闭当前 `SpeechService` stream，由它取消底层 Nano request；
 3. 清空尚未生成的 segments 并阻止后续 PCM send；
-4. 清空 continuation；
-5. 返回 `done(cancelled=true)` 并关闭连接。
+4. 由 `run` 返回 `done(cancelled=true)` 并关闭连接。
 
 已经进入 socket write 的一个 frame 可能无法撤回。服务不尝试判断客户端已播放
 到哪里。Botified barge-in 后的新回答使用新连接。
@@ -619,12 +633,15 @@ libsndfile/soundfile 默认 PCM_16 写入语义一致。
 该约束是按“音频时长”计算，不要求服务器按墙钟时间定时发送。
 
 generate/send task 直接 await WebSocket send。发送超过 5 秒时取消 Nano，
-记录 `client_too_slow`，best-effort 发送 error，然后关闭连接。协议不承诺已经
-不可写的客户端一定能收到该 error。
+并把 `client_too_slow` 结果交给 `run`；由 `run` best-effort 发送 error，然后
+关闭连接。协议不承诺已经不可写的客户端一定能收到该 error。
 
-服务在接受 append 前检查 session 累计文本上限；一旦接受，该 append 产生的所有
-segments 都可以进入 queue，不会因为句子数量较多而中途拒绝。queue 与尚未切分
-buffer 的文本总量始终不超过 session 的 64 KiB 预算。
+服务在接受 append 前，以
+`accepted_utf8_bytes + len(text.encode("utf-8"))` 检查 session 累计文本上限。
+计数在 append 被接受后单调增加，文本进入 queue、开始生成或生成完成都不返还
+预算。同一份文本只计数一次；queue 和未切分 buffer 只是已接受文本的两个去向，
+不再相加形成第二个 session 预算。一旦 append 被接受，它产生的所有 segments
+都可以进入 queue，不会因为句子数量较多而中途拒绝。
 
 ## 10. 文本分段
 
@@ -676,13 +693,20 @@ buffer 的文本总量始终不超过 session 的 64 KiB 预算。
 这些值在技术 spike 中用 Botified 的真实中英文输出固定一次，随后作为内部常量。
 首版不把它们暴露成请求参数，也不提供多种 segment policy。
 
-buffer 第一次从空变为非空时启动唯一一个 800 ms timer；后续 append 不重置
-timer。到期时主动调用 segmenter：
+receive task 独占 `Segmenter`，并保存一个基于 monotonic clock 的绝对
+`deadline_at`。buffer 第一次从空变为非空时令
+`deadline_at = now + 800 ms`；后续 append 不重置。receive loop 每次等待下一条
+客户端消息时都使用该绝对时刻计算剩余 timeout，因此持续收到消息也不能推迟
+deadline。timeout 到期时由同一个 receive task 调用 segmenter：
 
 - 已达到 12 字符则提交；
 - 不足 12 字符则保留“deadline 已到期”状态，后续一旦达到阈值立即提交；
-- segment 提交或 buffer 清空后，剩余新文本重新开始一次 deadline；
-- `flush`、`finish` 和 `cancel` 取消 timer。
+- segment 提交后若仍有 pending text，则从该时刻建立新的 absolute deadline；
+  buffer 清空时清除 deadline，后续新文本重新开始；
+- `flush`、`finish` 和 `cancel` 清除 deadline。
+
+不创建独立的持久 timer task，也不允许 receive task 之外的 task 调用
+`Segmenter`。
 
 强句末标点、`flush` 或 `finish` 可以提交短段，因为短回答必须能够结束；服务不
 通过填充无意义文本来绕过 VoxCPM2 对极短语音稳定性较弱的事实。
@@ -695,11 +719,10 @@ timer。到期时主动调用 segmenter：
 | WebSocket 单个 `append` | 16 KiB UTF-8 | `input_too_large` |
 | WebSocket session 累计文本 | 64 KiB UTF-8 | `input_too_large` |
 | 未切分 buffer | 4 KiB UTF-8 | 按 hard maximum 切分；仍无法切分则拒绝 |
-| queued + 未切分文本 | 64 KiB UTF-8 session 总预算 | 接受 append 前检查 |
 | `style` | 512 B UTF-8 | `invalid_request` |
 | Voice Design `description` | 1 KiB UTF-8 | `invalid_request` |
 | reference upload | 25 MiB | `invalid_request` |
-| WebSocket idle | 60 秒 | 结束 session |
+| WebSocket idle | 60 秒 | 等价 cancel，`done(cancelled=true)` |
 | WebSocket send | 5 秒 | `client_too_slow` 并结束 session |
 | 同时接纳的 HTTP 请求/WS session | 16 | `service_busy` |
 
@@ -1113,7 +1136,8 @@ runner 非零退出；不通过 traceback 字符串猜测独立 OOM 错误码。
 - `SpeechService` 只在 terminal completion 后 commit continuation，并在正常、
   cancel 和 error 路径显式 `aclose()` Nano stream。
 - admission slot 满时立即 `service_busy`，所有 HTTP/WS 结束路径都释放 slot。
-- 输入、queue 和 session 上限触发固定错误并释放 session。
+- 单个 append、累计已接受文本和未切分 buffer 的各自上限触发固定错误；累计文本
+  不因进入 queue 或完成生成而重复计数或返还，所有终态都释放 session。
 - CUDA preflight 失败时模型下载/加载函数没有被调用。
 
 Nano fork 的 focused unit tests 覆盖 `wait_for_fatal()` 的 wait-before-fatal、
