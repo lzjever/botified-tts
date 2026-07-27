@@ -64,6 +64,16 @@ class _RawStream:
             raise self._close_error
 
 
+class _FakeTokenizer:
+    def __init__(self, token_count: int = 5) -> None:
+        self.token_count = token_count
+        self.calls: list[str] = []
+
+    def __call__(self, text: str) -> list[int]:
+        self.calls.append(text)
+        return list(range(self.token_count))
+
+
 class _FakePool:
     instances: list[_FakePool] = []
     ready_error: BaseException | None = None
@@ -133,8 +143,28 @@ def _install_fake_runtime(
     voxcpm2.__path__ = []  # type: ignore[attr-defined]
     server = ModuleType("nanovllm_voxcpm.models.voxcpm2.server")
     server.AsyncVoxCPM2ServerPool = pool_class  # type: ignore[attr-defined]
+    utils = ModuleType("nanovllm_voxcpm.models.voxcpm2.utils")
+    transformers = ModuleType("transformers")
+    tokenizer_loads: list[str] = []
+    tokenizer_masks: list[object] = []
+
+    class FakeLlamaTokenizerFast:
+        @classmethod
+        def from_pretrained(cls, model_path: str) -> object:
+            tokenizer_loads.append(model_path)
+            return cls()
+
+    def mask_multichar_chinese_tokens(tokenizer: object) -> _FakeTokenizer:
+        tokenizer_masks.append(tokenizer)
+        return _FakeTokenizer(token_count=len("你好。"))
+
+    transformers.LlamaTokenizerFast = FakeLlamaTokenizerFast  # type: ignore[attr-defined]
+    utils.mask_multichar_chinese_tokens = mask_multichar_chinese_tokens  # type: ignore[attr-defined]
+    transformers.tokenizer_loads = tokenizer_loads  # type: ignore[attr-defined]
+    utils.tokenizer_masks = tokenizer_masks  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm", nano)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm.models", models)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm.models.voxcpm2", voxcpm2)
@@ -142,6 +172,11 @@ def _install_fake_runtime(
         sys.modules,
         "nanovllm_voxcpm.models.voxcpm2.server",
         server,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nanovllm_voxcpm.models.voxcpm2.utils",
+        utils,
     )
 
 
@@ -155,6 +190,7 @@ def test_create_checks_cuda_before_runtime_imports(
     monkeypatch.setattr(engine_module, "require_cuda", reject_cuda)
     monkeypatch.setitem(sys.modules, "huggingface_hub", None)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm", None)
+    monkeypatch.setitem(sys.modules, "transformers", None)
 
     with pytest.raises(CudaPreflightError, match="cuda_unavailable"):
         asyncio.run(VoxCPMEngine.create(_settings(tmp_path)))
@@ -211,6 +247,11 @@ def test_create_downloads_exact_snapshot_and_completes_warmup(
     assert len(pool.generate_calls) == 1
     assert pool.model_info_calls == 1
     assert pool.generate_calls[0]["target_text"]
+    assert pool.generate_calls[0]["max_generate_length"] == 28
+    transformers = sys.modules["transformers"]
+    utils = sys.modules["nanovllm_voxcpm.models.voxcpm2.utils"]
+    assert transformers.tokenizer_loads == ["/models/voxcpm2-snapshot"]  # type: ignore[attr-defined]
+    assert len(utils.tokenizer_masks) == 1  # type: ignore[attr-defined]
     assert pool.streams[0].closed is True
 
     asyncio.run(engine.close())
@@ -319,7 +360,8 @@ def test_generate_forwards_conditioning_and_emits_terminal_completion() -> None:
         waveform,
         {"type": "completion", "generated_latents": b"generated"},
     ]
-    engine = VoxCPMEngine(pool)
+    tokenizer = _FakeTokenizer(token_count=5)
+    engine = VoxCPMEngine(pool, tokenizer)
 
     async def collect() -> list[object]:
         return [
@@ -328,7 +370,6 @@ def test_generate_forwards_conditioning_and_emits_terminal_completion() -> None:
                 target_text="hello",
                 prompt_latents=b"prompt",
                 prompt_text="previous",
-                max_generate_length=120,
                 temperature=0.9,
                 cfg_value=2.0,
                 ref_audio_latents=b"reference",
@@ -345,14 +386,30 @@ def test_generate_forwards_conditioning_and_emits_terminal_completion() -> None:
             "target_text": "hello",
             "prompt_latents": b"prompt",
             "prompt_text": "previous",
-            "max_generate_length": 120,
+            "max_generate_length": 40,
             "temperature": 0.9,
             "cfg_value": 2.0,
             "ref_audio_latents": b"reference",
             "seed": 42,
         }
     ]
+    assert tokenizer.calls == ["hello"]
     assert pool.streams[0].closed is True
+
+
+def test_generate_caps_official_budget_at_2000() -> None:
+    pool = _FakePool()
+    tokenizer = _FakeTokenizer(token_count=400)
+    engine = VoxCPMEngine(pool, tokenizer)
+
+    async def collect() -> None:
+        async for _ in engine.generate(target_text="long target"):
+            pass
+
+    asyncio.run(collect())
+
+    assert tokenizer.calls == ["long target"]
+    assert pool.generate_calls[0]["max_generate_length"] == 2000
 
 
 @pytest.mark.parametrize(
@@ -382,7 +439,7 @@ def test_generate_forwards_conditioning_and_emits_terminal_completion() -> None:
 def test_generate_rejects_invalid_raw_protocol(raw_items: list[object]) -> None:
     pool = _FakePool()
     pool.warmup_items = raw_items
-    engine = VoxCPMEngine(pool)
+    engine = VoxCPMEngine(pool, _FakeTokenizer())
 
     async def collect() -> None:
         async for _ in engine.generate(target_text="hello"):
@@ -402,7 +459,7 @@ def test_generate_closes_raw_stream_when_consumer_stops_early() -> None:
         np.ones(WAVEFORM_SAMPLES, dtype=np.float32),
         {"type": "completion", "generated_latents": b"done"},
     ]
-    engine = VoxCPMEngine(pool)
+    engine = VoxCPMEngine(pool, _FakeTokenizer())
 
     async def close_early() -> None:
         stream = engine.generate(target_text="hello")
@@ -422,7 +479,7 @@ def test_generate_maps_raw_stream_close_failure(close_early: bool) -> None:
         {"type": "completion", "generated_latents": b"done"},
     ]
     pool.close_error = RuntimeError("close failed")
-    engine = VoxCPMEngine(pool)
+    engine = VoxCPMEngine(pool, _FakeTokenizer())
 
     async def consume() -> None:
         stream = engine.generate(target_text="hello")
@@ -446,7 +503,7 @@ def test_encode_rejects_empty_latents() -> None:
         return b""
 
     pool.encode_latents = encode_empty  # type: ignore[method-assign]
-    engine = VoxCPMEngine(pool)
+    engine = VoxCPMEngine(pool, _FakeTokenizer())
 
     with pytest.raises(EngineError) as caught:
         asyncio.run(engine.encode_reference(b"reference"))
@@ -456,7 +513,7 @@ def test_encode_rejects_empty_latents() -> None:
 
 def test_encode_fatal_wait_and_close_delegate_to_pool() -> None:
     pool = _FakePool()
-    engine = VoxCPMEngine(pool)
+    engine = VoxCPMEngine(pool, _FakeTokenizer())
 
     async def exercise() -> None:
         assert await engine.encode_reference(b"reference") == b"reference-latents"

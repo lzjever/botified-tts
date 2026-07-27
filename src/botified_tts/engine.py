@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 
@@ -15,6 +15,9 @@ EngineErrorCode = Literal["model_load_failed", "engine_error"]
 WaveformChunk = NDArray[np.float32]
 WARMUP_TEXT = "你好。"
 WAVEFORM_SAMPLES = 7680
+MAX_GENERATE_LENGTH_RATIO = 6
+MAX_GENERATE_LENGTH_BONUS = 10
+MAX_GENERATE_LENGTH_CAP = 2000
 
 
 class EngineError(RuntimeError):
@@ -32,8 +35,13 @@ EngineStreamItem = WaveformChunk | GenerationCompletion
 
 
 class VoxCPMEngine:
-    def __init__(self, pool: Any) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        text_tokenizer: Callable[[str], list[int]],
+    ) -> None:
         self._pool = pool
+        self._text_tokenizer = text_tokenizer
         self._closed = False
 
     @classmethod
@@ -46,11 +54,18 @@ class VoxCPMEngine:
             from nanovllm_voxcpm.models.voxcpm2.server import (
                 AsyncVoxCPM2ServerPool,
             )
+            from nanovllm_voxcpm.models.voxcpm2.utils import (
+                mask_multichar_chinese_tokens,
+            )
+            from transformers import LlamaTokenizerFast
 
             model_path = snapshot_download(
                 repo_id=settings.model,
                 revision=settings.model_revision,
                 cache_dir=settings.data_dir / "model-cache",
+            )
+            text_tokenizer = mask_multichar_chinese_tokens(
+                LlamaTokenizerFast.from_pretrained(model_path),
             )
             pool = AsyncVoxCPM2ServerPool(
                 model_path=model_path,
@@ -58,7 +73,7 @@ class VoxCPMEngine:
                 max_num_seqs=16,
                 gpu_memory_utilization=0.8,
             )
-            engine = cls(pool)
+            engine = cls(pool, text_tokenizer)
             await pool.wait_for_ready()
             model_info = await pool.get_model_info()
             if (
@@ -71,7 +86,6 @@ class VoxCPMEngine:
                 )
             async for _ in engine.generate(
                 target_text=WARMUP_TEXT,
-                max_generate_length=80,
                 temperature=1.0,
                 cfg_value=2.0,
                 seed=0,
@@ -122,13 +136,17 @@ class VoxCPMEngine:
         target_text: str,
         prompt_latents: bytes | None = None,
         prompt_text: str = "",
-        max_generate_length: int = 2000,
         temperature: float = 1.0,
         cfg_value: float = 2.0,
         ref_audio_latents: bytes | None = None,
         seed: int | None = None,
     ) -> AsyncIterator[EngineStreamItem]:
         self._ensure_open()
+        max_generate_length = min(
+            len(self._text_tokenizer(target_text)) * MAX_GENERATE_LENGTH_RATIO
+            + MAX_GENERATE_LENGTH_BONUS,
+            MAX_GENERATE_LENGTH_CAP,
+        )
         raw_stream = self._pool.generate(
             target_text=target_text,
             prompt_latents=prompt_latents,

@@ -61,6 +61,7 @@ dependencies = [
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torchaudio", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 
 [package.dev-dependencies]
@@ -78,6 +79,7 @@ requires-dist = [
     { name = "numpy", specifier = "==2.4.6" },
     { name = "torch", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchaudio", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "transformers", specifier = "==5.14.1" },
 ]
 
 [package.metadata.requires-dev]
