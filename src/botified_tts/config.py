@@ -116,9 +116,10 @@ class Settings:
             not isinstance(api_key, str)
             or not api_key
             or api_key != api_key.strip()
+            or not api_key.isascii()
         ):
             raise InvalidConfiguration(
-                "BOTIFIED_TTS_API_KEY must be a non-empty value "
+                "BOTIFIED_TTS_API_KEY must be a non-empty ASCII value "
                 "without surrounding whitespace"
             )
 

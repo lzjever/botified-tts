@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import threading
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass
 
@@ -61,18 +60,15 @@ class _Admission:
     def __init__(self, limit: int) -> None:
         self._limit = limit
         self._active = 0
-        self._lock = threading.Lock()
 
     def try_acquire(self) -> bool:
-        with self._lock:
-            if self._active >= self._limit:
-                return False
-            self._active += 1
-            return True
+        if self._active >= self._limit:
+            return False
+        self._active += 1
+        return True
 
     def release(self) -> None:
-        with self._lock:
-            self._active -= 1
+        self._active -= 1
 
 
 def create_app(
@@ -121,8 +117,8 @@ def create_app(
     def require_ready() -> None:
         if not readiness.ready:
             raise _ApiError(
-                503,
-                "service_not_ready",
+                500,
+                "engine_error",
                 "Service is not ready",
                 error_type="server_error",
             )
@@ -132,14 +128,14 @@ def create_app(
         require_ready()
 
     async def health(_: Request) -> Response:
-        require_ready()
         return JSONResponse(
             {
-                "status": "ready",
+                "status": "ready" if readiness.ready else "not_ready",
                 "cuda": True,
                 "model": model,
                 "sample_rate": 48_000,
-            }
+            },
+            status_code=200 if readiness.ready else 503,
         )
 
     async def synthesize(request: Request) -> Response:
@@ -239,7 +235,6 @@ def create_app(
             Exception: _internal_error_response,
         },
     )
-    app.state._admission = admission
     return app
 
 
@@ -285,14 +280,7 @@ async def _voice_form(
             "invalid_request",
             "Content-Type must be multipart/form-data",
         )
-    try:
-        form = await request.form()
-    except Exception:
-        raise _ApiError(
-            400,
-            "invalid_request",
-            "Request body must be valid multipart form data",
-        ) from None
+    form = await request.form(max_files=1, max_fields=2)
 
     try:
         fields: dict[str, str | UploadFile] = {}
@@ -357,14 +345,13 @@ def _api_error_response(_: Request, error: _ApiError) -> JSONResponse:
     )
 
 
-def _http_error_response(request: Request, error: HTTPException) -> JSONResponse:
-    code = "not_found" if error.status_code == 404 else "http_error"
+def _http_error_response(request: Request, _: HTTPException) -> JSONResponse:
     return _api_error_response(
         request,
         _ApiError(
-            error.status_code,
-            code,
-            "Not found" if error.status_code == 404 else "HTTP error",
+            400,
+            "invalid_request",
+            "Invalid request",
         ),
     )
 
@@ -374,7 +361,7 @@ def _internal_error_response(request: Request, _: Exception) -> JSONResponse:
         request,
         _ApiError(
             500,
-            "internal_error",
+            "engine_error",
             "Internal server error",
             error_type="server_error",
         ),

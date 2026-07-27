@@ -112,13 +112,18 @@ def test_health_is_public_and_ready_gate_precedes_protected_work() -> None:
         unauthenticated = client.get("/v1/voices")
 
     assert unavailable.status_code == 503
-    assert unavailable.json() == _error(
-        "service_not_ready",
+    assert unavailable.json() == {
+        "status": "not_ready",
+        "cuda": True,
+        "model": MODEL,
+        "sample_rate": 48_000,
+    }
+    assert protected.status_code == 500
+    assert protected.json() == _error(
+        "engine_error",
         "Service is not ready",
         "server_error",
     )
-    assert protected.status_code == 503
-    assert protected.json()["error"]["code"] == "service_not_ready"
     assert ready.status_code == 200
     assert ready.json() == {
         "status": "ready",
@@ -132,6 +137,37 @@ def test_health_is_public_and_ready_gate_precedes_protected_work() -> None:
         "Invalid authentication credentials",
         "authentication_error",
     )
+
+
+@pytest.mark.parametrize(
+    "headers",
+    (
+        {"Authorization": "Basic test-secret"},
+        [
+            ("Authorization", "Bearer test-secret"),
+            ("Authorization", "Bearer test-secret"),
+        ],
+    ),
+    ids=("wrong-scheme", "duplicate"),
+)
+def test_invalid_authorization_is_rejected_before_business_logic(
+    headers: dict[str, str] | list[tuple[str, str]],
+) -> None:
+    speech = FakeSpeech(RuntimeError("business must not run"))
+    with _client(speech=speech) as client:
+        response = client.post(
+            "/v1/speech",
+            headers=headers,
+            json={"text": "你好。"},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == _error(
+        "invalid_api_key",
+        "Invalid authentication credentials",
+        "authentication_error",
+    )
+    assert speech.calls == []
 
 
 def test_speech_uses_the_segmenter_and_returns_one_canonical_wav() -> None:
@@ -212,6 +248,21 @@ def test_speech_maps_public_input_and_engine_errors(
         "param",
         "code",
     }
+
+
+def test_unexpected_exception_is_fixed_engine_error_without_details() -> None:
+    secret = "database-password-must-not-leak"
+    with _client(speech=FakeSpeech(RuntimeError(secret))) as client:
+        response = client.post(
+            "/v1/speech",
+            headers=AUTH,
+            json={"text": "hello"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "engine_error"
+    assert response.json()["error"]["type"] == "server_error"
+    assert secret not in response.text
 
 
 class BlockingSpeech:
@@ -326,27 +377,64 @@ def test_voice_create_list_delete_lifecycle_uses_framework_multipart() -> None:
     assert missing.json()["error"]["code"] == "invalid_voice"
 
 
+def test_voice_multipart_rejects_empty_upload_and_framework_limits() -> None:
+    voices = FakeVoices()
+    with _client(voices=voices) as client:
+        empty = client.post(
+            "/v1/voices",
+            headers=AUTH,
+            data={"name": "assistant"},
+            files={"file": ("reference.wav", b"", "audio/wav")},
+        )
+        too_many_files = client.post(
+            "/v1/voices",
+            headers=AUTH,
+            data={"name": "assistant"},
+            files=[
+                ("file", ("one.wav", b"one", "audio/wav")),
+                ("file", ("two.wav", b"two", "audio/wav")),
+            ],
+        )
+        too_many_fields = client.post(
+            "/v1/voices",
+            headers=AUTH,
+            files=[
+                ("name", (None, "assistant")),
+                ("prompt_text", (None, "transcript")),
+                ("name", (None, "duplicate")),
+                ("file", ("reference.wav", b"wave", "audio/wav")),
+            ],
+        )
+
+    assert empty.status_code == 400
+    assert empty.json()["error"]["code"] == "invalid_request"
+    for response in (too_many_files, too_many_fields):
+        assert response.status_code == 400
+        assert response.json() == _error(
+            "invalid_request",
+            "Invalid request",
+            "invalid_request_error",
+        )
+    assert voices.create_args == ("assistant", b"", "reference.wav", None)
+
+
 @pytest.mark.parametrize(
-    ("method", "path", "status", "code"),
+    ("method", "path"),
     (
-        ("GET", "/not-found", 404, "not_found"),
-        ("GET", "/v1/speech", 405, "http_error"),
+        ("GET", "/not-found"),
+        ("GET", "/v1/speech"),
     ),
 )
-def test_unknown_routes_and_methods_use_the_error_envelope(
+def test_unknown_routes_and_methods_are_generic_invalid_requests(
     method: str,
     path: str,
-    status: int,
-    code: str,
 ) -> None:
     with _client() as client:
         response = client.request(method, path, headers=AUTH)
 
-    assert response.status_code == status
-    assert response.json()["error"]["code"] == code
-    assert set(response.json()["error"]) == {
-        "message",
-        "type",
-        "param",
-        "code",
-    }
+    assert response.status_code == 400
+    assert response.json() == _error(
+        "invalid_request",
+        "Invalid request",
+        "invalid_request_error",
+    )

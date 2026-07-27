@@ -98,6 +98,11 @@ def test_settings_require_api_key() -> None:
         Settings.from_env({})
 
 
+def test_settings_reject_non_ascii_api_key() -> None:
+    with pytest.raises(InvalidConfiguration, match="ASCII"):
+        Settings.from_env({"BOTIFIED_TTS_API_KEY": "内部密钥"})
+
+
 class FakeCuda:
     def __init__(
         self,
