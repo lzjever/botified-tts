@@ -9,7 +9,11 @@ from typing import Any, Literal, NoReturn
 import numpy as np
 from numpy.typing import NDArray
 
-from botified_tts.config import Settings, require_cuda
+from botified_tts.config import (
+    MAX_CONCURRENT_SYNTHESIS,
+    Settings,
+    require_cuda,
+)
 
 EngineErrorCode = Literal["model_load_failed", "engine_error"]
 WaveformChunk = NDArray[np.float32]
@@ -70,7 +74,7 @@ class VoxCPMEngine:
             pool = AsyncVoxCPM2ServerPool(
                 model_path=model_path,
                 devices=[settings.gpu_device],
-                max_num_seqs=16,
+                max_num_seqs=MAX_CONCURRENT_SYNTHESIS,
                 gpu_memory_utilization=0.8,
             )
             engine = cls(pool, text_tokenizer)

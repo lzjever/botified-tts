@@ -11,7 +11,11 @@ import numpy as np
 import pytest
 
 import botified_tts.engine as engine_module
-from botified_tts.config import CudaPreflightError, Settings
+from botified_tts.config import (
+    CudaPreflightError,
+    MAX_CONCURRENT_SYNTHESIS,
+    Settings,
+)
 from botified_tts.engine import (
     EngineError,
     GenerationCompletion,
@@ -241,7 +245,7 @@ def test_create_downloads_exact_snapshot_and_completes_warmup(
     assert pool.kwargs == {
         "model_path": "/models/voxcpm2-snapshot",
         "devices": [2],
-        "max_num_seqs": 16,
+        "max_num_seqs": MAX_CONCURRENT_SYNTHESIS,
         "gpu_memory_utilization": 0.8,
     }
     assert len(pool.generate_calls) == 1
