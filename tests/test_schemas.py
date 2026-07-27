@@ -88,6 +88,12 @@ def test_style_limit_counts_utf8_bytes() -> None:
         parse_synthesis_options({"style": too_large})
 
 
+@pytest.mark.parametrize("style", ["", " ", "\t\n"])
+def test_style_must_contain_non_whitespace_text(style: str) -> None:
+    with pytest.raises(InvalidSynthesisOptions):
+        parse_synthesis_options({"style": style})
+
+
 def test_design_description_limit_counts_utf8_bytes() -> None:
     exact = "a" * 1021 + "语"
     too_large = exact + "a"

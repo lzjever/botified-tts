@@ -275,7 +275,7 @@ task，因为 task exception 本身不会可靠终止服务进程。
 - 一个增量文本 buffer；
 - 一个受 session 64 KiB 总文本预算约束的 segment queue；
 - 当前 Nano generation task；
-- 上一个完整生成段的 spoken text 和 generated latents；
+- 上一个完整生成段的 model target text 和 generated latents；
 - cancelled/finished 状态。
 
 不保存客户端播放位置，不提供 session 恢复。
@@ -404,7 +404,9 @@ HTTP body 是 `text + SynthesisOptions`；WebSocket `start` 只包含
 `SynthesisOptions`，文本由后续 `append` 提供。
 
 `cfg_value`、`temperature` 和 `inference_timesteps` 在 Phase 0 固定为服务内部
-默认值，不进入公共 API。内部 `max_generate_length` 根据 segment 长度计算。
+默认值，不进入公共 API。`max_generate_length` 由 `VoxCPMEngine` 使用与 Nano
+相同的 tokenizer 对本次实际完整 target text 计数；首段 control prefix 也参与
+计数。公式固定为 `min(target_token_count * 6 + 10, 2000)`。
 
 服务只接受已知字段，unknown field 返回 `invalid_request`。
 
@@ -1041,7 +1043,6 @@ service_busy
 cuda_unavailable
 cuda_device_invalid
 model_load_failed
-engine_oom
 engine_error
 client_too_slow
 ```
@@ -1061,12 +1062,14 @@ HTTP 状态固定为：
 | `invalid_request` | 400 |
 | `invalid_voice` | 404 |
 | `input_too_large` | 413 |
-| `service_busy`、`engine_oom` | 503 |
+| `service_busy` | 503 |
 | `engine_error` | 500 |
 
 框架 schema validation 也统一映射为 `invalid_request` 400，不泄漏 FastAPI 的
 默认错误格式。`cuda_unavailable`、`cuda_device_invalid` 和
 `model_load_failed` 是启动日志/进程退出码，不会由已 ready 的 HTTP 服务返回。
+ready 后的推理 fatal 对当前请求 best-effort 映射为 `engine_error`，随后顶层
+runner 非零退出；不通过 traceback 字符串猜测独立 OOM 错误码。
 `client_too_slow` 只用于 WebSocket。
 
 ### 15.2 最小可观测性

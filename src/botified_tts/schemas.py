@@ -80,6 +80,10 @@ ClientMessage = (
 def parse_synthesis_options(value: Mapping[str, object]) -> SynthesisOptions:
     _reject_unknown(value, {"voice", "mode", "style"}, "synthesis options")
     style = _optional_string(value, "style")
+    if style is not None and not style.strip():
+        raise InvalidSynthesisOptions(
+            "style must be a non-empty string when provided"
+        )
     if style is not None and len(style.encode("utf-8")) > STYLE_MAX_BYTES:
         raise InvalidSynthesisOptions("style exceeds 512 UTF-8 bytes")
 
