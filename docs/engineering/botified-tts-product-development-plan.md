@@ -770,9 +770,9 @@ spoken-only 没有可观察优势，分支已删除，不作为配置或备用�
 
 ### 12.2 薄 fork 边界
 
-当前 Nano 在 reference padding、continuation completion、AsyncPool cancel 传播
-和 child fatal 传播四处不能直接满足服务语义。因此 Botified 维护一个固定 commit
-的最小 fork，只允许以下四项改动：
+当前 Nano 在 reference padding、continuation completion、AsyncPool cancel
+传播、child fatal 传播和 runtime dependency 五处不能直接满足服务。因此
+Botified 维护一个固定 commit 的最小 fork，只允许以下五项改动：
 
 1. `encode_latents(audio, role=reference|prompt)` 使用正确 padding。
 2. payload 使用独立的 `generated_latents` list 逐 step 保存新 latent；正常结束
@@ -783,6 +783,9 @@ spoken-only 没有可观察优势，分支已删除，不作为配置或备用�
 4. child `srv.step()` exception 发出 fatal event 后退出；parent 同时监视 child
    意外退出。两条路径都设置唯一 fatal state，使 active streams、pending
    operations 和后续 submit 有界失败。
+5. 从 fork `pyproject.toml` 删除 runtime/tests/deployment 均未使用的
+   `torchcodec`，并删除 `.github/workflows/ci.yml` 中只为它存在的 version
+   字段、安装步骤和 matrix 维度。
 
 不能从 payload 的 `feats` 切片推导生成结果：sequence 经 preemption 后重新
 prefill 时 Nano 会 concatenate `feats`，prompt/generated 边界会丢失。terminal
@@ -817,6 +820,10 @@ fork 不包含：
 - 多 GPU 调度；
 - artifact 或持久化。
 
+不为已删除的 torchcodec 增加“缺失测试”、NPP 系统包、`LD_LIBRARY_PATH`、
+optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` 解码并
+标准化 WAV/FLAC/MP3 的真实依赖，继续由项目 Dockerfile 安装并固定版本。
+
 上游合并等价能力后，原地删除对应 fork 改动，不保留双路径。
 
 ### 12.3 固定依赖
@@ -831,6 +838,7 @@ fork 不包含：
 - 当前 Nano 的未约束传递依赖会让解析器先选与 numba 不兼容的 NumPy。项目在
   顶层 `pyproject.toml` 固定 `numpy==2.4.6`、`numba==0.66.0` 和
   `llvmlite==0.48.0`，再生成唯一 `uv.lock`；不依赖解析器偶然回退。
+- `pyproject.toml` 和 `uv.lock` 不包含未使用的 torchcodec。
 - VoxCPM2 使用不可变 Hugging Face revision。容器通过 CUDA preflight 后，应用
   调用 `snapshot_download(repo_id, revision=<immutable-sha>,
   cache_dir=/data/model-cache)`，再把返回的本地 snapshot path 传给 Nano。
@@ -855,9 +863,9 @@ fork 不包含：
 
 当前 verified baseline 为 RTX 4090 24,564 MiB、compute capability 8.9、driver
 575.64.05（driver CUDA capability 12.9）。隔离运行环境为 Python 3.12.13、
-PyTorch/torchaudio 2.9.0+cu126、torchcodec 0.9.0+cu126、Triton 3.5.0、
-FlashAttention 2.8.3，以及第 12.3 节固定的 NumPy/Numba/llvmlite；模型 revision
-为 `bffb3df5a29440629464e5e839f4d214c8714c3d`。
+PyTorch/torchaudio 2.9.0+cu126、Triton 3.5.0、FlashAttention 2.8.3，以及第
+12.3 节固定的 NumPy/Numba/llvmlite；模型 revision 为
+`bffb3df5a29440629464e5e839f4d214c8714c3d`。
 
 该环境 warm generation 的 TTFB 为 0.1408 秒、生成阶段 RTF 为 0.1130；
 `wait_for_ready()` 约 17.89 秒后首次 generation 仍有约 12.25 秒 compile，因此
@@ -1256,7 +1264,7 @@ botified-tts/
 
 | 风险 | 最小处理 |
 |---|---|
-| Nano 上游差异 | 第 12.2 节固定四项薄 fork 改动 |
+| Nano 上游差异 | 第 12.2 节固定五项薄 fork 改动 |
 | 分段质量 | 上一完整段 continuation + 固定听测 |
 | 资源积压 | 固定输入/队列上限、send timeout、cancel |
 | 环境不兼容 | 支持表、host/container preflight、固定依赖 |
