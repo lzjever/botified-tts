@@ -50,7 +50,7 @@ Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务�
 - 长文本与增量文本共享同一个分段器。
 - Voice Design、音色克隆和普通合成都映射到同一个 VoxCPM2 generate 调用。
 - REST、WebSocket、CLI 和 Skill 使用同一份请求字段定义。
-- 音频转换、chunk 聚合和错误映射各只有一个实现。
+- 音频转换、chunk 输出和错误映射各只有一个实现。
 
 ### 2.3 YAGNI
 
@@ -525,7 +525,7 @@ receive task
 generate/send task
   -> 从 queue 串行取 segment
   -> 调用 SpeechService/Nano
-  -> 聚合并直接发送 PCM
+  -> 将 Nano waveform chunk 转换为 PCM 并直接发送
 ```
 
 两者共享一个 cancellation signal。没有独立 audio queue。
@@ -589,15 +589,18 @@ cancel：
 - PCM s16le；
 - 48 kHz；
 - mono；
-- aggregator 以 160 ms 为目标聚合音频；
-- 每个 segment 完成时 flush 一次余量，因此每段最多有一个短于 160 ms 的尾包；
-- 若 Nano 原生 chunk 已大于 160 ms，直接发送，不再切碎；
-- 固定验收语料的平均值不超过每秒音频 10 个 binary message。
+- 固定 Nano/VoxCPM2 revision 的每个 waveform chunk（包括最后一步）都是
+  7680 samples，即 160 ms；
+- 每个 waveform chunk 转换后直接对应一个 WebSocket binary message，不合并、
+  不切分，也不裁剪最后一步可能包含的自然尾音或静音；
+- 因此固定输出频率为每秒音频 6.25 个 binary message，低于 10 个上限。
 
 waveform 到 PCM 的唯一转换为：拒绝 NaN/Inf，再执行
 `np.rint(np.clip(waveform, -1.0, 1.0) * 32767.0).astype("<i2")`。服务不做响度
 归一化、fade、重采样或第二次声道处理。HTTP WAV 和 WebSocket PCM 复用这一个
-转换函数。
+转换函数。固定边界向量 `[-2, -1, -.5, 0, .5, 1, 2]` 的结果必须是
+`[-32767, -32767, -16384, 0, 16384, 32767, 32767]`，与
+libsndfile/soundfile 默认 PCM_16 写入语义一致。
 
 该约束是按“音频时长”计算，不要求服务器按墙钟时间定时发送。
 
@@ -691,6 +694,10 @@ timer。到期时主动调用 segmenter：
 `finally` 中释放。没有 slot 时立即返回 `service_busy`；不把请求排进 Nano 的
 无界 waiting queue。admission counter 与 Nano `max_num_seqs` 使用同一个常量，
 但它只是入口资源边界，不实现第二个 scheduler。
+
+HTTP 的 `service_busy` 使用 `503` 并返回 `Retry-After: 1`；这是服务整体的瞬时
+推理容量不可用，不是某个客户端超过 rate quota，因此不使用 `429`。WebSocket
+在 `start` 时发送 `service_busy` error 后关闭。
 
 ### 10.4 HTTP 复用
 
@@ -805,6 +812,9 @@ fork 不包含：
 - Nano 使用不可变 git commit。
 - Nano Git dependency 指向 Botified 最小 fork 的不可变 commit，不做运行时
   monkey patch，也不把整个 Nano 源码复制进本仓库。
+- 当前 Nano 的未约束传递依赖会让解析器先选与 numba 不兼容的 NumPy。项目在
+  顶层 `pyproject.toml` 固定 `numpy==2.4.6`、`numba==0.66.0` 和
+  `llvmlite==0.48.0`，再生成唯一 `uv.lock`；不依赖解析器偶然回退。
 - VoxCPM2 使用不可变 Hugging Face revision。容器通过 CUDA preflight 后，应用
   调用 `snapshot_download(repo_id, revision=<immutable-sha>,
   cache_dir=/data/model-cache)`，再把返回的本地 snapshot path 传给 Nano。
@@ -1050,7 +1060,7 @@ HTTP 状态固定为：
 - VoiceStore 创建、list、delete、半写失败清理，以及 delete 与已取得 immutable
   snapshot 并发时已有请求仍可读取。
 - PCM 对固定 float vectors 执行 NaN/Inf 拒绝、clip、round 和 little-endian
-  int16 转换；160 ms 合并后每个 segment 最多一个短尾包。
+  int16 转换，并验证每个 7680-sample Nano chunk 直接映射一个 binary message。
 - `SpeechService` 只在 terminal completion 后 commit continuation，并在正常、
   cancel 和 error 路径显式 `aclose()` Nano stream。
 - admission slot 满时立即 `service_busy`，所有 HTTP/WS 结束路径都释放 slot。
@@ -1083,7 +1093,7 @@ fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部
 8. 两个以上 segment 的 continuation；
 9. cancel；
 10. RTF 小于 1；
-11. 音频 chunk 频率不超过 10/s。
+11. 每个音频 chunk 均为 7680 samples，输出频率为 6.25/s。
 
 不建设 8/16/32 并发矩阵、全语言矩阵、自动 WER/UTMOS 平台或 worker restart
 仿真。
@@ -1238,7 +1248,7 @@ botified-tts/
   已形成 segment 的音频。
 - [ ] 输入 chunk 边界不造成丢字、重字或重排。
 - [ ] WebSocket 输出 48 kHz mono PCM s16le；固定验收语料平均每秒音频不超过
-  10 个 binary chunks，且每段最多一个短尾包。
+  10 个 binary chunks。
 - [ ] continuation 无明显 click、异常静音、重复或截断音素。
 - [ ] cancel、输入超限和 send timeout 均能有界结束 session。
 - [ ] 默认日志不包含正文、reference、audio、latent 或 secret。
