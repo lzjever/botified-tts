@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from botified_tts.engine import GenerationCompletion
+from botified_tts.engine import EngineError, GenerationCompletion
 from botified_tts.schemas import (
     DesignVoice,
     InvalidSynthesisOptions,
@@ -373,6 +373,30 @@ def test_error_or_close_failure_does_not_start_the_next_segment(
     with pytest.raises(RuntimeError):
         asyncio.run(_collect(service, options, "one", "two"))
 
+    assert len(engine.generate_calls) == 1
+    assert engine.streams[0].closed
+
+
+def test_invalid_waveform_maps_to_engine_error_and_stops_segments() -> None:
+    invalid_waveform = np.full(7680, np.nan, dtype=np.float32)
+    engine = FakeEngine(
+        plans=[
+            StreamPlan(
+                [
+                    invalid_waveform,
+                    GenerationCompletion(generated_latents=b"uncommitted"),
+                ]
+            )
+        ]
+    )
+    service = SpeechService(engine, FakeVoiceStore())
+    options = SynthesisOptions(voice=None, mode=None, style=None)
+
+    with pytest.raises(EngineError) as caught:
+        asyncio.run(_collect(service, options, "one", "two"))
+
+    assert caught.value.code == "engine_error"
+    assert str(caught.value) == "engine_error: VoxCPM2 emitted an invalid waveform"
     assert len(engine.generate_calls) == 1
     assert engine.streams[0].closed
 

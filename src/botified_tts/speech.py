@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from botified_tts.audio import float32_to_pcm_s16le
+from botified_tts.audio import InvalidWaveform, float32_to_pcm_s16le
 from botified_tts.engine import EngineError, GenerationCompletion, VoxCPMEngine
 from botified_tts.schemas import (
     DesignVoice,
@@ -85,7 +85,14 @@ class SpeechService:
                     if isinstance(item, GenerationCompletion):
                         completion = item
                     else:
-                        yield float32_to_pcm_s16le(item)
+                        try:
+                            pcm = float32_to_pcm_s16le(item)
+                        except InvalidWaveform as error:
+                            raise EngineError(
+                                "engine_error",
+                                "VoxCPM2 emitted an invalid waveform",
+                            ) from error
+                        yield pcm
             finally:
                 await generation.aclose()
 
