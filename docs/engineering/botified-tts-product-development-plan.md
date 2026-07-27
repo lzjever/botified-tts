@@ -1,2295 +1,1154 @@
-# Botified TTS 产品与工程开发计划
+# Botified TTS 产品开发计划
 
-> 状态：技术分析完成，待 Architecture Review
->
+> 状态：产品与架构收敛完成，可交付开发
 > 目标仓库：`botified-tts`
->
 > 研究基线：2026-07-27
->
-> 模型：OpenBMB VoxCPM2
->
-> 推理内核：Nano-vLLM-VoxCPM
+> 上游审阅基线：VoxCPM `616d3d3e630a9c96c2853250eef91b0f39dcd5fa`、
+> Nano-vLLM-VoxCPM `0ef61b0ba634dbf2fad9e916bc4fb696a3c0f51f`
 
-## 1. 文档定位
+## 1. 产品定义
 
-本计划用于交付 Botified 生态中的独立 TTS 服务。产品必须支持：
+Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务。
 
-- VoxCPM2 音色克隆；
-- Voice Design；
-- 情绪、语速、音高、能量和表达风格控制；
-- 笑声、叹气、犹豫等非语言声音；
-- Agent token 流式输入；
-- 音频流式输出；
-- 跨分段语音上下文延续；
-- 用户打断、取消和状态回滚；
-- OpenAI Speech API 兼容子集；
-- Botified Native API；
-- 可供 Codex、OpenClaw 和 Botified Agent 使用的统一 Skill；
-- CUDA-only 一键部署和明确的无 CUDA 失败行为。
+它只解决一件事：
 
-该服务是 Botified 的独立周边服务，不属于 Botified Core、Botified Claw
-Gateway 或 `botified-asr` 进程。各组件通过稳定协议独立演进：
+> 把 VoxCPM2 的主要语音合成能力封装成稳定、方便的 HTTP 非流式接口和
+> WebSocket 双向流式接口。
 
-```text
-Botified / OpenClaw / other agent
-        |
-        | text delta / explicit synthesis request
-        v
-botified-tts
-        |
-        | Nano-vLLM-VoxCPM
-        v
-VoxCPM2
-        |
-        +-- realtime PCM -> robot/player
-        |
-        `-- Ogg/Opus artifact -> publish_file(audio_as_voice=true)
-```
+产品不是通用语音平台，也不负责语音内容生产之后的渠道发布、播放进度、
+多租户治理或长期语音资产管理。
 
-## 2. 决策摘要
+首版必须做到：
 
-### 2.1 推理引擎
+1. 使用 VoxCPM2 和 Nano-vLLM-VoxCPM。
+2. 支持普通合成、Voice Design、可控音色克隆和高保真音色克隆。
+3. 支持自然语言风格控制和 VoxCPM2 原生非语言标签。
+4. 提供一个 HTTP 非流式合成入口，直接返回 WAV。
+5. 提供一个 WebSocket 双向流式入口，接收任意粒度的增量文本并输出 PCM。
+6. 服务端完成句子级分段，并利用上一完整语音段保持跨段连续性。
+7. 支持可复用音色的创建、列表和删除。
+8. 无 CUDA 时在模型下载和加载前明确失败，不尝试 CPU。
+9. 使用 Docker Compose 一键部署。
+10. 提供一个最小 Agent Skill。
 
-首版选择
-[`Nano-vLLM-VoxCPM`](https://github.com/a710128/nanovllm-voxcpm)
-作为 VoxCPM2 推理内核，不选择 vLLM-Omni 作为首版核心。
+## 2. 设计原则
 
-原因：
+### 2.1 KISS
 
-1. Botified-TTS 是单一模型的专用服务，不需要 vLLM-Omni 的多模型服务复杂度。
-2. Nano 已经支持 `prompt_latents`、`prompt_text` 和
-   `ref_audio_latents`，与跨段 continuation 的需求直接对应。
-3. Nano 内部已经持有每一步生成的 latent，只需小型扩展即可把最终 latent
-   交给 Session Manager。
-4. Nano 的异步生成接口适合 Botified 自己实现 WebSocket、取消、分段和
-   Voice Profile。
-5. 在单 GPU 和中等并发场景下，Nano 与 vLLM-Omni 的 VoxCPM2 RTF
-   处于同一量级。
+- 一个服务部署单元。
+- 一个 VoxCPM2 模型。
+- 一个服务实例使用一张 GPU。
+- 一个合成核心同时服务 HTTP 和 WebSocket。
+- 一个本地目录保存注册音色，不引入数据库。
+- 一个 Docker Compose 部署方式。
+- 仅支持当前 Botified 所需的纯文本输入和两种输出方式。
 
-vLLM-Omni 只作为未来可选后端。当出现下列明确需求时再增加 adapter：
+### 2.2 DRY
 
-- 单 GPU 32～64 以上持续高并发；
-- 大规模多租户；
-- 现有运维平台已经统一采用 vLLM；
-- 必须由推理服务原生暴露 OpenAI Speech API；
-- 同一服务需要运行多种语音或多模态模型。
+- HTTP 与 WebSocket 共享同一个 `SpeechService` 和 Nano adapter。
+- 长文本与增量文本共享同一个分段器。
+- Voice Design、音色克隆和普通合成都映射到同一个 VoxCPM2 generate 调用。
+- REST、WebSocket、CLI 和 Skill 使用同一份请求字段定义。
+- 音频转换、chunk 聚合和错误映射各只有一个实现。
 
-### 2.2 产品接口
+### 2.3 YAGNI
 
-Botified Native API 是完整能力契约；OpenAI API 只是兼容入口。
+首版不为可能出现的公网、多租户、多模型、多 GPU 或其他 TTS 引擎提前抽象。
+只有真实业务需求出现后，才增加兼容层、codec、调度器或持久任务。
 
-服务提供三层调用面：
+### 2.4 一个功能一种做法
 
-| 调用面 | 用途 |
+| 功能 | 唯一做法 |
 |---|---|
-| Botified Native REST | Voice Profile、Voice Design、文件生成和管理 |
-| Botified Native WebSocket | 双向流式、跨段延续、情绪更新、取消和 playback ack |
-| OpenAI-compatible REST | 普通完整文本 TTS 客户端兼容 |
+| 非流式合成 | `POST /v1/speech` |
+| 双向流式合成 | `WS /v1/speech/stream` |
+| 注册音色 | `POST /v1/voices` |
+| Voice Design | `/v1/speech` 中使用 `voice.type=design` |
+| 风格和情绪 | 一个自然语言 `style` 字段 |
+| 语气词和非语言声音 | 直接写入 `text` 的 VoxCPM2 原生标签 |
+| 跨段连续性 | 上一个完整生成段的 text + generated latents |
+| 中断 | 取消并结束当前 WebSocket session |
+| 部署 | `./scripts/deploy.sh` |
 
-### 2.3 Agent 集成
+## 3. 产品边界
 
-Agent Skill 和实时 token bridge 是两个不同产品：
+### 3.1 首版包含
 
-- Skill 用于 Agent 显式创建音色、选择风格、生成音频文件和语音留言。
-- `botified-tts-bridge` 用于把 Agent 的实时文本 delta 转发给 TTS。
+- Linux x86_64、NVIDIA CUDA。
+- VoxCPM2 单模型。
+- Nano-vLLM-VoxCPM 单推理后端。
+- 单实例单 GPU；不同请求的 batching 交给 Nano。
+- HTTP 完整文本输入、WAV 输出。
+- WebSocket 增量文本输入、48 kHz mono PCM s16le 输出。
+- 普通无参考合成。
+- Voice Design。
+- reference-only 可控音色克隆。
+- reference + exact transcript 高保真音色克隆。
+- 自然语言 voice/style instruction。
+- 官方推荐的非语言标签。
+- 最小本地音色创建、列表和删除。
+- 文本自动分段、强制 flush、finish 和 cancel。
+- CUDA preflight、模型 warmup、健康检查。
+- Docker Compose 一键部署。
+- Botified 调用示例和最小 Agent Skill。
 
-Skill 不能替代实时 bridge，因为 Skill 无法天然接收同一次 Agent 回答的每个
-token delta。
+### 3.2 首版明确不包含
 
-## 3. 产品目标
+- OpenAI Audio API 兼容层。
+- vLLM-Omni 或可插拔推理后端框架。
+- Voice Design candidate、试听列表或 materialize 工作流。
+- generation job、artifact、对象存储和异步任务。
+- Markdown、SSML、speech parts 或增量 Markdown parser。
+- 结构化 emotion、pace、pitch、energy、preset 或 style compiler。
+- 对非语言标签再设计一套结构化词汇。
+- MP3、Ogg、Opus 或渠道专用编码。
+- playback ack、播放水位、回滚和断线恢复。
+- session 内切换 voice、style 或 mode。
+- WebRTC、电话网关和通话编排。
+- 独立 Botified TTS Bridge 产品。
+- 多 GPU 调度、sticky routing 和故障迁移。
+- LoRA 训练、在线加载或音色微调。
+- Prometheus 平台、自动音质评分或大规模 benchmark 矩阵。
+- Voice Profile 授权证明、来源核验、滥用检测和合规审计。
+- 多租户、用户、组织、RBAC、计费和管理后台。
 
-### 3.1 必须交付
+如果未来出现明确的 OpenAI 客户端兼容需求，可以在 canonical
+`SpeechService` 之上增加薄 adapter；该可能性不进入首版实现。
 
-1. 一个独立部署的 CUDA-only TTS 服务。
-2. VoxCPM2 reference-only 音色克隆。
-3. VoxCPM2 reference + continuation 高保真音色克隆。
-4. Voice Design 候选生成、试听和持久化。
-5. 结构化的 emotion、pace、pitch、energy 和自定义 style instruction。
-6. 官方支持的非语言标签。
-7. 普通文本、Markdown 和结构化 speech parts。
-8. Agent text delta 输入和 PCM 音频输出的全双工 WebSocket。
-9. 服务端智能分段。
-10. 生成 latent 驱动的跨段 continuation。
-11. 用户打断、请求取消、未播放状态回滚。
-12. OpenAI `/v1/audio/speech` 明确兼容子集。
-13. 持久 Voice Profile。
-14. Bearer Token 鉴权。
-15. CUDA preflight、模型固定、warmup 和 readiness。
-16. 一键安装和公开 release manifest。
-17. 一份同时兼容 Codex、OpenClaw 和 Botified 的 Agent Skill。
-18. 与 Botified LLM text preview 对接的可选 bridge。
+## 4. 上游能力与采用方式
 
-### 3.2 首版不承诺
+### 4.1 采用依据
 
-- 向同一个 VoxCPM2 推理请求无限追加未知文本；
-- 精确到物理数值的语速、音高或停顿控制；
-- 完整 SSML；
-- Voice Profile 的授权证明、来源验证、滥用检测和合规审计；
-- 跨进程、跨版本复用未经 fingerprint 校验的 voice latents；
-- CPU fallback；
-- 移动端或 Apple Silicon 推理；
-- WebRTC、电话网关或实时通话平台；
-- 多租户账号、组织、计费和配额系统；
-- LoRA 在线训练；
-- 在 Gateway 内实现 TTS 或渠道音频编码逻辑；
-- 对所有语言提供完全一致的情绪和音色表现；
-- 对草稿 token stream 提供最终文本一致性保证。
+VoxCPM2 官方资料确认：
 
-## 4. 上游能力和采用边界
-
-### 4.1 VoxCPM2 基础能力
-
-VoxCPM2 是 2B 参数、48 kHz 输出、6.25 Hz latent token rate 的多语言
-TTS 模型，支持 30 种语言和 9 种中文方言。官方公开能力包括：
-
-- 普通 TTS；
-- natural-language Voice Design；
-- isolated reference voice cloning；
-- style-controllable voice cloning；
-- continuation-based high-fidelity cloning；
-- 48 kHz AudioVAE V2 输出；
-- 流式音频生成；
-- LoRA 和全量微调。
+- 支持 30 种语言和多种中文方言；
+- 输出 48 kHz 音频；
+- 支持 Voice Design；
+- 支持无需 transcript 的 reference-only 可控克隆；
+- 支持 reference + exact transcript 的高保真 continuation 克隆；
+- 支持自然语言控制音色、情绪、节奏和表达方式；
+- 支持流式音频输出；
+- 长文本推荐按句子拆分生成；
+- 原生模型不支持“同一个推理请求内文本不断增长”的双向流式。
 
 参考：
 
-- [VoxCPM 官方仓库](https://github.com/OpenBMB/VoxCPM)
-- [VoxCPM2 使用指南](https://voxcpm.readthedocs.io/en/latest/usage_guide.html)
-- [VoxCPM2 技术报告](https://arxiv.org/abs/2606.06928)
+- [VoxCPM README](https://github.com/OpenBMB/VoxCPM)
+- [VoxCPM2 Usage Guide](https://voxcpm.readthedocs.io/en/latest/usage_guide.html)
+- [VoxCPM2 Voice Cookbook](https://voxcpm.readthedocs.io/en/latest/cookbook.html)
+- [Nano-vLLM-VoxCPM](https://github.com/a710128/nanovllm-voxcpm)
 
-### 4.2 三条独立控制通道
-
-Botified-TTS 必须把下列概念分开建模：
-
-| 通道 | 用户语义 | VoxCPM2 条件 |
-|---|---|---|
-| Voice Identity | 谁在说话 | isolated reference audio 或 LoRA |
-| Style | 怎么说 | target text 前的自然语言 instruction |
-| Continuity | 如何接着上一段说 | prompt audio latent + exact prompt text |
-
-这三个通道不能被压缩成一个 OpenAI `voice` 字符串。
-
-### 4.3 生成模式
-
-服务公开下列 `voice.mode`：
-
-| 模式 | 输入 | 优先目标 | style |
-|---|---|---|---|
-| `design` | voice description，无 reference | 创建新声音 | 必需或推荐 |
-| `expressive` | isolated reference | 保持音色并改变表达 | 支持 |
-| `faithful` | reference + paired continuation | 最大相似度和原始表达还原 | 不支持 |
-| `auto` | 根据 Voice Profile 和请求解析 | 自动选择 | 条件支持 |
-
-官方文档说明：Hi-Fi cloning 启用 paired prompt transcript 时，control
-instruction 会被忽略。官方 CLI 也禁止 `--control` 与 `--prompt-text`
-组合。
-
-因此服务必须拒绝下列请求，而不是静默忽略：
+因此，本项目的“双向流式”定义为：
 
 ```text
-voice.mode=faithful + style
+客户端持续 append text
+        |
+服务端形成不可变 sentence/segment
+        |
+每个 segment 调用一次 Nano streaming generation
+        |
+服务端持续返回上一 segment 的 audio chunks
+```
+
+它是服务层的全双工协议，不宣称 VoxCPM2 支持对同一个未完成推理请求追加
+token。
+
+### 4.2 VoxCPM2 模式映射
+
+| API 输入 | VoxCPM2 条件 | 语义 |
+|---|---|---|
+| 无 `voice`、无 `style` | target text | 普通合成，音色不保证跨请求一致 |
+| 无 `voice`、有 `style` | `(style) + text` | 无参考风格合成，音色不保证跨请求一致 |
+| `voice.type=design` | `(description + style) + text` | Voice Design |
+| profile + `controllable` | right-padded reference latent + optional style | 音色稳定、表达可控 |
+| profile + `faithful` | left-padded prompt latent + exact transcript，并附 reference latent | 最大程度复现原声音色和表达 |
+
+规则：
+
+- `faithful` 要求注册音色时提供与 reference audio 精确一致的 transcript。
+- 官方说明高保真模式会忽略 control instruction，因此 `faithful + style`
+  直接返回 `invalid_request`，不静默忽略。
+- `style` 是自然语言字符串。服务只负责使用固定模板添加为模型 control
+  instruction，不虚构模型不存在的独立控制头。
+- Voice Design 的 `description` 和 `style` 同时存在时，按固定顺序合成一个
+  instruction：先 voice description，后 delivery style。
+- Voice Design 具有模型原生随机性。需要复用某次结果时，将生成的 WAV 注册为
+  profile；首版不暴露 seed。
+
+### 4.3 原生文本能力
+
+服务接收“应被朗读的纯文本”，不解析 Markdown。
+
+客户端可以直接使用官方非语言标签：
+
+```text
+[laughing] [sigh] [Uhm] [Shh]
+[Question-ah] [Question-ei] [Question-en] [Question-oh]
+[Surprise-wa] [Surprise-yo] [Dissatisfaction-hnn]
+```
+
+服务不把这些标签映射成另一套 event schema，也不自动插入语气词。
+
+Botified 调用方负责把 Agent 的 Markdown 或结构化回答投影成最终朗读文本。
+TTS 服务只负责分段，不负责决定哪些业务内容应该被朗读。
+
+## 5. 最小架构
+
+```text
+HTTP / WebSocket
+        |
+        v
+SpeechService
+  |        |          |
+  |        |          +-- Segmenter / StreamingSession
+  |        +------------- VoiceStore
+  +---------------------- VoxCPMEngine
+                              |
+                              v
+                    Nano-vLLM-VoxCPM / CUDA
+```
+
+### 5.1 `SpeechService`
+
+`SpeechService` 是唯一合成 owner：
+
+```python
+async def synthesize(
+    options: SynthesisOptions,
+    segments: AsyncIterator[str],
+) -> AsyncIterator[PCMChunk]
+```
+
+- 解析 voice 和 mode；
+- 从 `VoiceStore` 读取 reference；
+- 构造 VoxCPM2 conditioning；
+- 串行生成同一请求/session 的 segments；
+- 保存上一个完整段的 continuation；
+- 统一输出 PCM chunks。
+
+HTTP adapter 收集该 iterator 并封装 WAV。WebSocket adapter 直接发送同一个
+iterator。不得为 HTTP 再实现一套非流式模型调用。
+
+### 5.2 `VoxCPMEngine`
+
+- 只封装 Nano-vLLM-VoxCPM，不设计通用 engine interface。
+- Nano worker 与 Web 服务属于同一部署单元，不另起一个内部 HTTP 服务。
+- 同一 session 的 segment 串行提交。
+- 不同 session 的并发与 batching 使用 Nano 原生能力。
+- 服务层 request/session ID 不进入 Nano 公共模型协议。
+
+### 5.3 `VoiceStore`
+
+- 本地目录是唯一持久化方式。
+- 保存标准化 reference WAV、可选 exact transcript 和简单 metadata。
+- reference/prompt latents 只放进程内 cache，不持久化。
+- 重启后按需重新编码，避免 latent schema、fingerprint 和迁移体系。
+- 创建和删除使用临时目录加原子 rename，防止留下半写资源。
+
+### 5.4 `StreamingSession`
+
+每个 WebSocket 连接只保存：
+
+- 固定的 voice、mode、style 和 generation options；
+- 一个增量文本 buffer；
+- 一个受 session 64 KiB 总文本预算约束的 segment queue；
+- 当前 Nano generation task；
+- 上一个完整生成段的 spoken text 和 generated latents；
+- cancelled/finished 状态。
+
+不保存客户端播放位置，不提供 session 恢复。
+
+## 6. 音色管理
+
+### 6.1 存储
+
+```text
+data/voices/<voice-id>/
+├── metadata.json
+└── reference.wav
+```
+
+`metadata.json` 只包含：
+
+```json
+{
+  "id": "voice_01k...",
+  "name": "assistant",
+  "prompt_text": "可选的精确参考音频文本",
+  "duration_seconds": 8.4,
+  "created_at": "2026-07-27T00:00:00Z"
+}
+```
+
+不保存：
+
+- candidate；
+- version；
+- rights assertion；
+- generated artifact；
+- persisted latent；
+- model fingerprint；
+- audit history。
+
+### 6.2 创建
+
+```http
+POST /v1/voices
+Content-Type: multipart/form-data
+```
+
+字段：
+
+| 字段 | 必填 | 说明 |
+|---|---:|---|
+| `name` | 是 | 人类可读名称 |
+| `file` | 是 | WAV、FLAC 或 MP3 reference audio |
+| `prompt_text` | 否 | 与音频逐字一致时启用 faithful 模式 |
+
+服务在注册时：
+
+1. 解码并 downmix 为 mono；
+2. 重采样为 VoxCPM2 encoder 所需的 16 kHz；
+3. 检查非空、非静音和时长；
+4. 保存为标准 WAV；
+5. 返回 voice metadata。
+
+参考音频推荐 5～30 秒。首版接受范围固定为 3～60 秒，超过范围直接拒绝。
+不提供远程 URL 或服务器本地路径注册方式。
+
+### 6.3 查询和删除
+
+```text
+GET    /v1/voices
+DELETE /v1/voices/{id}
+```
+
+- list 返回 metadata，不返回 reference audio。
+- 名称可重复，调用始终使用唯一 ID。
+- update 不进入首版；需要修改时删除后重新创建。
+- delete 删除目录并清理该 voice 的进程内 latent cache。
+- 正在使用的 session 保持已加载的内存引用直到结束；新请求立即看不到该 ID。
+
+本项目使用可信数据并运行在可信内网，Voice Profile 安全和授权治理不在范围内。
+
+## 7. Canonical 合成选项
+
+HTTP body 和 WebSocket `start` 共用一个 `SynthesisOptions`：
+
+```json
+{
+  "voice": {
+    "type": "profile",
+    "id": "voice_01k..."
+  },
+  "mode": "controllable",
+  "style": "温暖、自然、语速稍慢"
+}
+```
+
+`voice` 是可选 union：
+
+```json
+{"type":"profile","id":"voice_01k..."}
+```
+
+或：
+
+```json
+{
+  "type": "design",
+  "description": "温暖自然的年轻女性声音，音高略低"
+}
+```
+
+字段规则：
+
+| 字段 | 规则 |
+|---|---|
+| `voice` | 可选；省略表示普通无参考合成 |
+| `mode` | profile 可用：`controllable`（默认）或 `faithful` |
+| `style` | 可选自然语言 instruction；faithful 禁止 |
+
+HTTP body 是 `text + SynthesisOptions`；WebSocket `start` 只包含
+`SynthesisOptions`，文本由后续 `append` 提供。
+
+`cfg_value`、`temperature` 和 `inference_timesteps` 在 Phase 0 固定为服务内部
+默认值，不进入公共 API。内部 `max_generate_length` 根据 segment 长度计算。
+
+服务只接受已知字段，unknown field 返回 `invalid_request`。
+
+## 8. HTTP 非流式 API
+
+### 8.1 健康检查
+
+```http
+GET /health
+```
+
+ready 时：
+
+```json
+{
+  "status": "ready",
+  "cuda": true,
+  "model": "openbmb/VoxCPM2",
+  "sample_rate": 48000
+}
+```
+
+服务只在 CUDA preflight、模型加载和 warmup 成功后开始接受请求，因此
+`/health` 只返回 ready `200`。preflight 或模型加载失败时记录稳定错误码并退出，
+不启动一个专门返回 `503` 的后台状态服务。deploy 脚本通过容器退出或 health
+timeout 判断启动失败。
+
+### 8.2 合成
+
+```http
+POST /v1/speech
+Content-Type: application/json
+Accept: audio/wav
+```
+
+响应固定为：
+
+```text
+Content-Type: audio/wav
+```
+
+服务使用同一分段器处理完整文本，并按顺序收集 `SpeechService` 的 PCM
+iterator，最后封装成一个 48 kHz mono WAV。它不创建 job、artifact 或下载 URL。
+
+### 8.3 鉴权
+
+`/health` 不鉴权。`/v1/*` 和 WebSocket 使用一个部署级 Bearer Token：
+
+```http
+Authorization: Bearer <BOTIFIED_TTS_API_KEY>
+```
+
+这是内部服务的最小访问边界，不增加账号、角色、租户或审计体系。
+
+## 9. WebSocket 双向流式 API
+
+### 9.1 入口
+
+```text
+WS /v1/speech/stream
+```
+
+连接建立后，第一条消息必须是 `start`：
+
+```json
+{
+  "type": "start",
+  "voice": {"type":"profile","id":"voice_01k..."},
+  "mode": "controllable",
+  "style": "自然、亲切"
+}
+```
+
+服务校验后返回：
+
+```json
+{
+  "type": "ready",
+  "audio": {
+    "encoding": "pcm_s16le",
+    "sample_rate": 48000,
+    "channels": 1
+  }
+}
+```
+
+### 9.2 客户端消息
+
+追加任意粒度文本：
+
+```json
+{"type":"append","text":"我感觉"}
+{"type":"append","text":"这个方案可以，"}
+{"type":"append","text":"我们继续吧。"}
+```
+
+强制提交当前 buffer，但保持 session：
+
+```json
+{"type":"flush"}
+```
+
+提交尾部并等待全部音频发送完成：
+
+```json
+{"type":"finish"}
+```
+
+取消当前生成并结束 session：
+
+```json
+{"type":"cancel"}
+```
+
+`append` 可以在服务生成和发送前一 segment 音频时继续到达，这就是产品要求的
+双向流式。
+
+每个连接固定使用两个并发任务：
+
+```text
+receive task
+  -> 接收 append/flush/finish/cancel
+  -> 驱动 segmenter 和 deadline timer
+  -> 将不可变 segment 放入受 session 文本预算约束的 queue
+
+generate/send task
+  -> 从 queue 串行取 segment
+  -> 调用 SpeechService/Nano
+  -> 聚合并直接发送 PCM
+```
+
+两者共享一个 cancellation signal。没有独立 audio queue。
+
+### 9.3 服务端消息
+
+服务端只发送：
+
+- `ready` JSON；
+- 有序 WebSocket binary PCM message；
+- `done` JSON；
+- `error` JSON。
+
+完成：
+
+```json
+{"type":"done","cancelled":false}
 ```
 
 错误：
 
 ```json
 {
+  "type": "error",
   "error": {
-    "type": "invalid_request_error",
-    "code": "style_not_supported_in_faithful_mode",
-    "param": "style",
-    "message": "faithful voice mode cannot be combined with style control"
+    "code": "invalid_request",
+    "message": "faithful mode does not accept style"
   }
 }
 ```
 
-### 4.4 Reference audio
+WebSocket 本身保证 message 顺序，因此不增加 audio sequence、自定义 binary
+header、sample offset 或 ack。
 
-参考音频产品约束：
-
-- 推荐时长：5～30 秒；
-- 单声道或可安全 downmix；
-- 输入可接受 WAV、FLAC、MP3 和服务明确列出的格式；
-- 清晰、少混响、少背景噪声；
-- reference-only 不要求 transcript；
-- faithful cloning 要求精确 transcript；
-- denoise 默认关闭；
-- denoise 只用于 noisy reference 的显式修复；
-- 不把 denoise 当生成音频后处理；
-- 注册时进行静音、削波、时长、可解码性和声道检查。
-
-### 4.5 Voice Design
-
-Voice Design description 推荐包含：
-
-- 性别或角色；
-- 年龄；
-- 音高；
-- 声线质感；
-- 情绪；
-- 节奏；
-- 使用场景。
-
-Voice Design 每次生成可能有变化。持久 Voice Profile 不能只保存
-description 并在每次请求重新 design。
-
-Canonical 工作流：
+### 9.4 状态机
 
 ```text
-description
-    |
-    v
-1～3 个 candidate audio
-    |
-    v
-用户或调用方选择 candidate
-    |
-    v
-candidate audio -> reference latent
-    |
-    v
-持久 Voice Profile
+NEW --start--> ACTIVE --finish--> DRAINING --> DONE
+                  |
+                  +--cancel----------------> CANCELLED
+
+任意状态 --protocol/engine error----------> ERROR
 ```
 
-未 materialize 的 candidate 是临时资源，默认 24 小时后删除。
+`ACTIVE` 内部只有 `IDLE` 和 `GENERATING`。voice、mode 和 style 在 `start`
+后固定；需要改变时建立新连接。
 
-### 4.6 Style control
+cancel：
 
-VoxCPM2 的 style 是自然语言文本条件，不是独立数值控制头。
+1. 停止接收新文本；
+2. 取消当前 Nano request；
+3. 清空尚未生成的 segments 并阻止后续 PCM send；
+4. 清空 continuation；
+5. 返回 `done(cancelled=true)` 并关闭连接。
 
-Native API 接受结构化 style：
+已经进入 socket write 的一个 frame 可能无法撤回。服务不尝试判断客户端已播放
+到哪里。Botified barge-in 后的新回答使用新连接。
 
-```json
-{
-  "preset": "empathetic",
-  "emotion": "concerned",
-  "intensity": "medium",
-  "pace": "slow",
-  "pitch": "low",
-  "energy": "soft",
-  "delivery": "like comforting a nervous friend",
-  "instruction": "末尾语气要坚定一些"
-}
-```
+### 9.5 音频 chunk
 
-服务内部 Style Compiler 按固定顺序生成一个 control instruction：
-
-```text
-emotion
-  -> intensity
-  -> pace
-  -> pitch
-  -> energy
-  -> delivery
-  -> custom instruction
-```
-
-编译结果示例：
-
-```text
-(语气关切，情绪强度中等，语速稍慢，音高略低，声音轻柔，
-像在安慰一个紧张的朋友，末尾语气要坚定一些)
-```
-
-调用方不需要自己拼接圆括号。服务必须移除 control instruction 内部的
-半角和全角圆括号，避免破坏模型输入约定。
-
-结构化字段只是语义意图，不承诺：
-
-- `pace=slow` 等于某个精确倍速；
-- `pitch=low` 等于某个 Hz；
-- `intensity=high` 在不同语言和音色上具有相同物理强度。
-
-### 4.7 非语言标签
-
-首版只允许官方推荐标签，服务用稳定事件名映射到模型标签：
-
-| Native event | VoxCPM2 tag |
-|---|---|
-| `laughing` | `[laughing]` |
-| `sigh` | `[sigh]` |
-| `uhm` | `[Uhm]` |
-| `shh` | `[Shh]` |
-| `question_ah` | `[Question-ah]` |
-| `question_ei` | `[Question-ei]` |
-| `question_en` | `[Question-en]` |
-| `question_oh` | `[Question-oh]` |
-| `surprise_wa` | `[Surprise-wa]` |
-| `surprise_yo` | `[Surprise-yo]` |
-| `dissatisfaction_hnn` | `[Dissatisfaction-hnn]` |
-
-未知事件返回 `400 unsupported_vocalization`。不自动猜测近义标签，不把
-`[Laughter]` 等非官方变体静默改写。
-
-Agent 和服务都不默认增加非语言声音。只有下列情况允许：
-
-- 用户明确要求；
-- 请求显式提交 speech part；
-- 部署启用明确的 `auto_expressiveness` 策略。
-
-即使启用自动策略，也必须限制每段数量，避免一条句子堆叠多个标签。
-
-### 4.8 Pronunciation
-
-首版 Native API 预留 pronunciation parts：
-
-```json
-{"type":"phoneme","alphabet":"pinyin","value":"{ni3}{hao3}"}
-```
-
-```json
-{"type":"phoneme","alphabet":"cmudict","value":"{HH AH0 L OW1}"}
-```
-
-实现约束：
-
-- phoneme span 内不执行 text normalization；
-- 分段器不能从 phoneme span 中间切分；
-- phoneme 语法必须严格校验；
-- 普通文本仍是默认和推荐路径；
-- 首版可以在核心流式能力完成后再开放 pronunciation parts，但 schema
-  必须避免与未来字段冲突。
-
-## 5. 总体架构
-
-```text
-                         +-----------------------------+
-                         | Botified-TTS API             |
-                         | REST / WebSocket / OpenAI    |
-                         +--------------+--------------+
-                                        |
-              +-------------------------+-------------------------+
-              |                                                   |
-              v                                                   v
-   +----------------------+                          +----------------------+
-   | Voice Profile Store  |                          | Session Manager      |
-   | SQLite + private FS  |                          | state/backpressure   |
-   +----------+-----------+                          +----------+-----------+
-              |                                                 |
-              v                                                 v
-   +----------------------+                          +----------------------+
-   | Audio Preprocessor   |                          | Text Pipeline        |
-   | decode/validate/VAE  |                          | markdown/TN/style    |
-   +----------+-----------+                          +----------+-----------+
-              |                                                 |
-              +----------------------+--------------------------+
-                                     |
-                                     v
-                          +----------------------+
-                          | Segment Scheduler    |
-                          | per-session serial   |
-                          | cross-session batch  |
-                          +----------+-----------+
-                                     |
-                                     v
-                          +----------------------+
-                          | Nano VoxCPM Adapter  |
-                          | pinned small fork    |
-                          +----------+-----------+
-                                     |
-                       +-------------+-------------+
-                       |                           |
-                       v                           v
-             +------------------+        +----------------------+
-             | Audio Aggregator |        | Continuation Manager |
-             | PCM / codec      |        | generated latents    |
-             +------------------+        +----------------------+
-```
-
-### 5.1 单一职责
-
-| 组件 | 职责 |
-|---|---|
-| API | 鉴权、协议验证、错误 envelope、连接生命周期 |
-| Voice Store | Voice Profile、candidate、artifact 和 fingerprint |
-| Audio Preprocessor | 解码、downmix、resample、质量检查和 role-aware encode |
-| Text Pipeline | Markdown、normalization、speech parts 和 style compiler |
-| Segmenter | 增量文本缓冲和语义分段 |
-| Session Manager | WebSocket 状态、取消、ack、回滚和资源限制 |
-| Scheduler | 同 session 串行、跨 session 并发 |
-| Nano Adapter | 唯一推理后端接口 |
-| Continuation Manager | generated latents、完整 segment deque 和状态版本 |
-| Audio Aggregator | 100～200 ms 网络 chunk、PCM 和文件编码 |
-
-### 5.2 KISS
-
-- 一个 Python 产品服务；
-- 一个 SQLite 数据库；
-- 一个私有数据目录；
-- 每张 GPU 一个 Nano server worker；
-- 不引入 Redis、Kafka、Celery、外部对象存储或服务发现；
-- 不在首版建立通用模型插件平台；
-- 不把 Voice Profile、session 和 generation job 强行塞进同一 DTO；
-- Native API、OpenAI adapter 和 Skill 共用同一 canonical generation
-  processor。
-
-## 6. Voice Profile
-
-### 6.1 资源模型
-
-```json
-{
-  "id": "voice_01J...",
-  "name": "robot-assistant",
-  "version": 1,
-  "source": {
-    "type": "reference",
-    "reference_duration_ms": 8200,
-    "transcript_status": "verified"
-  },
-  "capabilities": {
-    "expressive": true,
-    "faithful": true,
-    "lora": false
-  },
-  "default_style": {
-    "preset": "warm"
-  },
-  "model_fingerprint": "sha256:...",
-  "status": "ready",
-  "created_at": "2026-07-27T00:00:00Z"
-}
-```
-
-### 6.2 内部数据
-
-Voice Profile 内部可包含：
-
-- 原始 reference artifact；
-- 标准化后的 16 kHz mono reference；
-- isolated reference latents；
-- continuation prompt latents；
-- verified prompt transcript；
-- Voice Design description；
-- Voice Design candidate seed；
-- optional LoRA adapter name；
-- model fingerprint；
-- preprocessing fingerprint；
-- retention policy。
-
-latent 只供服务内部使用，公共 API 不返回 float32 latent bytes。
-
-### 6.3 Role-aware latent encoding
-
-VoxCPM2 官方实现：
-
-- isolated reference 使用 right padding；
-- continuation prompt 使用 left padding。
-
-当前 Nano `encode_latents()` 对所有音频采用 left padding。Botified fork
-必须改为：
-
-```python
-encode_latents(wav, role="reference")
-encode_latents(wav, role="continuation")
-```
-
-同一 reference file 在 faithful profile 中需要分别编码两个角色，不能假设
-同一份 latent 在两个 pathway 中完全等价。
-
-### 6.4 Voice fingerprint
-
-`model_fingerprint` 至少覆盖：
-
-- VoxCPM2 model revision；
-- `config.json` hash；
-- `model.safetensors` hash；
-- `audiovae.pth` hash；
-- tokenizer files hash；
-- Nano fork commit；
-- reference encode sample rate；
-- downmix 和 resample policy；
-- left/right padding policy；
-- latent dtype 和 shape contract。
-
-模型或 AudioVAE 升级后：
-
-- fingerprint 相同：允许直接加载；
-- fingerprint 不同且保留原始 reference：重新编码新 voice version；
-- fingerprint 不同且未保留 reference：标记 `stale`，要求重新上传；
-- 禁止静默使用不兼容 latents。
-
-### 6.5 Voice Design candidate
-
-创建请求：
-
-```http
-POST /v1/voice-candidates
-```
-
-```json
-{
-  "description": "温暖、自然的年轻女性声音，音高略低，语速舒缓",
-  "sample_text": "你好，我是你的机器人助手，很高兴认识你。",
-  "count": 3,
-  "seed": 42
-}
-```
-
-约束：
-
-- `count` 为 1～3；
-- 每个 candidate 使用独立 seed；
-- sample text 应产生至少约 5 秒声音；
-- candidate 不自动成为 Voice Profile；
-- materialize 前允许用户试听；
-- candidate 默认 24 小时过期；
-- candidate audio 不用于其他用户或其他部署。
-
-固化：
-
-```http
-POST /v1/voice-candidates/{candidate_id}/materialize
-```
-
-```json
-{
-  "name": "warm-assistant",
-  "retain_source_audio": true
-}
-```
-
-## 7. Text Pipeline
-
-### 7.1 输入格式
-
-Native API 支持：
-
-```text
-plain_text
-markdown
-parts
-```
-
-默认：
-
-- Agent bridge：`markdown`
-- 普通 SDK：`plain_text`
-- rich generation：`parts`
-
-### 7.2 Speech parts
-
-```json
-{
-  "format": "parts",
-  "parts": [
-    {"type":"text","text":"我想了想，"},
-    {"type":"vocalization","name":"uhm"},
-    {"type":"text","text":"我们还是现在出发吧。"},
-    {"type":"break","strength":"medium"},
-    {"type":"text","text":"不用担心，我会陪着你。"}
-  ]
-}
-```
-
-`break.strength` 只接受：
-
-```text
-short
-medium
-long
-```
-
-实现使用标点和 segment boundary 表达，不对外承诺精确毫秒。
-
-### 7.3 Markdown policy
-
-增量 Markdown 处理默认规则：
-
-- 标题标记不朗读；
-- emphasis 标记不朗读；
-- link 只朗读 label；
-- URL 默认不朗读完整协议和 query；
-- inline code 默认按普通短文本处理；
-- fenced code 默认跳过，并发送 `code_block_skipped` warning；
-- list item 之间加入自然停顿；
-- block quote 朗读正文；
-- image 只朗读 alt text；
-- HTML 默认移除 tag，保留可见文本；
-- 未闭合 Markdown span 在超时前保留有限缓冲；
-- 缓冲达到上限时按安全文本 fallback，不无限等待。
-
-### 7.4 Text normalization
-
-VoxCPM 官方使用 WeText 对中文和英文进行文本正规化。Botified-TTS
-前处理层复用相同能力，不在 Nano engine 内复制。
-
-公开选项：
-
-```text
-normalization=auto
-normalization=on
-normalization=off
-```
-
-默认 `auto`：
-
-- 对官方 normalizer 明确支持的中文和英文执行；
-- phoneme span 不执行；
-- 模型名、代码、URL 和已标记 verbatim span 不执行；
-- 其他语言保留原文；
-- normalization 在完整 segment commit 后执行，不逐 token 调用。
-
-### 7.5 两种文本表示
-
-每个 segment 保留：
-
-- `spoken_text`：用户预期听到的正文；
-- `model_text`：包含 style instruction、非语言标签和模型控制文本。
-
-两者只保存在 session 内存和必要的内部 continuation state。默认不写日志、
-数据库或 metrics label。
-
-## 8. Native HTTP API
-
-### 8.1 鉴权
-
-除 `/health/live` 外，全部产品端点要求：
-
-```http
-Authorization: Bearer <BOTIFIED_TTS_API_KEY>
-```
-
-规则：
-
-- 单部署级 API Key；
-- constant-time 比较；
-- API Key 只从环境变量读取；
-- YAML 不允许明文 key；
-- 日志和错误不回显 key；
-- `/health/ready` 也要求鉴权；
-- 发行运行时不公开 interactive Swagger UI；
-- OpenAPI JSON 在 release 构建时离线生成。
-
-### 8.2 Health
-
-```http
-GET /health/live
-GET /health/ready
-```
-
-`live` 只证明事件循环可响应。
-
-`ready` 必须证明：
-
-- CUDA preflight 通过；
-- 指定 GPU 可用；
-- 模型文件 hash 通过；
-- Nano worker ready；
-- reference encoder ready；
-- SQLite 和私有目录可用；
-- 固定 warmup generation 成功；
-- scheduler 已启动。
-
-### 8.3 Capabilities
-
-```http
-GET /v1/capabilities
-```
-
-返回：
-
-- model alias 和 fingerprint；
-- 支持语言；
-- 支持 voice modes；
-- 支持 vocalization events；
-- 支持输入格式；
-- 支持输出编码；
-- sample rate；
-- max reference duration；
-- max session limits；
-- OpenAI compatibility version；
-- `faithful + style` 不兼容说明；
-- realtime protocol version。
-
-不返回：
-
-- 本地路径；
-- CUDA device UUID；
-- API key；
-- voice 列表；
-- 完整依赖版本；
-- 原始模型下载 URL。
-
-### 8.4 Voice endpoints
-
-```text
-POST   /v1/voice-candidates
-GET    /v1/voice-candidates/{id}
-DELETE /v1/voice-candidates/{id}
-POST   /v1/voice-candidates/{id}/materialize
-
-POST   /v1/voices
-GET    /v1/voices
-GET    /v1/voices/{id}
-DELETE /v1/voices/{id}
-```
-
-`POST /v1/voices` 使用 `multipart/form-data` 注册 reference voice：
-
-- `metadata`：JSON；
-- `file`：唯一 reference audio；
-- optional `transcript`；
-- optional `denoise`；
-- optional `retain_source_audio`。
-
-禁止：
-
-- 多个 file part；
-- URL 形式任意远程下载；
-- 任意本地路径；
-- 未知 metadata 字段；
-- 重复 scalar 字段；
-- 不受限的 multipart body；
-- 超过部署上限的 reference；
-- 空白或纯静音 reference。
-
-### 8.5 Native generation
-
-```http
-POST /v1/speech/generations
-```
-
-请求：
-
-```json
-{
-  "voice": {
-    "id": "voice_01J...",
-    "mode": "expressive"
-  },
-  "style": {
-    "preset": "empathetic",
-    "emotion": "concerned",
-    "pace": "slow",
-    "energy": "soft"
-  },
-  "input": {
-    "format": "parts",
-    "parts": [
-      {"type":"text","text":"我想了想，"},
-      {"type":"vocalization","name":"uhm"},
-      {"type":"text","text":"我们还是现在出发吧。"}
-    ]
-  },
-  "output": {
-    "encoding": "ogg_opus",
-    "delivery": "artifact"
-  },
-  "generation": {
-    "seed": 42,
-    "adherence": "balanced"
-  }
-}
-```
-
-`output.delivery`：
-
-| 值 | 语义 |
-|---|---|
-| `stream` | HTTP audio byte stream |
-| `artifact` | 完整生成后返回私有 generation artifact |
-
-实时交互推荐 WebSocket，不推荐长期 HTTP chunked stream。
-
-### 8.6 Generation 参数
-
-Agent-facing 参数：
-
-- `voice.mode`
-- `style`
-- `seed`
-- `adherence`
-- `output`
-
-首版不直接向 Agent 暴露：
-
-- `temperature`
-- `cfg_value`
-- `inference_timesteps`
-- `max_generate_length`
-- KV cache 参数
-- VAE chunk 参数
-
-`adherence` 到 `cfg_value` 的映射由真实 GPU A/B 测试确定：
-
-```text
-natural
-balanced
-strict
-```
-
-映射属于 release 配置和 processor fingerprint，不能在 patch release
-静默改变。
-
-Nano 当前 `inference_timesteps` 是进程级配置。首版固定为 `10`，不伪装成
-逐请求参数。
-
-## 9. Realtime WebSocket API
-
-### 9.1 Session 创建
-
-```http
-POST /v1/speech/sessions
-```
-
-```json
-{
-  "voice": {
-    "id": "voice_01J...",
-    "mode": "expressive"
-  },
-  "style": {
-    "preset": "warm"
-  },
-  "input_format": "markdown",
-  "segmentation": {
-    "mode": "semantic",
-    "profile": "balanced"
-  },
-  "continuity": {
-    "enabled": true,
-    "on_style_change": "reset"
-  },
-  "output": {
-    "encoding": "pcm_s16le",
-    "sample_rate": 48000,
-    "chunk_ms": 160
-  }
-}
-```
-
-返回 session ID、WebSocket URL、过期时间和 protocol version。session
-是短期运行资源，不进入 durable job 系统。
-
-### 9.2 Client JSON frames
-
-```text
-session.configure
-input.text.append
-input.vocalization.append
-input.text.commit
-style.update
-input.done
-playback.ack
-response.cancel
-session.close
-```
-
-所有 client frame：
-
-- 包含严格递增的 `client_seq`；
-- 单个 JSON frame 有明确字节上限；
-- 未知 `type` 返回稳定协议错误；
-- 未知字段 fail closed；
-- 同一个 session 只允许一个 active response；
-- WebSocket 顺序是 canonical 顺序，不支持乱序补帧；
-- 重连不续传旧音频流，建立新 session。
-
-示例：
-
-```json
-{
-  "type": "input.text.append",
-  "client_seq": 1,
-  "text": "嗯，我想了一下，"
-}
-```
-
-```json
-{
-  "type": "input.vocalization.append",
-  "client_seq": 2,
-  "name": "sigh"
-}
-```
-
-```json
-{
-  "type": "style.update",
-  "client_seq": 3,
-  "style": {
-    "emotion": "excited",
-    "pace": "fast"
-  }
-}
-```
-
-```json
-{
-  "type": "input.done",
-  "client_seq": 4
-}
-```
-
-### 9.3 Server JSON frames
-
-```text
-session.ready
-input.accepted
-segment.committed
-segment.started
-audio.started
-segment.completed
-response.completed
-response.cancelled
-warning
-error
-```
-
-关键事件字段：
-
-- session ID；
-- response ID；
-- segment sequence；
-- audio sequence；
-- style revision；
-- continuity revision；
-- sample rate；
-- audio encoding；
-- stop reason；
-- stable error/warning code。
-
-### 9.4 Binary audio frame
-
-音频不使用 base64 JSON。Realtime v1 使用固定 binary header：
-
-| Offset | Size | 字段 |
-|---:|---:|---|
-| 0 | 4 | magic `BTSA` |
-| 4 | 1 | version `1` |
-| 5 | 1 | flags |
-| 6 | 2 | header length，network byte order |
-| 8 | 8 | audio chunk sequence，network byte order |
-| 16 | 4 | segment sequence，network byte order |
-| 20 | 8 | sample offset，network byte order |
-| 28 | N | PCM payload |
-
-PCM payload：
-
-- signed 16-bit little-endian；
-- mono；
+- PCM s16le；
 - 48 kHz；
-- 默认 160 ms；
-- 配置允许范围 100～200 ms；
-- 默认约每秒 6.25 个网络 chunk；
-- 任何时候不超过每秒 10 个网络 chunk。
+- mono；
+- aggregator 以 160 ms 为目标聚合音频；
+- 每个 segment 完成时 flush 一次余量，因此每段最多有一个短于 160 ms 的尾包；
+- 若 Nano 原生 chunk 已大于 160 ms，直接发送，不再切碎；
+- 固定验收语料的平均值不超过每秒音频 10 个 binary message。
 
-内部 Nano chunk 可以更细，Audio Aggregator 负责合并。
+该约束是按“音频时长”计算，不要求服务器按墙钟时间定时发送。
 
-### 9.5 Backpressure
+generate/send task 直接 await WebSocket send。发送超过 5 秒时取消 Nano，
+记录 `client_too_slow`，best-effort 发送 error，然后关闭连接。协议不承诺已经
+不可写的客户端一定能收到该 error。
 
-必须限制：
+服务在接受 append 前检查 session 累计文本上限；一旦接受，该 append 产生的所有
+segments 都可以进入 queue，不会因为句子数量较多而中途拒绝。queue 与尚未切分
+buffer 的文本总量始终不超过 session 的 64 KiB 预算。
 
-- 单 append 字节数；
-- 未 commit text 总字节数；
-- pending segment 数；
-- session 总时长；
-- session idle 时间；
-- 待发送音频时长；
-- 未确认播放音频时长；
-- 单 session continuation context；
-- 全局 active sessions；
-- 每 GPU active sequences。
+## 10. 文本分段
 
-慢客户端不能导致无界队列。达到上限后：
+### 10.1 目标
 
-1. 暂停提交新 segment；
-2. 保留短暂宽限；
-3. 仍无法恢复时取消 active generation；
-4. 发送或记录 `client_too_slow`；
-5. 关闭 session；
-6. 回收 continuation 和 audio buffers。
+同一个增量分段器必须正确处理：
 
-Nano fork 的进程间 stream queue 也必须有界，不能只限制 WebSocket 层。
+- 单字或逐词 append；
+- 随机小 chunks；
+- 一次包含多句的大 chunk；
+- HTTP 完整长文本；
+- 中英文和中英混合；
+- 非语言标签、数字和小数。
 
-## 10. 智能分段
+无论输入 chunk 如何切分，送入模型的 spoken text 都不得丢字、重字或重排。
 
-### 10.1 官方约束
+### 10.2 唯一分段策略
 
-VoxCPM2 当前支持完整文本输入、流式音频输出，不支持向同一个推理调用持续追加
-token。官方建议交互场景：
+每次 append 后循环提取零到多个 segment：
 
-1. 把到达文本切成句子；
-2. 每句调用一次 streaming generation；
-3. 顺序播放音频。
+1. 优先在 `。！？.!?` 等强句末标点后切分。
+2. 缓存达到最小稳定长度后，允许在 `，,；;：:` 或空格处切分。
+3. 达到 latency deadline 时，从最近的安全软边界切分。
+4. 达到 hard maximum 时，从上一个安全边界强制切分。
+5. `flush` 和 `finish` 提交剩余文本。
+6. 不在完整的官方 `[non-verbal tag]` 或小数中间切分；未闭合或未知的方括号
+   内容按普通文本处理。
+7. hard maximum 优先于其他边界规则。
 
-因此 Botified-TTS 的“双向流式”定义为：
+初始工程默认值：
 
-```text
-外部协议持续接收 text delta
-        +
-服务内部提交完整 segment
-        +
-模型持续生成 audio chunk
-        +
-接收下一段文本与播放上一段音频并行
-```
+| 常量 | 初始值 |
+|---|---:|
+| 软切分最小字符数 | 24 |
+| deadline 兜底最小字符数 | 12 |
+| 目标最大字符数 | 100 |
+| hard maximum | 160 |
+| latency deadline | 800 ms |
 
-不得宣称 VoxCPM2 本身实现了 unknown future text append。
+这些值在技术 spike 中用 Botified 的真实中英文输出固定一次，随后作为内部常量。
+首版不把它们暴露成请求参数，也不提供多种 segment policy。
 
-### 10.2 目标
+buffer 第一次从空变为非空时启动唯一一个 800 ms timer；后续 append 不重置
+timer。到期时主动调用 segmenter：
 
-分段器平衡：
+- 已达到 12 字符则提交；
+- 不足 12 字符则保留“deadline 已到期”状态，后续一旦达到阈值立即提交；
+- segment 提交或 buffer 清空后，剩余新文本重新开始一次 deadline；
+- `flush`、`finish` 和 `cancel` 取消 timer。
 
-- 首音频延迟；
-- 最小稳定语音时长；
-- 自然语义边界；
-- 上下文长度；
-- style/markup/tag 完整性；
-- 中英文和其他语言差异；
-- Agent Markdown；
-- 用户显式 commit。
+强句末标点、`flush` 或 `finish` 可以提交短段，因为短回答必须能够结束；服务不
+通过填充无意义文本来绕过 VoxCPM2 对极短语音稳定性较弱的事实。
 
-### 10.3 Canonical 边界
+### 10.3 固定资源上限
 
-优先级：
+| 资源 | 上限 | 超限行为 |
+|---|---:|---|
+| HTTP `text` | 8 KiB UTF-8 | `input_too_large` |
+| WebSocket 单个 `append` | 16 KiB UTF-8 | `input_too_large` |
+| WebSocket session 累计文本 | 64 KiB UTF-8 | `input_too_large` |
+| 未切分 buffer | 4 KiB UTF-8 | 按 hard maximum 切分；仍无法切分则拒绝 |
+| queued + 未切分文本 | 64 KiB UTF-8 session 总预算 | 接受 append 前检查 |
+| `style` | 512 B UTF-8 | `invalid_request` |
+| Voice Design `description` | 1 KiB UTF-8 | `invalid_request` |
+| reference upload | 25 MiB | `invalid_request` |
+| WebSocket idle | 60 秒 | 结束 session |
+| WebSocket send | 5 秒 | `client_too_slow` 并结束 session |
+| 同时活动的 HTTP/WS generation | 16 | `service_busy` |
 
-1. `input.text.commit`
-2. `input.done`
-3. 句号、问号、感叹号及等价标点
-4. 达到最小时长后的逗号、分号、冒号
-5. paragraph/list boundary
-6. latency deadline
-7. hard maximum
+这些是内部固定稳定性边界，不作为配置项。活动 generation 上限与 Nano
+`max_num_seqs` 使用同一个常量，不增加第二个 scheduler。
 
-不得在下列位置切分：
+### 10.4 HTTP 复用
 
-- phoneme span 内；
-- vocalization tag 内；
-- 未闭合 Markdown link 内；
-- 数字、小数、日期或 URL 中间；
-- style control 内；
-- emoji sequence 中间；
-- grapheme cluster 中间。
+HTTP 将完整文本一次 feed 给相同分段器，再调用 `finish`。它不使用另一套
+“长文本 splitter”，也不把整篇长文本直接送入单次模型请求。
 
-### 10.4 时长目标
+## 11. 跨段连续性
 
-不使用“固定字符数”作为唯一规则。分段器估算语音时长：
+官方建议按句子生成流式语音，但独立生成每句可能造成音色、语速和边界不自然。
+首版采用一种 continuation 方法：
 
-- 理想 segment：约 1.5～6 秒；
-- hard maximum：约 8～12 秒；
-- 太短输入先缓存；
-- `input.done` 允许提交短尾段；
-- hard punctuation 可在最小稳定时长附近提前提交；
-- 参数在 Phase 0 真实音频测试后固定。
+1. segment N 完整生成后，保留它的 continuation text 和最终 generated latents。
+2. segment N+1 使用二者作为 continuation prompt。
+3. profile 模式同时继续提供原始 reference latent，约束音色身份。
+4. 只保留上一个完整 segment，不维护 deque。
+5. continuation 只存在于当前请求/session 内存中。
+6. 新请求、新连接、cancel 或 error 都清空 continuation。
 
-官方指出短于约 1 秒的生成稳定性较弱，长文本容易出现逐渐加速、buzzing、
-KV cache 增长或无法停止。分段是质量策略，不只是接口兼容层。
+内部统一命名为 `continuation_text`：
 
-## 11. 跨段 Continuation
+- generated latents 只包含当前 segment 新生成的 latent，不包含 reference、
+  历史 prompt 或其他 conditioning；
+- `continuation_text` 是与这些 latents 对应的、commit 后不可修改的目标文本；
+- `[laughing]`、`[Uhm]` 等参与生成的原生文本表示保留；
+- 未发声的 style/voice control prefix 不进入 `continuation_text`。
 
-### 11.1 Nano 扩展
+下一段分别把它们作为 Nano `prompt_latents` 和 `prompt_text`。
 
-当前 Nano 公共 `generate()` 只 yield waveform，但 engine 的
-`postprocess_seq()` 已经取得每个生成 latent。
+Voice Design 和 controllable clone 的 style 只在首段作为显式 instruction 注入；
+后续段通过前一段音频 continuation 延续表达风格。faithful 模式始终不接受
+style。
 
-Botified fork 增加：
+不增加：
+
+- playback ack；
+- speculative/committed 双状态；
+- revision；
+- 回滚；
+- crossfade；
+- 断线恢复。
+
+技术 spike 必须确认该方法相较每段只使用静态 reference 没有明显的重复音素、
+截断、异常静音或持续语速漂移。验证通过后只保留 continuation 实现，不将两种
+策略做成公开配置。
+
+## 12. Nano-vLLM-VoxCPM 集成
+
+### 12.1 选择 Nano
+
+选择 Nano-vLLM-VoxCPM，而不是 vLLM-Omni，原因是：
+
+- 产品只服务一个 VoxCPM2 模型；
+- Nano 已提供 async streaming、并发 batching、reference/prompt latent 和
+  cancel；
+- 代码和运行边界更小，适合实现服务层的增量文本分段；
+- 不需要 vLLM-Omni 的通用多模态 serving 面。
+
+本项目不预留 vLLM-Omni adapter。
+
+### 12.2 薄 fork 边界
+
+当前审阅的 Nano 实现将 `encode_latents()` 统一做 left padding，而 VoxCPM2
+官方实现对 isolated reference 使用 right padding、对 continuation prompt 使用
+left padding；同时 Nano 的公开 generator 只返回 waveform，没有返回最终
+generated latents。
+
+因此 Botified 维护一个固定 commit 的最小 fork，只允许以下改动：
+
+1. `encode_latents(audio, role=reference|prompt)` 使用正确 padding。
+2. generation 完成时返回仅属于当前 segment 的最终 generated latents。
+
+先用 focused GPU test 验证上游 cancel。只有确认 sequence、KV 或请求状态未释放
+时，才增加修复该缺陷所需的最小 patch。如果上游行为正确，不修改 cancel。上游
+合并等价能力后删除对应 fork patch。
+
+fork 不包含：
+
+- HTTP/WebSocket DTO；
+- VoiceStore；
+- 文本分段；
+- 音频 codec；
+- 产品错误码；
+- session 状态；
+- 多 GPU 调度；
+- artifact 或持久化。
+
+### 12.3 固定依赖
+
+- Python 包、PyTorch、FlashAttention 和 Nano Git dependency 固定在
+  `pyproject.toml`/`uv.lock`。
+- Python 系统版本、CUDA runtime、FFmpeg 和 OS 固定在 Dockerfile base image
+  digest 与安装层。
+- Nano 使用不可变 git commit。
+- VoxCPM2 使用不可变 Hugging Face revision，并由应用默认值/Compose 固定。
+- 运行时不得 `pip install -U`。
+- 不建设逐文件 hash、processor fingerprint 或 release attestation 平台。
+- 每次升级只运行本项目的 focused GPU smoke 和 Botified 端到端验收。
+
+## 13. CUDA 与一键部署
+
+### 13.1 支持环境
+
+首版只支持：
+
+- Linux x86_64；
+- 满足 Phase 0 最低显存和 compute capability 基线的 NVIDIA GPU；
+- CUDA 12.x 兼容驱动；
+- Docker、Docker Compose 和 NVIDIA Container Toolkit；
+- 单个可见 GPU。
+
+不支持 CPU fallback、Apple Silicon、Windows 或 ROCm。
+
+Phase 0 必须把最低显存、最低 compute capability、验证 GPU 型号和对应的
+CUDA/PyTorch 组合写回 README 的支持表。`RTF < 1` 只承诺在表中指定的 reference
+GPU 上成立，不泛化到所有能被 CUDA 识别的设备。
+
+### 13.2 CUDA fail-fast
+
+`./scripts/deploy.sh` 在拉取镜像/启动前检查：
+
+1. `docker`；
+2. `docker compose`；
+3. `nvidia-smi`；
+4. GPU 显存和 compute capability 是否达到已验证基线。
+
+固定应用镜像拉取完成后，容器 entrypoint 在 import/初始化 Nano 和下载
+VoxCPM2 权重前检查 Docker 内 GPU 可见性：
 
 ```python
-@dataclass
-class SegmentResult:
-    request_id: str
-    generated_latents: bytes
-    generated_patch_count: int
-    seed: int | None
-    stop_reason: str
+torch.cuda.is_available()
+torch.cuda.device_count()
+selected_device_is_valid
 ```
 
-stream 消息：
+失败时：
+
+- 输出 `cuda_unavailable` 或 `cuda_device_invalid`；
+- 非零退出；
+- 不下载模型；
+- 不创建 Nano worker；
+- 不尝试 CPU。
+
+### 13.3 唯一部署方式
+
+```bash
+./scripts/deploy.sh
+```
+
+脚本：
+
+1. 完成 CUDA preflight；
+2. 生成或读取权限为 `0600` 的 `deploy/.env`；
+3. pull 固定 digest 的发布镜像；
+4. `docker compose up -d`；
+5. 在有界 timeout 内等待 `/health` ready；
+6. 生成一条固定短文本 WAV 作为 smoke。
+
+Docker 内 GPU 检测可能需要先拉取应用镜像，但 CUDA 失败时不得下载 VoxCPM2
+模型权重。health timeout 或容器退出时，脚本输出容器状态和查看日志的命令并
+非零退出。
+
+Compose 挂载 `/data` 持久卷：
 
 ```text
-audio
-complete
-error
-cancelled
+/data/voices
+/data/model-cache
 ```
 
-生成 latent 不发送给公共客户端，只交给产品进程内的 Continuation Manager。
+容器重建不重复下载模型或丢失注册音色。镜像包含 reference WAV/FLAC/MP3
+解码所需的 FFmpeg。
 
-### 11.2 完整 segment deque
+不同时维护 systemd、Podman、裸机 pip 和 Kubernetes 安装器。
 
-模型输出没有可靠的字符级或词级 latent alignment，因此不得：
+本地开发可单独执行 Compose build，但它不是正式部署脚本的第二种模式。
+
+### 13.4 配置
+
+仅使用环境变量：
 
 ```text
-直接截取最后 3 秒 latent
-  +
-猜测对应的 prompt_text
+BOTIFIED_TTS_HOST=0.0.0.0
+BOTIFIED_TTS_PORT=8000
+BOTIFIED_TTS_MODEL=openbmb/VoxCPM2
+BOTIFIED_TTS_MODEL_REVISION=<immutable-revision>
+BOTIFIED_TTS_GPU_DEVICE=0
+BOTIFIED_TTS_DATA_DIR=/data
+BOTIFIED_TTS_API_KEY=<secret>
+BOTIFIED_TTS_LOG_LEVEL=INFO
 ```
 
-Continuation state 按完整 segment 保存：
+不同时维护 YAML 和第二套 service config。Nano 内部调优值保留为代码中的已验证
+默认值，只有出现真实部署调优需求后才开放配置。
 
-```text
-SegmentState:
-  segment_seq
-  spoken_text
-  model_text
-  generated_latents
-  audio_samples
-  style_revision
-  playback_state
-```
+## 14. Botified 与 Agent Skill
 
-达到 prompt 预算时按完整 segment 淘汰最旧项。某一 segment 本身超过
-continuation budget 时，下一段重置 continuation。
+### 14.1 Botified 集成边界
 
-是否在 continuation prompt 中保留 non-verbal model tag，以及 style prefix
-是否只用于首段，必须通过 Phase 0 A/B 验证。首选候选策略：
+Botified 负责：
 
-- prompt transcript 使用 `spoken_text`；
-- 保留必要的官方 non-verbal tag；
-- 不把 style description 当成被朗读 transcript；
-- style 通过上一段生成音频自然传递。
+- 将 Agent 输出转换成应朗读的纯文本；
+- 把 LLM text delta 依次发送到 WebSocket `append`；
+- 回答结束时发送 `finish`；
+- 用户打断时发送 `cancel`；
+- 播放 PCM 或将 HTTP WAV 交给现有文件/渠道路径；
+- 需要 Ogg/Opus 时在渠道边界转码。
 
-这项策略在验证完成前不能宣称完全等同于官方 Hi-Fi prompt cache。
+TTS 服务不实现独立 bridge，不修改 Botified Gateway，不管理渠道发布。
 
-### 11.3 Speculative 与 committed state
+职责划分：
 
-为了同时满足低延迟和中断正确性，维护两份逻辑状态：
+- `botified-tts` 仓库负责协议、服务、示例 WebSocket client 和 Skill。
+- 相邻 `botified` 仓库负责把其 LLM text preview/delta 接到本 WebSocket，并把
+  PCM 交给现有播放或媒体路径；该工作由 Botified runtime 团队完成。
+- 跨仓库端到端通过是 Botified TTS release dependency，不是本仓库单独可关闭
+  的代码任务。
 
-```text
-committed continuation
-speculative continuation
-```
+### 14.2 Agent Skill
 
-流程：
-
-1. Segment N 推理完成。
-2. N 立即成为 speculative continuation。
-3. N+1 可在 N 播放期间开始生成。
-4. 客户端完整播放 N 后发送 `playback.ack`。
-5. N 被提升为 committed continuation。
-6. 用户中断时取消 active 和 queued segments。
-7. 丢弃未完整播放的 speculative states。
-8. 回滚到最后一个 committed segment。
-
-如果客户端不支持 playback ack：
-
-- 服务只能以 `sent` 作为近似 watermark；
-- session capability 返回 `playback_ack=false`；
-- 中断后默认更保守地重置 continuation；
-- 不把 sent 等价描述为 played。
-
-### 11.4 Style transition
-
-默认：
-
-```text
-continuity.on_style_change=reset
-```
-
-规则：
-
-| 变化 | 行为 |
-|---|---|
-| style 未变化 | 保持 continuation |
-| 仅无语义 metadata 变化 | 保持 continuation |
-| emotion/pace/pitch/energy 变化 | 清空 continuation，保留 reference |
-| expressive -> faithful | 新 response，拒绝在原 response 热切换 |
-| faithful -> expressive | 新 response，清空 continuation |
-| voice ID 变化 | 新 response 和新 continuation |
-
-示例：
-
-```text
-calm -> calm        continuation
-calm -> excited     reset continuation, keep voice identity
-excited -> excited  continuation
-```
-
-## 12. Nano-vLLM-VoxCPM Fork
-
-### 12.1 Fork 原则
-
-- Fork 保持很薄；
-- 产品 API 不进入 fork；
-- Voice Store 不进入 fork；
-- WebSocket 不进入 fork；
-- 上游可接受的通用修复优先提交 upstream；
-- release 固定完整 commit；
-- 每次上游升级重跑真实 GPU parity suite。
-
-### 12.2 必须修改
-
-1. 输出 generated latents。
-2. 新增 `complete/error/cancelled` stream message。
-3. role-aware reference/continuation encoding。
-4. 记录 generation start offset，不从混合 `feats` 猜测。
-5. 有界进程间 output queue。
-6. 客户端关闭 async generator 时可靠取消 request。
-7. 完成或取消后释放 sequence、KV block 和 latent buffer。
-8. request ID 和 session-owned metadata 透传。
-9. stable stop reason。
-10. 对 CUDA OOM、invalid prompt length 和 worker exit 提供稳定异常类别。
-
-### 12.3 不放进 Fork
-
-- Bearer auth；
-- OpenAI route；
-- Voice Profile；
-- SQLite；
-- text normalization；
-- Markdown；
-- style compiler；
-- segmentation；
-- Ogg/Opus；
-- Agent Skill；
-- Botified bridge。
-
-### 12.4 上游 parity
-
-至少验证：
-
-- reference-only；
-- continuation-only；
-- reference + continuation；
-- style control；
-- zero-shot Voice Design；
-- seed；
-- runtime LoRA；
-- PCM waveform duration；
-- first chunk latency；
-- stop condition；
-- concurrent generation；
-- cancellation；
-- reference right padding；
-- continuation left padding。
-
-## 13. OpenAI-compatible API
-
-### 13.1 定位
-
-```http
-POST /v1/audio/speech
-```
-
-“兼容”只表示明确子集。标准 OpenAI SDK 可在自定义 `base_url` 下完成普通
-speech generation；不宣称兼容全部 OpenAI Audio API。
-
-### 13.2 首版字段
-
-| 字段 | 支持 |
-|---|---|
-| `model` | 固定 alias `voxcpm2` |
-| `input` | 完整非空文本 |
-| `voice` | Voice Profile ID 或唯一名称 |
-| `response_format` | `pcm`、`wav`、`mp3`、`opus` |
-| `speed` | 首版只接受 `1.0` |
-
-非 `1.0` speed 返回明确错误。VoxCPM2 的 pace 是自然语言条件，不是精确
-时间拉伸；Native API 使用 `style.pace`。
-
-### 13.3 不支持
-
-- input token streaming；
-- Voice Profile 创建；
-- Voice Design；
-- speech parts；
-- vocalization event；
-- style update；
-- continuation；
-- playback ack；
-- realtime cancel；
-- arbitrary model ID；
-- response 内扩展 latent。
-
-不把大量 Botified 私有字段塞进 OpenAI endpoint。丰富能力只走 Native API。
-
-## 14. Botified TTS Bridge
-
-### 14.1 现有输入
-
-Botified 已有 live-only `/v1/llm-text-preview`，frame 包括：
-
-```text
-started
-text_delta
-finished
-aborted
-error
-status
-```
-
-Bridge 映射：
-
-| Botified | Botified-TTS |
-|---|---|
-| `started` | create/reset response |
-| `text_delta` | `input.text.append` |
-| `finished` | `input.done` |
-| `aborted` | `response.cancel` |
-| `error` | `response.cancel` |
-
-Bridge 必须使用 `provider_request_id`、`cycle_id`、`provider_call_index` 和
-`input_ids` 区分多次 provider call，不能把不同 call 的文本拼进同一个
-TTS response。
-
-### 14.2 两种模式
-
-```text
-low_latency_draft
-committed
-```
-
-`low_latency_draft`：
-
-- 消费 preview delta；
-- 低延迟；
-- preview 是草稿；
-- provider 后续可能调用工具、abort 或改写；
-- 已播放语音无法撤回；
-- abort 时取消未发送/未播放部分；
-- UI 和文档必须显示 draft 语义。
-
-`committed`：
-
-- 从 timeline final text 生成；
-- 文本正确；
-- 没有 token 输入流式收益；
-- 适合语音留言和正式播报。
-
-不能静默从一种模式切换到另一种。
-
-### 14.3 不修改 Gateway ownership
-
-实时机器人播放由 player/robot integration 处理。
-
-聊天平台语音留言：
-
-```text
-TTS 生成 Ogg/Opus artifact
-        |
-        v
-Botified publish_file(audio_as_voice=true)
-        |
-        v
-Botified Claw Gateway
-        |
-        v
-官方 channel plugin
-```
-
-Gateway 不选择声音、不调用 TTS、不管理 Voice Profile，也不实现新的模型或
-channel-specific TTS policy。
-
-## 15. Agent Skill
-
-### 15.1 唯一源码
+仓库提供：
 
 ```text
 skills/botified-tts/
 ├── SKILL.md
-├── agents/openai.yaml
-├── scripts/botified-tts
-└── references/
-    ├── api.md
-    └── style-guide.md
+└── scripts/botified-tts
 ```
 
-`SKILL.md` frontmatter：
-
-```yaml
----
-name: botified-tts
-description: Use when creating or cloning a voice, generating expressive speech, or producing a voice-message audio file through Botified TTS.
----
-```
-
-不增加 Codex、OpenClaw 或 Botified 私有 frontmatter。
-
-### 15.2 Skill 职责
-
-Skill 指导 Agent：
-
-- 从唯一 `client.env` 读取连接目标；
-- 先检查 ready；
-- 判断 reference voice、Voice Design、expressive 和 faithful；
-- 创建 Voice Design candidate，并让用户选择；
-- 注册 reference voice；
-- 选择 emotion、pace、energy 和 vocalization；
-- faithful 模式不提交 style；
-- 不擅自增加笑声、叹气或犹豫；
-- 生成 PCM/WAV/MP3/Ogg/Opus；
-- 语音留言优先 Ogg/Opus；
-- 需要渠道 voice presentation 时使用
-  `publish_file(audio_as_voice=true)`；
-- 不在输出中泄漏 API key、reference audio、latents 或私有路径；
-- 删除 Voice Profile 时说明相关生成能力会失效。
-
-### 15.3 Deterministic helper
+薄 helper 只提供：
 
 ```text
 health
-capabilities
-voice-candidate-create
-voice-candidate-get
-voice-create-reference
-voice-create-from-candidate
+voice-create
 voice-list
-voice-get
 voice-delete
-synthesize
-preview
+speak
 ```
 
-约束：
+`speak` 可以使用普通、Voice Design、controllable clone 和 faithful clone，并把
+WAV 写到显式输出路径。helper 复用公开 HTTP API，不实现第二套 TTS pipeline。
 
-- helper 是薄 wrapper，不实现第二套 TTS pipeline；
-- helper 不保存 API key；
-- helper 输出 JSON；
-- audio 写到显式输出路径，不把 binary 打到 Agent context；
-- 长文本通过 stdin、`--text-file` 或 request JSON file 输入；
-- 服务错误保留 stable error code；
-- 不替 Agent 自动决定人物身份或发布渠道；
-- 不自动安装系统依赖；
-- 缺少依赖时 fail fast 并给出明确前置条件。
-
-### 15.4 客户端配置
+helper 只读取：
 
 ```text
-${XDG_CONFIG_HOME:-$HOME/.config}/botified-tts/client.env
+BOTIFIED_TTS_URL
+BOTIFIED_TTS_API_KEY
 ```
 
-只接受：
+不增加 client config 文件。
 
-```text
-BOTIFIED_TTS_BASE_URL=http://127.0.0.1:17771
-BOTIFIED_TTS_API_KEY=<secret>
-```
+Skill 用于 Agent 显式生成语音文件。它不能接管同一次 LLM 回答的逐 token
+stream；实时朗读由 Botified runtime 直接调用 WebSocket。
 
-规则沿用 `botified-asr`：
+## 15. 错误与日志
 
-- 键白名单解析；
-- 不 `source` 文件；
-- mode `0600`；
-- 环境变量只作为显式一次性覆盖；
-- URL 和 key 成对切换；
-- 不修改服务端 `service.env`；
-- token 不写入 Skill、README 命令示例或 shell profile。
+### 15.1 稳定错误码
 
-### 15.5 安装位置
-
-同一个 skill tarball：
-
-| Runtime | 默认目录 |
-|---|---|
-| Codex | `~/.codex/skills/botified-tts` |
-| OpenClaw | `~/.agents/skills/botified-tts` |
-| Botified | `~/.local/share/botified/skills/botified-tts` |
-
-`install-tts-skill.sh --target <codex|openclaw|botified>` 必须显式指定 target，
-不自动检测后静默选择。
-
-## 16. CUDA-only 部署
-
-### 16.1 支持范围
-
-首版：
-
-```text
-Linux x86_64
-NVIDIA CUDA
-one or more supported NVIDIA GPUs
-```
-
-不支持 CPU、MPS、ROCm、XPU 和无验证的 compute capability。
-
-### 16.2 启动顺序
-
-必须在下载模型和创建 Nano worker 前：
-
-1. 检查 NVIDIA container/runtime；
-2. 检查 GPU visibility；
-3. `torch.cuda.is_available()`；
-4. 检查 device count；
-5. 检查配置 device index；
-6. 检查 driver/runtime/PyTorch compatibility；
-7. 检查 FlashAttention 和 Triton；
-8. 检查 compute capability；
-9. 检查可用显存；
-10. 检查模型 cache 磁盘空间。
-
-无 CUDA：
-
-```text
-level=error code=cuda_unavailable
-message="Botified TTS requires a supported NVIDIA CUDA device; CPU fallback is disabled"
-```
-
-进程非零退出。不得先下载约 5 GB 权重再失败。
-
-### 16.3 当前审计基线
-
-```text
-OpenBMB/VoxCPM:
-616d3d3e630a9c96c2853250eef91b0f39dcd5fa
-
-a710128/nanovllm-voxcpm:
-0ef61b0ba634dbf2fad9e916bc4fb696a3c0f51f
-
-openbmb/VoxCPM2:
-bffb3df5a29440629464e5e839f4d214c8714c3d
-```
-
-正式 release 固定：
-
-- OCI digest；
-- base image digest；
-- CUDA runtime；
-- Python；
-- PyTorch；
-- FlashAttention；
-- Triton；
-- Nano fork commit；
-- VoxCPM2 HF revision；
-- 全部运行时模型文件 SHA-256；
-- FFmpeg 版本或外部前置条件；
-- processor fingerprint。
-
-容器启动时禁止：
-
-- `pip install -U`；
-- 解析 mutable `main`；
-- 自动切换模型；
-- 无 hash 下载后直接加载；
-- 无 CUDA 时尝试 CPU。
-
-### 16.4 一键安装
-
-`install-tts.sh` 必须：
-
-1. 检查平台和架构；
-2. 检查 Docker/Podman 支持范围；
-3. 检查 NVIDIA Container Toolkit；
-4. 检查真实 GPU；
-5. 检查 driver 和 compute capability；
-6. 检查磁盘和端口；
-7. 下载 release manifest；
-8. 校验 manifest 和 installer artifact；
-9. 按 digest 拉取 image；
-10. 创建私有 config/data/cache 目录；
-11. 创建 `service.env` 和 `client.env`；
-12. 启动容器；
-13. 等待 ready；
-14. 执行固定 TTS smoke；
-15. 输出服务地址和 Skill 安装提示。
-
-安装失败不得留下“看似已安装但永远不 ready”的 active service。
-
-## 17. 配置
-
-### 17.1 YAML
-
-建议：
-
-```yaml
-version: 1
-
-service:
-  host: 127.0.0.1
-  port: 17771
-  api_key_env: BOTIFIED_TTS_API_KEY
-
-model:
-  alias: voxcpm2
-  path: openbmb/VoxCPM2
-  revision: bffb3df5a29440629464e5e839f4d214c8714c3d
-  devices: [0]
-  inference_timesteps: 10
-  max_model_len: 4096
-  max_num_seqs: 16
-  gpu_memory_utilization: 0.95
-
-realtime:
-  output_chunk_ms: 160
-  max_sessions: 64
-  max_pending_segments_per_session: 8
-  max_uncommitted_text_bytes: 262144
-  max_audio_buffer_secs: 5
-  idle_timeout_secs: 60
-  max_session_secs: 1800
-
-segmentation:
-  profile: balanced
-
-voices:
-  retain_source_audio: true
-  candidate_retention_hours: 24
-
-storage:
-  data_dir: /var/lib/botified-tts
-  max_bytes: 21474836480
-
-logging:
-  level: info
-```
-
-所有上限在真实 GPU capacity test 后固定。release 默认值一旦成为公开契约，
-不得在 patch release 中大幅漂移。
-
-### 17.2 Secret
-
-```text
-${XDG_CONFIG_HOME:-$HOME/.config}/botified-tts/service.env
-```
-
-只包含：
-
-```text
-BOTIFIED_TTS_API_KEY=<secret>
-```
-
-mode `0600`。YAML 不接受明文 `api_key`。
-
-## 18. 数据边界
-
-### 18.1 当前信任模型
-
-本项目当前是内部项目，运行在可信内网中，输入的 reference audio、Voice
-Design 描述和 Voice Profile 均视为可信数据。因此，首版不设计或实现：
-
-- Voice Profile 的授权声明和授权证明；
-- reference audio 来源核验；
-- 人物身份识别或公众人物检测；
-- 音色克隆滥用检测；
-- 水印、内容溯源和对外合规审计；
-- 面向不可信租户的 Voice Profile 访问隔离。
-
-这些能力不进入当前 API、错误码、数据库字段、Skill 工作流或发布验收。
-如果未来服务暴露到公网、接入不可信数据或转为多租户产品，需要重新完成威胁
-建模，并作为独立安全阶段设计，不能默认沿用本版本的信任假设。
-
-Bearer Token、输入大小限制、路径隔离、secret 脱敏和资源清理仍然保留。
-它们属于服务运行边界和稳定性要求，不构成 Voice Profile 合规治理。
-
-### 18.2 私有数据
-
-默认不记录：
-
-- reference audio 内容；
-- reference transcript；
-- target text；
-- style instruction；
-- generated audio；
-- latent；
-- Voice Profile name；
-- Authorization；
-- request body；
-- Botified preview delta。
-
-可记录：
-
-- request/session ID；
-- voice ID 的不可逆短 hash；
-- voice mode；
-- 输入字符/字节数；
-- segment 数；
-- audio duration；
-- queue wait；
-- TTFB；
-- RTF；
-- status；
-- stable error code。
-
-### 18.3 删除
-
-删除 Voice Profile：
-
-- 标记删除并停止新请求；
-- 等待或取消正在使用该 version 的 session，按 API 语义固定；
-- 删除 reference artifacts；
-- 删除 derived latents；
-- 删除 candidate linkage；
-- 删除 optional LoRA association；
-- 清理 prefix cache；
-- 记录不含音色内容的 audit event；
-- 返回资源不可恢复说明。
-
-首版使用本地文件系统，删除是 best-effort 文件删除，不宣称物理介质安全擦除。
-
-## 19. 多 GPU 和调度
-
-### 19.1 Session serial
-
-同一 session 的 segment 推理必须串行，因为 Segment N+1 的 continuation
-依赖 Segment N 的 generated latents。
-
-文本输入、上一段播放和下一段等待可并行，但同一 session 不同时运行两个互相
-依赖的 segment generation。
-
-### 19.2 Cross-session batching
-
-不同 session 由 Nano continuous batching 合并。Scheduler 不实现第二套
-GPU batching。
-
-### 19.3 Sticky GPU
-
-多 GPU 时 session 默认固定到一个 worker：
-
-- 增加 prefix cache 命中；
-- 避免 reference context 重复预填；
-- 简化 request cancellation；
-- 保持性能稳定。
-
-worker 失败后：
-
-- active segment 失败；
-- session 返回 `engine_worker_lost`；
-- speculative continuation 丢弃；
-- committed continuation 可在新 worker 上通过 latents 重建；
-- 不静默重复已经播放的音频。
-
-## 20. 音频输出
-
-### 20.1 Realtime
-
-Canonical：
-
-```text
-48 kHz
-mono
-PCM s16le
-160 ms network chunk
-```
-
-Realtime 不默认 MP3，避免编码延迟、frame buffering 和播放端差异。
-
-### 20.2 Artifact
-
-支持：
-
-- WAV；
-- PCM；
-- MP3；
-- Ogg/Opus。
-
-语音留言推荐：
-
-```text
-audio/ogg
-Ogg/Opus
-48 kHz mono
-```
-
-转码在完整 artifact 路径完成，不影响 VoxCPM2 内部 48 kHz generation。
-
-### 20.3 Gapless
-
-同 session 的音频 timeline 使用 sample offset，客户端按 offset 播放。服务不在
-segment boundary 任意插入静音。
-
-必要的 crossfade 只能作为实验性 fallback：
-
-- 默认关闭；
-- 不替代 continuation；
-- 参数进入 processor fingerprint；
-- 通过听感和波形边界测试后才能开启；
-- 不能掩盖重复音素或截断音素。
-
-## 21. 错误契约
-
-REST 使用 OpenAI 风格 envelope：
-
-```json
-{
-  "error": {
-    "message": "human-readable message",
-    "type": "invalid_request_error",
-    "param": "voice.mode",
-    "code": "invalid_voice_mode"
-  }
-}
-```
-
-稳定错误至少包括：
+首版只保留：
 
 ```text
 invalid_api_key
-service_not_ready
-cuda_unavailable
-cuda_unsupported
-insufficient_gpu_memory
-model_artifact_mismatch
-engine_worker_lost
-engine_oom
+invalid_request
 invalid_voice
-voice_not_ready
-voice_fingerprint_mismatch
-invalid_reference_audio
-reference_too_short
-reference_too_long
-reference_silent
-prompt_transcript_required
-style_not_supported_in_faithful_mode
-unsupported_vocalization
-invalid_phoneme
 input_too_large
-session_limit_exceeded
-session_expired
+service_busy
+cuda_unavailable
+cuda_device_invalid
+model_load_failed
+engine_oom
+engine_error
 client_too_slow
-generation_cancelled
-continuation_reset
 ```
 
-WebSocket error frame 使用同一 stable code，不定义第二套错误词汇。
+REST 返回 JSON error envelope；WebSocket 使用同样的 code/message 放进
+`error` event。cancel 是正常的 `done(cancelled=true)`，不是错误码。内部异常
+不向客户端返回 traceback。
 
-## 22. Observability
+### 15.2 最小可观测性
 
-### 22.1 Metrics
-
-至少：
-
-```text
-tts_requests_total
-tts_sessions_active
-tts_segments_total
-tts_generation_errors_total
-tts_queue_wait_seconds
-tts_text_buffer_seconds
-tts_audio_ttfb_seconds
-tts_rtf
-tts_audio_seconds_total
-tts_audio_chunks_total
-tts_playback_unacked_seconds
-tts_cancellations_total
-tts_continuity_resets_total
-tts_engine_worker_restarts_total
-tts_cuda_memory_bytes
-tts_voice_encode_seconds
-```
-
-metrics label 禁止使用：
-
-- target text；
-- style instruction；
-- voice name；
-- reference filename；
-- session/user provided strings；
-- API key；
-- raw error message。
-
-### 22.2 日志
-
-结构化日志包含：
+结构化日志记录：
 
 - request/session ID；
-- response/segment sequence；
-- engine worker；
-- model fingerprint short ID；
-- mode；
-- style revision；
-- continuity revision；
-- byte/character/audio duration；
-- queue/TTFB/RTF；
-- status 和 stable code。
+- voice type 和 mode；
+- 输入字符数和 segment 数；
+- queue wait；
+- TTFB；
+- audio duration；
+- RTF；
+- result/error code。
 
-默认不记录内容。
+默认不记录：
 
-## 23. 质量评估
+- 朗读正文；
+- style/description；
+- reference audio 和 transcript；
+- generated audio；
+- latent；
+- API key。
 
-### 23.1 指标
+首版不建设 metrics endpoint 和 dashboard。出现实际运维需求后再增加。
 
-| 维度 | 评估 |
-|---|---|
-| 可懂度 | ASR WER/CER |
-| 音色 | speaker embedding cosine similarity |
-| 自然度 | MOS/UTMOS + 人工听测 |
-| Style | 指令跟随人工评分/分类器 |
-| Boundary | gap、click、重复音素、截断音素 |
-| Realtime | text wait、TTFB、RTF、underrun |
-| Non-verbal | tag 命中和自然度人工检查 |
+## 16. 测试与验收
 
-speaker similarity 只用于质量比较，不称为身份概率。
+测试只验证本项目拥有的行为，不重复测试 PyTorch、CUDA、FastAPI 或 Nano 的
+内部测试。
 
-### 23.2 A/B 矩阵
+### 16.1 单元测试
 
-必须比较：
+- 分段器：逐字、小 chunk、大 chunk、多句、标点、deadline、flush、finish。
+- 不切断官方非语言标签和小数。
+- 请求 union 和 mode/style 约束。
+- VoiceStore 创建、list、delete 和半写失败清理。
+- PCM 以 160 ms 聚合，每个 segment 最多一个短尾包。
+- 输入、queue 和 session 上限触发固定错误并释放 session。
+- CUDA preflight 失败时模型下载/加载函数没有被调用。
 
-1. reference-only；
-2. continuation-only；
-3. reference + continuation；
-4. ref-only + style；
-5. first-segment style + generated continuation；
-6. style change without reset；
-7. style change with reset；
-8. whole-segment continuation window 1/2/3 segments；
-9. static reference every segment；
-10. output chunk 100/160/200 ms；
-11. different segmentation latency；
-12. denoise on/off；
-13. cfg/adherence 档位；
-14. non-verbal tags；
-15. Markdown Agent 输出；
-16. 中断和 rollback。
+### 16.2 API 集成测试
 
-### 23.3 测试语言
+使用一个最小 fake Nano adapter，只验证本项目协议：
 
-至少：
+- HTTP request 经 canonical `SpeechService` 返回合法 WAV。
+- WebSocket `start -> append -> binary audio -> finish -> done`。
+- 生成期间仍可接收 append。
+- cancel 停止当前任务并清空队列。
+- 慢客户端触发有界失败而不是无限缓存。
+
+fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部过程。
+
+### 16.3 真实 GPU smoke
+
+一个脚本在目标 GPU 上依次覆盖：
+
+1. CUDA 检测、模型加载和 warmup；
+2. 普通 TTS；
+3. Voice Design；
+4. controllable reference clone + style；
+5. faithful clone；
+6. 非语言标签；
+7. WebSocket 增量文本；
+8. 两个以上 segment 的 continuation；
+9. cancel；
+10. RTF 小于 1；
+11. 音频 chunk 频率不超过 10/s。
+
+不建设 8/16/32 并发矩阵、全语言矩阵、自动 WER/UTMOS 平台或 worker restart
+仿真。
+
+### 16.4 人工听测
+
+使用一套固定样本，覆盖：
 
 - 普通话；
 - 英语；
 - 中英混合；
-- 粤语真实用词；
-- 日语；
-- 韩语；
-- 一种长单词/复杂标点的欧洲语言；
-- 一种 RTL 语言。
-
-方言测试必须使用真实方言词汇，不能只给标准普通话加一个方言 control。
-
-## 24. 测试
-
-### 24.1 CPU-safe unit tests
-
-不加载 CUDA：
-
-- API schema；
-- mode conflict；
-- style compiler；
-- Markdown incremental parser；
-- segmentation；
-- speech parts；
-- vocalization mapping；
-- phoneme validation；
-- Voice Profile storage；
-- fingerprint；
-- auth；
-- error envelope；
-- WebSocket state machine；
-- playback ack；
-- speculative rollback；
-- queue limits；
-- installer manifest parsing。
-
-### 24.2 Fake engine integration
-
-使用确定性的 fake Nano adapter：
-
-- 固定 waveform；
-- 固定 generated latents；
-- first chunk delay；
-- worker OOM；
-- cancellation；
-- stop reason；
-- disconnect；
-- slow client；
-- out-of-order internal event；
-- worker loss。
-
-### 24.3 Real CUDA tests
-
-真实受支持 GPU：
-
-- CUDA preflight；
-- model load；
-- warmup；
-- zero-shot；
-- reference clone；
-- expressive style；
-- faithful clone；
 - Voice Design；
-- generated latent continuation；
-- 8/16 并发；
-- cancellation；
-- worker restart；
-- memory ceiling；
-- long-running soak；
-- audio quality samples。
+- 两种 clone；
+- style 和 `[laughing]`/`[sigh]`/`[Uhm]`；
+- 逐字输入与大 chunk 输入；
+- 至少四个连续 segments。
 
-未通过真实 CUDA runner 的 image 不得标记 supported。
+只验收业务可感知问题：
 
-### 24.4 Missing CUDA
+- 音色是否稳定；
+- style 是否明显；
+- faithful 是否接近 reference；
+- 是否丢字、重字；
+- 边界是否出现 click、异常静音、重复/截断音素；
+- 长回答是否明显加速或漂移。
 
-必须验证：
-
-- `CUDA_VISIBLE_DEVICES=""`；
-- 无 NVIDIA runtime；
-- device index 不存在；
-- driver 不兼容；
-- FlashAttention 不可用；
-- compute capability 不支持；
-- 显存不足。
-
-这些场景不得进入模型下载和推理。
-
-## 25. 发布验收
-
-在固定 reference hardware 上记录，而不是只声明“实时”：
-
-- segment commit 到 engine first audio；
-- Agent first delta 到 first playable audio；
-- RTF；
-- concurrency 1/8/16/32；
-- audio chunks/sec；
-- cancellation latency；
-- segment gap；
-- playback underrun；
-- GPU memory；
-- voice encode duration。
-
-发布门槛：
-
-1. 网络 audio chunk 每秒不超过 10。
-2. 默认输出约每秒 5～8 个 chunk。
-3. 持续播放无明显 segment gap、click、重复或截断。
-4. 中断后快速停止后续音频发送；具体 p95 在 Phase 0 基准后固定。
-5. 并发 8 下保持明显快于实时。
-6. 同一 Voice Profile 跨请求音色稳定。
-7. style 切换不明显改变 voice identity。
-8. faithful 模式不静默忽略 style。
-9. 无 CUDA 时 fail fast。
-10. 新主机一键安装后可完成 health、reference clone 和 streaming smoke。
-11. 同一 Skill artifact 在三个 runtime 完成 discovery 和固定合成 smoke。
-
-## 26. 仓库结构
+## 17. 仓库结构
 
 ```text
 botified-tts/
+├── README.md
 ├── pyproject.toml
 ├── uv.lock
-├── README.md
 ├── src/botified_tts/
-│   ├── main.py
+│   ├── app.py
 │   ├── config.py
-│   ├── api.py
-│   ├── auth.py
-│   ├── contracts.py
-│   ├── errors.py
-│   ├── capabilities.py
-│   ├── audio.py
-│   ├── text.py
-│   ├── markdown.py
-│   ├── styles.py
-│   ├── segmentation.py
+│   ├── schemas.py
+│   ├── speech.py
+│   ├── engine.py
 │   ├── voices.py
-│   ├── storage.py
-│   ├── sessions.py
-│   ├── continuation.py
-│   ├── scheduler.py
-│   ├── nano_adapter.py
-│   ├── openai_api.py
-│   └── metrics.py
-├── vendor/
-│   └── nanovllm-voxcpm/
+│   ├── segmenter.py
+│   └── audio.py
 ├── tests/
-│   ├── test_api_contract.py
-│   ├── test_styles.py
-│   ├── test_markdown.py
-│   ├── test_segmentation.py
-│   ├── test_sessions.py
-│   ├── test_continuation.py
-│   ├── test_voices.py
-│   ├── test_cuda_preflight.py
-│   └── live/
+│   ├── test_segmenter.py
+│   ├── test_speech.py
+│   ├── test_api.py
+│   └── gpu_smoke.py
+├── deploy/
+│   ├── Dockerfile
+│   └── compose.yaml
+├── scripts/
+│   └── deploy.sh
 ├── skills/botified-tts/
 │   ├── SKILL.md
-│   ├── agents/openai.yaml
-│   ├── scripts/botified-tts
-│   └── references/
-├── deploy/
-│   ├── Containerfile.cuda
-│   ├── compose.yaml
-│   └── botified-tts.service
-├── scripts/
-│   ├── release
-│   ├── live-acceptance
-│   └── gpu-smoke
-└── docs/
-    ├── engineering/
-    ├── api.md
-    ├── realtime.md
-    ├── voices.md
-    └── deployment.md
+│   └── scripts/botified-tts
+└── docs/engineering/
+    └── botified-tts-product-development-plan.md
 ```
 
-不先建立抽象 repository/service/use-case 多层框架。文件超出清晰职责后再按真实
-边界拆分。
+不要预先创建 repository/service/use-case/domain 多层目录。只有文件真实变大并
+出现明确职责边界时才拆分。
 
-## 27. 开发阶段
+## 18. 开发阶段
 
-### Phase 0：VoxCPM2/Nano 证据验证
+### Phase 0：推理技术 Spike
 
-交付：
-
-- 最小 Nano fork；
-- generated latent result；
-- role-aware latent encoding；
-- continuation prototype；
-- style reset prototype；
-- 真实 GPU A/B 报告；
-- 固定音频样本和评估脚本。
-
-GO 条件：
-
-- generated continuation 明显优于简单 waveform 拼接；
-- ref-only + style 可用；
-- style reset 能切换情绪并保留音色；
-- 跨段没有不可接受的边界 artifact；
-- Nano fork 可以可靠取消和释放资源。
-
-NO-GO 条件：
-
-- generated continuation 无法稳定工作；
-- continuation 导致持续严重文本错读；
-- style reset 明显破坏音色；
-- Nano 无法可靠回传 latent 或取消；
-- 实时 RTF 在目标硬件上不满足播放。
-
-NO-GO 时先回到模型/推理选型，不继续堆产品 API。
-
-### Phase 1：服务基础
+目标是在写完整服务前消除唯一高风险问题。
 
 交付：
 
-- Python project；
-- pinned dependencies；
-- CUDA preflight；
-- config/auth/health；
-- model artifact verification；
-- Nano adapter；
-- Voice Profile Store；
-- reference-only clone；
-- Native HTTP generation；
-- OpenAI compatibility；
-- structured logs/metrics。
+- 将 VoxCPM2 HF revision、Nano commit、容器 base digest、Python、PyTorch、
+  CUDA、FlashAttention 和 FFmpeg 版本固定到实际交付文件；
+- 写回最低显存、compute capability、验证 GPU 和 reference GPU 的支持表；
+- target GPU 上完成普通、design、两种 clone 和 style；
+- 验证官方 non-verbal tag；
+- 实现并验证 role-aware latent encoding；
+- 让 Nano 返回最终 generated latents；
+- 验证上一段 continuation；
+- 验证 cancel；
+- 测得 TTFB、RTF、实际 audio chunk 时长和显存占用。
 
-### Phase 2：丰富音色
+退出条件：
 
-交付：
+- reference GPU 上 RTF < 1；
+- continuation 无明显质量倒退；
+- controllable 与 faithful 模式行为和官方一致；
+- cancel 能停止 request；
+- 对 Nano fork 的改动不超出第 12.2 节。
 
-- faithful clone；
-- Voice Design candidate；
-- candidate materialization；
-- style compiler；
-- vocalization parts；
-- normalization；
-- Markdown；
-- WAV/MP3/Ogg/Opus artifacts。
+如果 continuation 验证失败，先解决或明确模型限制，不用 crossfade、回滚状态机
+或第二套策略掩盖。
 
-### Phase 3：Realtime
+### Phase 1：服务 V1
 
 交付：
 
-- session API；
-- WebSocket protocol；
-- binary audio frames；
-- smart segmenter；
-- output aggregator；
-- generated continuation；
-- speculative/committed state；
-- playback ack；
-- cancel/barge-in；
-- backpressure；
-- multi-session scheduler。
+- canonical schema；
+- VoiceStore；
+- SpeechService 与 Nano adapter；
+- segmenter 和 continuation；
+- `/health`、voice 创建/列表/删除、`POST /v1/speech`；
+- WebSocket；
+- WAV/PCM；
+- 错误、日志和 focused tests。
 
-### Phase 4：生态发布
+退出条件：
+
+- HTTP 和 WebSocket 共用同一核心；
+- 任意 text chunk 粒度不丢字不重字；
+- cancel 和慢客户端有界；
+- 单元与 API 集成测试通过。
+
+### Phase 2：部署与 Botified 交付
 
 交付：
 
+- 固定依赖和模型 revision；
+- Dockerfile、Compose 和 `deploy.sh`；
+- CUDA 双重 fail-fast；
+- README 和调用示例；
 - Agent Skill；
-- deterministic helper；
-- `install-tts.sh`；
-- `install-tts-skill.sh`；
-- OCI image；
-- release manifest；
-- OpenAPI artifact；
-- Botified bridge；
-- Gateway voice-message acceptance；
-- 三 runtime Skill acceptance。
+- Botified text delta 到 WebSocket 的真实联调；
+- 一次真实 GPU smoke 和固定样本听测。
 
-这些阶段是实现顺序，不表示允许发布缺失核心能力的半成品。首个正式 release
-必须至少完成 Phase 0～4 的首版范围。
+退出条件：
 
-### Phase 5：后续增强
+- 满足支持表的 fresh CUDA host 一条命令 ready；
+- 无 CUDA 时在模型下载前明确失败；
+- `botified` runtime 团队完成一次真实回答的连续播放和 cancel；
+- Definition of Done 全部满足。
 
-- runtime LoRA Voice Profile；
-- LoRA training workflow；
-- multi-GPU sticky routing；
-- vLLM-Omni optional adapter；
-- automatic quality evaluation；
-- provenance/watermark；
-- 更丰富 pronunciation；
-- 更细的 style preset catalog。
+## 19. 风险与处理
 
-## 28. 风险
-
-| 风险 | 处理 |
+| 风险 | 最小处理 |
 |---|---|
-| Nano 是社区项目 | 固定小型 fork、完整 commit、真实 GPU parity |
-| continuation 与 style 冲突 | style change reset，Phase 0 A/B |
-| generated latent 无文本对齐 | 只按完整 segment 保留 |
-| draft token 后续被改写 | bridge 显式区分 draft/committed |
-| Voice Design 不稳定 | candidates + materialize |
-| reference latent padding 不一致 | role-aware encode |
-| 长文本失稳 | server segmenter 和 hard max |
-| 短文本弱 | 最小时长缓冲，done 时允许短尾段 |
-| 客户端播放慢 | bounded buffers、cancel、client_too_slow |
-| 用户中断后上下文错误 | playback ack + speculative rollback |
-| 模型升级破坏 voice latent | fingerprint + re-encode |
-| 无 CUDA 仍下载模型 | installer 和 startup 双重 preflight |
-| OpenAI API 表达力不足 | 仅作为兼容 adapter |
-| LoRA 占用和治理复杂 | 首版不做在线训练 |
+| Nano 上游差异 | role-aware encode 与 completion result 两个最小 patch |
+| 分段质量 | 上一完整段 continuation + 固定听测 |
+| 资源积压 | 固定输入/队列上限、send timeout、cancel |
+| 环境不兼容 | 支持表、host/container preflight、固定依赖 |
 
-## 29. Definition of Done
+## 20. Definition of Done
 
-- [ ] 技术报告中的模型模式与官方实现一致。
-- [ ] Nano fork 只包含通用推理扩展。
-- [ ] generated latents 可稳定回传。
-- [ ] reference/continuation 使用正确 padding。
-- [ ] Voice Profile 有完整 fingerprint。
-- [ ] Voice Design 通过 candidate materialization 固化。
-- [ ] expressive 和 faithful 模式明确区分。
-- [ ] faithful + style 被显式拒绝。
-- [ ] 官方非语言标签通过结构化 parts 使用。
-- [ ] Markdown Agent 文本不会朗读控制符和代码块。
-- [ ] 分段器通过中英文真实 token stream 测试。
-- [ ] realtime 输出每秒不超过 10 个网络 chunk。
-- [ ] 跨段 continuation 通过听测和边界测试。
-- [ ] style change reset 通过音色和情绪测试。
-- [ ] playback ack 和 speculative rollback 正确。
-- [ ] slow client 不产生无界队列。
-- [ ] cancel 释放 sequence、KV 和 latent buffers。
-- [ ] OpenAI SDK 基础 speech smoke 通过。
-- [ ] Native REST/OpenAPI/Skill 使用同一契约。
-- [ ] Botified preview bridge 显式标识 draft。
-- [ ] Ogg/Opus artifact 可通过现有 Gateway 作为 voice intent 发布。
-- [ ] 无 CUDA 时下载前失败并输出 stable code。
-- [ ] 固定 OCI/model/dependency digest。
-- [ ] fresh host 一键安装通过。
-- [ ] 三个 Agent runtime 使用同一 Skill artifact。
-- [ ] Voice Profile 删除清理全部关联资产。
-- [ ] 默认日志、metrics 和错误不泄漏文本、声音或 secret。
-- [ ] API、schema、Skill 和错误码均不包含 Voice Profile 授权审计流程。
-
-## 30. 最终产品判断
-
-Botified-TTS 不应被实现成“给 Nano-vLLM 套一个 OpenAI Speech API”。
-
-正确的产品边界是：
-
-```text
-VoxCPM2 model
-    +
-Nano inference engine
-    +
-Voice Profile
-    +
-Voice Design materialization
-    +
-structured style/vocalization
-    +
-semantic segmentation
-    +
-generated-latent continuation
-    +
-full-duplex session protocol
-    +
-playback-aware cancellation
-    +
-Agent Skill
-    +
-Botified token bridge
-```
-
-OpenAI compatibility 保证通用客户端可以使用基础 TTS；Botified Native API
-和 realtime session protocol 才是 Botified 生态内部的长期能力契约。
+- [ ] 无 CUDA 时在模型下载前非零退出且不尝试 CPU；支持表内 fresh host 可一键
+  启动、ready 并完成 smoke。
+- [ ] 音色可以创建、列出、删除；`/v1/speech` 返回可播放的 48 kHz mono WAV。
+- [ ] 普通、Voice Design、controllable clone、faithful clone、style 和官方
+  非语言标签均通过真实 GPU 验收。
+- [ ] `faithful + style` 和所有超限请求得到固定错误。
+- [ ] WebSocket 接受逐字、小 chunk 和多句大 chunk，并在 `finish` 前开始返回
+  已形成 segment 的音频。
+- [ ] 输入 chunk 边界不造成丢字、重字或重排。
+- [ ] WebSocket 输出 48 kHz mono PCM s16le；固定验收语料平均每秒音频不超过
+  10 个 binary chunks，且每段最多一个短尾包。
+- [ ] continuation 无明显 click、异常静音、重复或截断音素。
+- [ ] cancel、输入超限和 send timeout 均能有界结束 session。
+- [ ] 默认日志不包含正文、reference、audio、latent 或 secret。
+- [ ] 单元、API、同一份真实 GPU smoke 和固定样本听测通过。
+- [ ] Agent Skill 可注册音色并生成 WAV。
+- [ ] `botified` runtime 团队完成真实 token delta → 连续播放 → cancel 的
+  release dependency 验收。
