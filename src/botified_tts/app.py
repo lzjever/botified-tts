@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import threading
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import asdict, dataclass
+
+from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
+
+from botified_tts.audio import pcm_s16le_chunks_to_wav
+from botified_tts.config import MAX_CONCURRENT_SYNTHESIS
+from botified_tts.engine import EngineError
+from botified_tts.schemas import (
+    InputTooLarge,
+    InvalidSynthesisOptions,
+    SpeechRequest,
+    parse_speech_request,
+)
+from botified_tts.segmenter import Segmenter
+from botified_tts.speech import SpeechService
+from botified_tts.voices import (
+    MAX_UPLOAD_BYTES,
+    InvalidVoice,
+    VoiceMetadata,
+    VoiceStore,
+)
+
+
+@dataclass
+class Readiness:
+    ready: bool = False
+
+
+class _ApiError(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        error_type: str = "invalid_request_error",
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.error_type = error_type
+        self.headers = headers
+
+
+class _Admission:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._active >= self._limit:
+                return False
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._active -= 1
+
+
+def create_app(
+    *,
+    api_key: str,
+    model: str,
+    readiness: Readiness,
+    voices: VoiceStore,
+    speech: SpeechService,
+) -> Starlette:
+    if not api_key:
+        raise ValueError("api_key must not be empty")
+    if not model:
+        raise ValueError("model must not be empty")
+
+    expected_api_key_digest = hashlib.sha256(api_key.encode("utf-8")).digest()
+    admission = _Admission(MAX_CONCURRENT_SYNTHESIS)
+
+    def authenticate(request: Request) -> None:
+        values = [
+            value
+            for name, value in request.scope.get("headers", ())
+            if name.lower() == b"authorization"
+        ]
+        authorization = values[0] if len(values) == 1 else b""
+        prefix = b"Bearer "
+        candidate = (
+            authorization[len(prefix) :]
+            if authorization.startswith(prefix)
+            else b""
+        )
+        candidate_digest = hashlib.sha256(candidate).digest()
+        if not (
+            len(values) == 1
+            and candidate
+            and candidate.isascii()
+            and hmac.compare_digest(candidate_digest, expected_api_key_digest)
+        ):
+            raise _ApiError(
+                401,
+                "invalid_api_key",
+                "Invalid authentication credentials",
+                error_type="authentication_error",
+            )
+
+    def require_ready() -> None:
+        if not readiness.ready:
+            raise _ApiError(
+                503,
+                "service_not_ready",
+                "Service is not ready",
+                error_type="server_error",
+            )
+
+    def authorize(request: Request) -> None:
+        authenticate(request)
+        require_ready()
+
+    async def health(_: Request) -> Response:
+        require_ready()
+        return JSONResponse(
+            {
+                "status": "ready",
+                "cuda": True,
+                "model": model,
+                "sample_rate": 48_000,
+            }
+        )
+
+    async def synthesize(request: Request) -> Response:
+        authorize(request)
+        if not admission.try_acquire():
+            raise _ApiError(
+                503,
+                "service_busy",
+                "Service is busy",
+                error_type="server_error",
+                headers={"Retry-After": "1"},
+            )
+        try:
+            speech_request = await _parse_speech_body(request)
+            segments = _segment_text(speech_request)
+            try:
+                chunks = [
+                    chunk
+                    async for chunk in speech.synthesize(
+                        speech_request.options,
+                        segments,
+                    )
+                ]
+            except InvalidVoice as error:
+                raise _ApiError(404, "invalid_voice", str(error)) from error
+            except InvalidSynthesisOptions as error:
+                raise _ApiError(400, "invalid_request", str(error)) from error
+            except EngineError as error:
+                raise _ApiError(
+                    500,
+                    "engine_error",
+                    "Speech synthesis failed",
+                    error_type="server_error",
+                ) from error
+            return Response(
+                pcm_s16le_chunks_to_wav(chunks),
+                media_type="audio/wav",
+            )
+        finally:
+            admission.release()
+
+    async def create_voice(request: Request) -> Response:
+        authorize(request)
+        name, source, filename, prompt_text = await _voice_form(request)
+        try:
+            metadata = await run_in_threadpool(
+                voices.create,
+                name=name,
+                source=source,
+                filename=filename,
+                prompt_text=prompt_text,
+            )
+        except InvalidVoice as error:
+            raise _ApiError(400, "invalid_request", str(error)) from error
+        return JSONResponse(_voice_object(metadata), status_code=201)
+
+    async def list_voices(request: Request) -> Response:
+        authorize(request)
+        metadata = await run_in_threadpool(voices.list)
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": [_voice_object(item) for item in metadata],
+            }
+        )
+
+    async def delete_voice(request: Request) -> Response:
+        authorize(request)
+        deleted = await run_in_threadpool(
+            voices.delete,
+            request.path_params["voice_id"],
+        )
+        if not deleted:
+            raise _ApiError(
+                404,
+                "invalid_voice",
+                "Voice profile does not exist",
+            )
+        return Response(status_code=204)
+
+    app = Starlette(
+        debug=False,
+        routes=[
+            Route("/health", health, methods=["GET"]),
+            Route("/v1/speech", synthesize, methods=["POST"]),
+            Route("/v1/voices", create_voice, methods=["POST"]),
+            Route("/v1/voices", list_voices, methods=["GET"]),
+            Route(
+                "/v1/voices/{voice_id}",
+                delete_voice,
+                methods=["DELETE"],
+            ),
+        ],
+        exception_handlers={
+            _ApiError: _api_error_response,
+            HTTPException: _http_error_response,
+            Exception: _internal_error_response,
+        },
+    )
+    app.state._admission = admission
+    return app
+
+
+async def _parse_speech_body(request: Request) -> SpeechRequest:
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
+        "application/json"
+    ):
+        raise _ApiError(
+            400,
+            "invalid_request",
+            "Content-Type must be application/json",
+        )
+    try:
+        value = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise _ApiError(
+            400,
+            "invalid_request",
+            "Request body must be valid JSON",
+        ) from None
+    try:
+        return parse_speech_request(value)
+    except InputTooLarge as error:
+        raise _ApiError(413, "input_too_large", str(error)) from error
+    except InvalidSynthesisOptions as error:
+        raise _ApiError(400, "invalid_request", str(error)) from error
+
+
+async def _segment_text(request: SpeechRequest) -> AsyncIterator[str]:
+    segmenter = Segmenter()
+    for segment in (*segmenter.append(request.text), *segmenter.finish()):
+        yield segment
+
+
+async def _voice_form(
+    request: Request,
+) -> tuple[str, bytes, str, str | None]:
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
+        "multipart/form-data"
+    ):
+        raise _ApiError(
+            400,
+            "invalid_request",
+            "Content-Type must be multipart/form-data",
+        )
+    try:
+        form = await request.form()
+    except Exception:
+        raise _ApiError(
+            400,
+            "invalid_request",
+            "Request body must be valid multipart form data",
+        ) from None
+
+    try:
+        fields: dict[str, str | UploadFile] = {}
+        for name, value in form.multi_items():
+            if name not in {"name", "file", "prompt_text"}:
+                raise _ApiError(
+                    400,
+                    "invalid_request",
+                    f"Unknown multipart field: {name}",
+                )
+            if name in fields:
+                raise _ApiError(
+                    400,
+                    "invalid_request",
+                    f"Multipart field must not be repeated: {name}",
+                )
+            fields[name] = value
+
+        name = fields.get("name")
+        upload = fields.get("file")
+        prompt_text = fields.get("prompt_text")
+        if not isinstance(name, str):
+            raise _ApiError(400, "invalid_request", "name is required")
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            raise _ApiError(400, "invalid_request", "file is required")
+        if prompt_text is not None and not isinstance(prompt_text, str):
+            raise _ApiError(
+                400,
+                "invalid_request",
+                "prompt_text must be a string",
+            )
+
+        source = await upload.read(MAX_UPLOAD_BYTES + 1)
+        filename = upload.filename
+    finally:
+        await form.close()
+    if len(source) > MAX_UPLOAD_BYTES:
+        raise _ApiError(
+            400,
+            "invalid_request",
+            "voice reference exceeds 25 MiB",
+        )
+    return name, source, filename, prompt_text
+
+
+def _voice_object(metadata: VoiceMetadata) -> dict[str, object]:
+    return asdict(metadata)
+
+
+def _api_error_response(_: Request, error: _ApiError) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": error.message,
+                "type": error.error_type,
+                "param": None,
+                "code": error.code,
+            }
+        },
+        status_code=error.status_code,
+        headers=error.headers,
+    )
+
+
+def _http_error_response(request: Request, error: HTTPException) -> JSONResponse:
+    code = "not_found" if error.status_code == 404 else "http_error"
+    return _api_error_response(
+        request,
+        _ApiError(
+            error.status_code,
+            code,
+            "Not found" if error.status_code == 404 else "HTTP error",
+        ),
+    )
+
+
+def _internal_error_response(request: Request, _: Exception) -> JSONResponse:
+    return _api_error_response(
+        request,
+        _ApiError(
+            500,
+            "internal_error",
+            "Internal server error",
+            error_type="server_error",
+        ),
+    )
