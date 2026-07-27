@@ -448,6 +448,158 @@ def test_composition_failure_never_constructs_server_and_closes_engine_once(
     assert engine.close_calls == 1
 
 
+def test_outer_cancellation_reaps_children_removes_signals_and_closes_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> tuple[
+        _FakeEngine,
+        object,
+        SimpleNamespace,
+        list[int],
+    ]:
+        events: list[object] = []
+        children_started = asyncio.Event()
+        started_count = 0
+        removed: list[int] = []
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "add_signal_handler", lambda *_: None)
+        monkeypatch.setattr(
+            loop,
+            "remove_signal_handler",
+            lambda number: removed.append(number) or True,
+        )
+
+        def mark_started() -> None:
+            nonlocal started_count
+            started_count += 1
+            if started_count == 2:
+                children_started.set()
+
+        async def wait_for_fatal() -> None:
+            engine.fatal_task = asyncio.current_task()
+            mark_started()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                events.append("fatal.cancel")
+                raise
+
+        engine = _FakeEngine(wait_for_fatal, events)
+        engine.fatal_task = None
+
+        class WaitingServer:
+            instance: WaitingServer
+
+            def __init__(self, _: object) -> None:
+                type(self).instance = self
+                self.should_exit = False
+                self.force_exit = False
+                self.http_task: asyncio.Task[None] | None = None
+
+            async def serve(self) -> None:
+                self.http_task = asyncio.current_task()
+                mark_started()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    events.append("http.cancel")
+                    raise
+
+        captured = _install_composition(
+            monkeypatch,
+            _settings(tmp_path),
+            engine,
+            WaitingServer,
+            events,
+        )
+        serve_task = asyncio.create_task(runtime.serve(_settings(tmp_path)))
+        await children_started.wait()
+        serve_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await serve_task
+        return engine, WaitingServer.instance, captured, removed
+
+    engine, server, captured, removed = asyncio.run(exercise())
+
+    assert server.should_exit is True
+    assert server.http_task.done()
+    assert engine.fatal_task.done()
+    assert captured.readiness.ready is False
+    assert removed == [signal.SIGINT, signal.SIGTERM]
+    assert engine.close_calls == 1
+
+
+def test_fatal_with_blocking_close_is_bounded_and_preserves_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> tuple[
+        _FakeEngine,
+        RuntimeError,
+        RuntimeError,
+    ]:
+        events: list[object] = []
+        fatal_error = RuntimeError("worker died")
+
+        async def wait_for_fatal() -> None:
+            raise fatal_error
+
+        class BlockingCloseEngine(_FakeEngine):
+            close_task: asyncio.Task[None] | None = None
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                self.close_task = asyncio.current_task()
+                await asyncio.Event().wait()
+
+        engine = BlockingCloseEngine(wait_for_fatal, events)
+
+        class ExitingServer:
+            def __init__(self, _: object) -> None:
+                self._should_exit = False
+                self.force_exit = False
+                self.exit_requested = asyncio.Event()
+
+            @property
+            def should_exit(self) -> bool:
+                return self._should_exit
+
+            @should_exit.setter
+            def should_exit(self, value: bool) -> None:
+                self._should_exit = value
+                if value:
+                    self.exit_requested.set()
+
+            async def serve(self) -> None:
+                await self.exit_requested.wait()
+
+        _install_composition(
+            monkeypatch,
+            _settings(tmp_path),
+            engine,
+            ExitingServer,
+            events,
+        )
+        monkeypatch.setattr(runtime, "CLEANUP_TIMEOUT_SECONDS", 0.001)
+        serve_task = asyncio.create_task(runtime.serve(_settings(tmp_path)))
+        done, _ = await asyncio.wait({serve_task}, timeout=0.2)
+        if not done:
+            serve_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await serve_task
+            pytest.fail("runtime did not bound engine close")
+        with pytest.raises(RuntimeError) as caught:
+            await serve_task
+        return engine, caught.value, fatal_error
+
+    engine, caught, fatal_error = asyncio.run(exercise())
+
+    assert caught is fatal_error
+    assert engine.close_calls == 1
+    assert engine.close_task.done()
+
+
 def test_main_loads_environment_and_runs_serve(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 
 import uvicorn
 
@@ -15,6 +15,7 @@ from botified_tts.voices import VoiceStore
 
 GRACEFUL_SHUTDOWN_SECONDS = 10
 SHUTDOWN_TIMEOUT_SECONDS = 15
+CLEANUP_TIMEOUT_SECONDS = 15
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
@@ -29,11 +30,11 @@ async def serve(settings: Settings) -> None:
     try:
         await _serve(settings, engine)
     except BaseException:
-        with contextlib.suppress(Exception):
-            await engine.close()
+        with contextlib.suppress(BaseException):
+            await _close_engine(engine)
         raise
     else:
-        await engine.close()
+        await _close_engine(engine)
 
 
 async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
@@ -58,6 +59,9 @@ async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
     server = RuntimeServer(config)
     loop = asyncio.get_running_loop()
     installed_signals: list[int] = []
+    http_task: asyncio.Task[None] | None = None
+    fatal_task: asyncio.Task[None] | None = None
+    active_error: BaseException | None = None
 
     def request_exit() -> None:
         readiness.ready = False
@@ -81,44 +85,108 @@ async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
         readiness.ready = False
 
         if fatal_task in done:
-            try:
-                await fatal_task
-            except BaseException as error:
-                fatal_error = error
-            else:
-                fatal_error = RuntimeError(
-                    "VoxCPM2 fatal waiter stopped unexpectedly"
-                )
-            server.should_exit = True
-            await _wait_for_http_shutdown(server, http_task)
-            raise fatal_error
-
-        fatal_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
             await fatal_task
+            raise RuntimeError("VoxCPM2 fatal waiter stopped unexpectedly")
         await http_task
+    except BaseException as error:
+        active_error = error
+        raise
     finally:
         readiness.ready = False
-        for handled_signal in installed_signals:
-            loop.remove_signal_handler(handled_signal)
+        try:
+            await _shutdown_tasks(
+                server,
+                http_task,
+                fatal_task,
+                graceful=not isinstance(
+                    active_error,
+                    asyncio.CancelledError,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            if active_error is None:
+                raise
+        finally:
+            for handled_signal in installed_signals:
+                loop.remove_signal_handler(handled_signal)
 
 
-async def _wait_for_http_shutdown(
+async def _shutdown_tasks(
     server: RuntimeServer,
-    http_task: asyncio.Task[None],
+    http_task: asyncio.Task[None] | None,
+    fatal_task: asyncio.Task[None] | None,
+    *,
+    graceful: bool,
 ) -> None:
+    if http_task is None:
+        return
+    server.should_exit = True
     try:
-        await asyncio.wait_for(
-            asyncio.shield(http_task),
-            timeout=SHUTDOWN_TIMEOUT_SECONDS,
+        if graceful and not http_task.done():
+            done, _ = await asyncio.wait(
+                (http_task,),
+                timeout=SHUTDOWN_TIMEOUT_SECONDS,
+            )
+            if not done:
+                server.force_exit = True
+    finally:
+        await _cancel_and_reap(
+            task
+            for task in (http_task, fatal_task)
+            if task is not None
         )
-    except TimeoutError:
-        server.force_exit = True
-        http_task.cancel()
-        with contextlib.suppress(BaseException):
-            await http_task
+
+
+async def _close_engine(engine: VoxCPMEngine) -> None:
+    close_task = asyncio.create_task(engine.close())
+    try:
+        done, _ = await asyncio.wait(
+            (close_task,),
+            timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
     except BaseException:
-        pass
+        close_task.cancel()
+        with contextlib.suppress(BaseException):
+            await _cancel_and_reap((close_task,))
+        raise
+    if done:
+        await close_task
+        return
+
+    await _cancel_and_reap((close_task,))
+    raise TimeoutError("VoxCPM2 engine shutdown timed out")
+
+
+async def _cancel_and_reap(
+    tasks: Iterable[asyncio.Task[None]],
+) -> None:
+    owned_tasks = tuple(tasks)
+    pending = {task for task in owned_tasks if not task.done()}
+    for task in pending:
+        task.cancel()
+    if pending:
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
+        for task in done:
+            _consume_task_result(task)
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.sleep(0)
+    for task in owned_tasks:
+        if task.done():
+            _consume_task_result(task)
+        else:
+            task.add_done_callback(_consume_task_result)
+
+
+def _consume_task_result(task: asyncio.Task[None]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
 
 
 def main() -> None:
