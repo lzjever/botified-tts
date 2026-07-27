@@ -737,9 +737,9 @@ Voice Design 和 controllable clone 的 style 只在首段作为显式 instructi
 
 该选择与 VoxCPM2 官方 `merge_prompt_cache()` 原样累积完整 `new_text` 的语义
 一致，也保证 Nano 的 `prompt_text` 与同次生成得到的 `prompt_latents` 来自同一
-条件历史。RTX 4090 focused 验证中，full-target continuation 的四段固定语料
-结果为 23 个音频块、3.68 秒，边界 sample jump 约 `1.42e-6`，未出现重复音素、
-截断或异常静音。spoken-only 分支已删除，不作为配置或备用路径保留。
+条件历史。RTX 4090 focused A/B 中，full-target 的 next segment 为 23 个音频块、
+3.68 秒，边界 sample jump 约 `1.40e-6`，未出现重复音素、截断或异常静音；
+spoken-only 没有可观察优势，分支已删除，不作为配置或备用路径保留。
 
 不增加：
 
