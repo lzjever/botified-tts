@@ -37,6 +37,9 @@ testpaths = ["tests"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/botified_tts"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.uv]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
