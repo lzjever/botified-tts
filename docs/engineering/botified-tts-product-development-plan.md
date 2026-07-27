@@ -3,6 +3,7 @@
 > 状态：产品与架构收敛完成，可交付开发
 > 目标仓库：`botified-tts`
 > 研究基线：2026-07-27
+> 项目约束：`docs/development-constraints.md`；发生冲突时以项目约束为准
 > 上游审阅基线：VoxCPM `616d3d3e630a9c96c2853250eef91b0f39dcd5fa`、
 > Nano-vLLM-VoxCPM `0ef61b0ba634dbf2fad9e916bc4fb696a3c0f51f`
 
