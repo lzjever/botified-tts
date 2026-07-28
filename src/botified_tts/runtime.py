@@ -10,8 +10,8 @@ from collections.abc import Generator, Iterable
 import uvicorn
 
 from botified_tts.app import Readiness, create_app
-from botified_tts.config import Settings
-from botified_tts.engine import VoxCPMEngine
+from botified_tts.config import CudaPreflightError, Settings
+from botified_tts.engine import EngineError, VoxCPMEngine
 from botified_tts.speech import SpeechService
 from botified_tts.voices import VoiceStore
 
@@ -196,12 +196,18 @@ def _consume_task_result(task: asyncio.Task[None]) -> None:
 def main() -> None:
     try:
         asyncio.run(serve(Settings.from_env()))
-    except Exception:
+    except Exception as error:
         _LOGGER.critical(
             json.dumps(
-                {"event": "fatal", "result": "engine_error"},
+                {"event": "fatal", "result": _fatal_result(error)},
                 separators=(",", ":"),
                 sort_keys=True,
             )
         )
         raise SystemExit(1) from None
+
+
+def _fatal_result(error: Exception) -> str:
+    if isinstance(error, (CudaPreflightError, EngineError)):
+        return error.code
+    return "engine_error"

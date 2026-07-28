@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 import botified_tts.runtime as runtime
-from botified_tts.config import Settings
+from botified_tts.config import CudaPreflightError, Settings
+from botified_tts.engine import EngineError
 
 MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d"
 
@@ -613,7 +614,6 @@ def test_fatal_with_blocking_close_is_bounded_and_preserves_fatal(
 def test_main_loads_environment_and_runs_serve(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = _settings(tmp_path)
     calls: list[object] = []
@@ -633,8 +633,41 @@ def test_main_loads_environment_and_runs_serve(
 
     assert calls == ["settings", ("serve", settings)]
 
+
+@pytest.mark.parametrize(
+    ("error", "expected_result"),
+    [
+        (
+            CudaPreflightError("cuda_unavailable", "RAW_FATAL_SENTINEL"),
+            "cuda_unavailable",
+        ),
+        (
+            CudaPreflightError("cuda_device_invalid", "RAW_FATAL_SENTINEL"),
+            "cuda_device_invalid",
+        ),
+        (
+            EngineError("model_load_failed", "RAW_FATAL_SENTINEL"),
+            "model_load_failed",
+        ),
+        (
+            EngineError("engine_error", "RAW_FATAL_SENTINEL"),
+            "engine_error",
+        ),
+        (RuntimeError("RAW_FATAL_SENTINEL"), "engine_error"),
+    ],
+)
+def test_main_logs_safe_fatal_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    expected_result: str,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(runtime.Settings, "from_env", lambda: settings)
+
     async def failing_serve(_: Settings) -> None:
-        raise RuntimeError("RAW_FATAL_SENTINEL")
+        raise error
 
     monkeypatch.setattr(runtime, "serve", failing_serve)
     with pytest.raises(SystemExit) as caught:
@@ -647,7 +680,7 @@ def test_main_loads_environment_and_runs_serve(
         if record.name == "uvicorn.error.botified_tts"
         and json.loads(record.getMessage()).get("event") == "fatal"
     ]
-    assert fatal_logs == [{"event": "fatal", "result": "engine_error"}]
+    assert fatal_logs == [{"event": "fatal", "result": expected_result}]
     assert "RAW_FATAL_SENTINEL" not in "\n".join(
         record.getMessage() for record in caplog.records
     )
