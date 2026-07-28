@@ -9,7 +9,9 @@
 
 ## 1. 产品定义
 
-Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务。
+Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务。仓库同时
+提供一个薄 Botified companion，把现有 Botified 文本流接到服务并在宿主机播放
+PCM；它不是第二个服务或通用 bridge。
 
 它只解决一件事：
 
@@ -30,19 +32,23 @@ Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务�
 7. 支持可复用音色的创建、列表和删除。
 8. 无 CUDA 时在模型下载和加载前明确失败，不尝试 CPU。
 9. 使用 Docker Compose 一键部署。
-10. 提供一个最小 Agent Skill。
+10. 提供本仓库内的最小 Botified companion。
+11. 提供一个最小 Agent Skill。
 
 ## 2. 设计原则
 
 ### 2.1 KISS
 
 - 一个服务部署单元。
+- 一个只负责协议映射和本地播放的 Botified companion。
 - 一个 VoxCPM2 模型。
 - 一个服务实例使用一张 GPU。
 - 一个合成核心同时服务 HTTP 和 WebSocket。
 - 一个本地目录保存注册音色，不引入数据库。
 - 一个 Docker Compose 部署方式。
 - 仅支持当前 Botified 所需的纯文本输入和两种输出方式。
+- companion 使用独立的轻量 Python 项目，不加入服务根 package 或根 uv
+  workspace，也不安装 Torch/CUDA 依赖。
 
 ### 2.2 DRY
 
@@ -92,6 +98,8 @@ Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务�
 - CUDA preflight、模型 warmup、健康检查。
 - Docker Compose 一键部署。
 - Botified 调用示例和最小 Agent Skill。
+- 本仓库内消费 Botified `stream_text`、调用 WebSocket、播放 PCM 并转发
+  barge-in cancel 的薄 companion。
 
 ### 3.2 首版明确不包含
 
@@ -106,7 +114,7 @@ Botified TTS 是一个面向 Botified 的独立、轻量、CUDA-only TTS 服务�
 - playback ack、播放水位、回滚和断线恢复。
 - session 内切换 voice、style 或 mode。
 - WebRTC、电话网关和通话编排。
-- 独立 Botified TTS Bridge 产品。
+- 通用或独立部署的 Botified TTS bridge 框架、渠道抽象和 daemon 平台。
 - 多 GPU 调度、sticky routing 和故障迁移。
 - LoRA 训练、在线加载或音色微调。
 - Prometheus 平台、自动音质评分或大规模 benchmark 矩阵。
@@ -581,8 +589,8 @@ header、sample offset 或 ack。
 
 ```text
 NEW --start--> ACTIVE --finish--> DRAINING --> DONE
-                  |
-                  +--cancel----------------> CANCELLED
+                  |             |
+                  +--cancel-----+----------> CANCELLED
 
 任意状态 --protocol/engine error----------> ERROR
 ```
@@ -596,6 +604,10 @@ deadline。业务 idle 只在 `ACTIVE` 生效，从最后一条被服务接受�
 `DRAINING` 后禁用 idle deadline，让已经接受的文本正常生成和发送完成。
 `ACTIVE` idle 到期与 `cancel` 使用同一路径，最终返回
 `done(cancelled=true)`；首个 `start` 超时也按同一取消结果结束。
+
+`DRAINING` 在生成完成前继续并发接收 `cancel`，但不再接受其他客户端消息。收到
+`cancel` 后立即关闭当前 `SpeechService` stream，使取消到达 Nano child，并返回
+`done(cancelled=true)`；生成先完成时停止并回收接收任务，再返回正常 `done`。
 
 session `run` 是终态转换的唯一 owner：receive task、generate/send task 和
 deadline 只返回结果或设置 signal，不发送 terminal `done`/`error`，不关闭
@@ -1031,33 +1043,29 @@ PUBLISHED_PORT=8000
 
 ### 14.1 Botified 集成边界
 
-Botified 负责：
+现有 Botified 是只读的外部协议和运行时依赖，负责提供 `stream_text` 事件和托管
+managed task。本仓库不修改 Botified 或 Botified Gateway。
 
-- 将 Agent 输出转换成应朗读的纯文本；
-- 把 LLM text delta 依次发送到 WebSocket `append`；
-- 回答结束时发送 `finish`；
-- 用户打断时发送 `cancel`；
-- 播放 PCM 或将 HTTP WAV 交给现有文件/渠道路径；
-- 需要 Ogg/Opus 时在渠道边界转码。
+本仓库内的 `companions/botified/` 负责：
 
-TTS 服务不实现独立 bridge，不修改 Botified Gateway，不管理渠道发布。
+- 读取现有 Botified `stream_text`，依次发送 WebSocket `append`；
+- 回答结束时发送 `finish`，同时继续读取事件；
+- 用户打断或新回答替换旧回答时，立即发送 `cancel` 并停止本地播放；
+- 把 PCM 交给宿主机 `aplay`；
+- 使用独立 `pyproject.toml` 和 `uv.lock`，运行时只依赖轻量 WebSocket client。
 
-职责划分：
-
-- `botified-tts` 仓库负责协议、服务、示例 WebSocket client 和 Skill。
-- 相邻 `botified` 仓库负责把其 LLM text preview/delta 接到本 WebSocket，并把
-  PCM 交给现有播放或媒体路径；该工作由 Botified runtime 团队完成。
-- 跨仓库端到端通过是 Botified TTS release dependency，不是本仓库单独可关闭
-  的代码任务。
+companion 是 Botified managed task 启动的薄客户端，不是独立服务或通用 bridge。
+它接收已经适合朗读的纯文本并原样传递，不解析 Markdown/SSML。启用实时朗读的
+Botified 工作区应在其 `AGENTS.md` 中要求 Agent 输出适合朗读的纯文本。
 
 ### 14.2 Agent Skill
 
 仓库提供：
 
 ```text
-skills/botified-tts/
+skills/voxcpm-tts/
 ├── SKILL.md
-└── scripts/botified-tts
+└── scripts/voxcpm-tts
 ```
 
 薄 helper 只提供：
@@ -1077,13 +1085,14 @@ helper 只读取：
 
 ```text
 BOTIFIED_TTS_URL
-BOTIFIED_TTS_API_KEY
 ```
 
-不增加 client config 文件。
+API key 只通过 `--api-key-file` 指向的明文文件读取，与 companion 使用同一种
+传递方式，避免 Botified 对 `*API_KEY*` 环境变量的过滤。`speak --text` 必须是
+已经适合朗读的纯文本，可以包含 VoxCPM2 原生非语言标签。
 
 Skill 用于 Agent 显式生成语音文件。它不能接管同一次 LLM 回答的逐 token
-stream；实时朗读由 Botified runtime 直接调用 WebSocket。
+stream；实时朗读由本仓库 companion 调用 WebSocket。
 
 ## 15. 错误与日志
 
@@ -1190,11 +1199,17 @@ fatal-before-wait、AsyncPool 任一 child fatal，以及 normal stop 不触发 
 - WebSocket `start -> append -> binary audio -> finish -> done`。
 - 生成期间仍可接收 append。
 - cancel 停止当前任务并清空队列。
+- `finish` 进入 `DRAINING` 后仍可接收 cancel，取消到达 Nano stream 并只返回
+  一个 `done(cancelled=true)`。
 - 慢客户端触发有界失败而不是无限缓存。
 - idle 状态下 fake Nano fatal 无需下一请求即可使顶层 runner 撤销 ready 并抛错；
   正常 shutdown 取消 waiter 并正常返回。
 
 fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部过程。
+
+companion 使用 fake Botified frames、fake TTS WebSocket 和 fake `aplay` 覆盖：
+文本顺序、start 选项、finish 后不阻塞事件读取、barge-in cancel、旧 session
+完成不影响新 session，以及所有后台任务和播放器均被回收。
 
 ### 16.3 真实 GPU smoke
 
@@ -1242,6 +1257,7 @@ fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部
 
 ```text
 botified-tts/
+├── AGENTS.md
 ├── README.md
 ├── pyproject.toml
 ├── uv.lock
@@ -1268,9 +1284,15 @@ botified-tts/
 │   └── compose.yaml
 ├── scripts/
 │   └── deploy.sh
-├── skills/botified-tts/
+├── companions/botified/
+│   ├── README.md
+│   ├── pyproject.toml
+│   ├── uv.lock
+│   ├── sidecar.py
+│   └── tests/test_sidecar.py
+├── skills/voxcpm-tts/
 │   ├── SKILL.md
-│   └── scripts/botified-tts
+│   └── scripts/voxcpm-tts
 └── docs/engineering/
     └── botified-tts-product-development-plan.md
 ```
@@ -1343,15 +1365,17 @@ botified-tts/
 - Dockerfile、Compose 和 `deploy.sh`；
 - CUDA 双重 fail-fast；
 - README 和调用示例；
+- 使用独立轻量依赖的 `companions/botified/`；
 - Agent Skill；
-- Botified text delta 到 WebSocket 的真实联调；
+- 不修改 Botified 的 `stream_text` 到 WebSocket 真实联调；
 - 一次真实 GPU smoke 和固定样本听测。
 
 退出条件：
 
 - 满足支持表的 fresh CUDA host 一条命令 ready；
 - 无 CUDA 时在模型下载前明确失败；
-- `botified` runtime 团队完成一次真实回答的连续播放和 cancel；
+- 本仓库 companion 使用现有 Botified 完成一次真实回答的连续播放和 barge-in
+  cancel；
 - Definition of Done 全部满足。
 
 ## 19. 风险与处理
@@ -1384,6 +1408,7 @@ botified-tts/
   下一请求，也会撤销 ready 并非零退出；没有 worker restart 或 fallback。
 - [ ] 默认日志不包含正文、reference、audio、latent 或 secret。
 - [ ] 单元、API、同一份真实 GPU smoke 和固定样本听测通过。
-- [ ] Agent Skill 可注册音色并生成 WAV。
-- [ ] `botified` runtime 团队完成真实 token delta → 连续播放 → cancel 的
-  release dependency 验收。
+- [ ] 非保留名称的 Agent Skill 可被 Botified 加载，通过 key file 注册音色并
+  生成 WAV。
+- [ ] 本仓库 companion 在不修改 Botified 的前提下完成真实 token delta →
+  连续播放 → finish 后 barge-in cancel，并回收旧 session 和播放器。

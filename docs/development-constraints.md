@@ -53,6 +53,8 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - HTTP 与 WebSocket 必须复用同一个 `SpeechService`。
 - 长文本和增量文本必须复用同一个 segmenter。
 - 只使用 VoxCPM2 和 Nano-vLLM-VoxCPM，不建立通用模型插件系统。
+- Botified 对接只使用本仓库内的薄 companion；它使用独立轻量依赖，不加入根
+  Python package 或根 uv workspace，也不引入 Torch/CUDA。
 - 只保留当前产品需要的 VoiceStore、合成、分段、音频和部署模块。
 - 只有出现真实重复或明确 ownership 问题时才增加抽象。
 - 不为目录整齐而预拆 domain、repository、service、use-case 等层级。
@@ -80,6 +82,7 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - 服务端分段与跨段 continuation；
 - 最小音色创建、列表和删除；
 - CUDA-only 一键部署；
+- 本仓库内的最小 Botified companion；
 - 最小 Agent Skill。
 
 OpenAI 兼容、Artifact/Job、多 GPU 调度、多租户治理、复杂播放状态、自动质量
@@ -87,3 +90,6 @@ OpenAI 兼容、Artifact/Job、多 GPU 调度、多租户治理、复杂播放�
 
 新增范围必须来自明确业务需求。实现过程中发现任何偏离本边界的代码或文档，
 立即原地清理。
+
+当前仓库之外的 Botified、Botified ASR、上游和参考仓库均为只读；所有适配和
+集成实现都放在当前仓库。完整写入边界见根目录 `AGENTS.md`。
