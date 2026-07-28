@@ -1,9 +1,9 @@
 # Botified TTS
 
 Botified TTS is a standalone VoxCPM2 speech service for Botified. It provides
-HTTP WAV synthesis, bidirectional WebSocket streaming, Voice Design,
-controllable and faithful voice cloning, style instructions, and native
-VoxCPM2 text tags.
+HTTP WAV and Ogg/Opus synthesis, bidirectional WebSocket streaming, Voice
+Design, controllable and faithful voice cloning, style instructions, and
+native VoxCPM2 text tags.
 
 The service requires Linux x86_64, Docker, an NVIDIA GPU with a CUDA-compatible
 host driver, and NVIDIA Container Toolkit configured for Docker. There is no
@@ -38,7 +38,7 @@ docker run -d \
   --env-file ./botified-tts.env \
   -p 8000:8000 \
   -v botified-tts-data:/data \
-  ghcr.io/lzjever/botified-tts:v0.1.0
+  ghcr.io/lzjever/botified-tts:v0.2.0
 ```
 
 Check readiness and failures with:
@@ -76,10 +76,10 @@ absolute `botified-tts.env` path and the complete WebSocket endpoint.
 
 ## Develop
 
-The local test suite additionally requires `ffmpeg`:
+The local test suite additionally requires `ffmpeg` and `ffprobe`:
 
 ```bash
-command -v ffmpeg
+command -v ffmpeg ffprobe
 uv sync --locked
 uv run pytest -q
 ```
@@ -100,7 +100,7 @@ docker build --provenance=false --platform linux/amd64 -t botified-tts:local .
 ```
 
 Run it with the same env file, GPU, port, and volume from the service command
-above, replacing only `ghcr.io/lzjever/botified-tts:v0.1.0` with
+above, replacing only `ghcr.io/lzjever/botified-tts:v0.2.0` with
 `botified-tts:local`.
 
 ## API and capabilities
@@ -110,7 +110,7 @@ All authenticated endpoints use `Authorization: Bearer <API key>`.
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Public readiness, CUDA, logical model name, and sample rate |
-| `POST /v1/speech` | Synthesize a complete mono 48 kHz PCM s16le WAV |
+| `POST /v1/speech` | Synthesize a complete mono 48 kHz WAV or Ogg/Opus file |
 | `POST /v1/voices` | Register a trusted reference voice |
 | `GET /v1/voices` | List registered voice profiles |
 | `DELETE /v1/voices/{voice_id}` | Delete a voice profile |
@@ -126,9 +126,20 @@ Canonical synthesis options are top-level fields:
 | Faithful clone | `{"voice":{"type":"profile","id":"voice_..."},"mode":"faithful"}`; `"style"` is not accepted |
 
 For `POST /v1/speech`, add the required top-level `"text"` field to the selected
-options. For WebSocket streaming, add the required top-level `"type":"start"`
-field to the same options, then send `append` events followed by `finish` or
-`cancel`.
+options. WAV is the default. Send `Accept: audio/ogg` to receive Ogg/Opus:
+
+```bash
+curl \
+  -H 'Authorization: Bearer <API key>' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: audio/ogg' \
+  --data '{"text":"你好。"}' \
+  http://127.0.0.1:8000/v1/speech \
+  --output speech.ogg
+```
+
+For WebSocket streaming, add the required top-level `"type":"start"` field to
+the same options, then send `append` events followed by `finish` or `cancel`.
 
 `POST /v1/voices` accepts multipart fields `name`, `file`, and optional
 `prompt_text`. A profile used in faithful mode must have a `prompt_text` that
@@ -138,7 +149,9 @@ The service also supports VoxCPM2 native tags, sentence-aware segmentation,
 continuation, and cancellation. It receives final speakable plain text and does
 not parse Markdown or SSML. The bundled
 [`voxcpm-tts` Skill](skills/voxcpm-tts/SKILL.md) provides the concise HTTP
-workflow for synthesis and voice management.
+workflow for synthesis and voice management. Its `speak` command requests WAV
+or Ogg/Opus from the lowercase `.wav` or `.ogg` output suffix; it does not run
+FFmpeg locally.
 
 WebSocket clients send a `start` event, then any number of incremental `append`
 events, followed by `finish` or `cancel`. The server returns JSON lifecycle

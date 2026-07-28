@@ -18,7 +18,11 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
-from botified_tts.audio import pcm_s16le_chunks_to_wav
+from botified_tts.audio import (
+    AudioEncodingError,
+    pcm_s16le_chunks_to_ogg_opus,
+    pcm_s16le_chunks_to_wav,
+)
 from botified_tts.config import MAX_CONCURRENT_SYNTHESIS
 from botified_tts.engine import EngineError
 from botified_tts.schemas import (
@@ -152,6 +156,7 @@ def create_app(
 
     async def synthesize(request: Request) -> Response:
         authorize(request)
+        media_type = _speech_media_type(request)
         if not admission.try_acquire():
             raise _ApiError(
                 503,
@@ -193,9 +198,25 @@ def create_app(
                     "Speech synthesis failed",
                     error_type="server_error",
                 ) from error
+            if media_type == "audio/ogg":
+                try:
+                    content = await run_in_threadpool(
+                        pcm_s16le_chunks_to_ogg_opus,
+                        chunks,
+                    )
+                except AudioEncodingError as error:
+                    raise _ApiError(
+                        500,
+                        "engine_error",
+                        "Speech encoding failed",
+                        error_type="server_error",
+                    ) from error
+            else:
+                content = pcm_s16le_chunks_to_wav(chunks)
             response = Response(
-                pcm_s16le_chunks_to_wav(chunks),
-                media_type="audio/wav",
+                content,
+                media_type=media_type,
+                headers={"Vary": "Accept"},
             )
             result = "ok"
             return response
@@ -278,6 +299,22 @@ def create_app(
         },
     )
     return app
+
+
+def _speech_media_type(request: Request) -> str:
+    accept = request.headers.get("accept")
+    if accept is None:
+        return "audio/wav"
+    normalized = accept.strip().lower()
+    if normalized in {"*/*", "audio/wav"}:
+        return "audio/wav"
+    if normalized == "audio/ogg":
+        return "audio/ogg"
+    raise _ApiError(
+        406,
+        "invalid_request",
+        "Accept must be audio/wav or audio/ogg",
+    )
 
 
 async def _parse_speech_body(request: Request) -> SpeechRequest:

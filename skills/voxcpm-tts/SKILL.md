@@ -1,6 +1,6 @@
 ---
 name: voxcpm-tts
-description: Generate WAV speech and manage trusted Botified TTS voice profiles through the bundled HTTP helper. Use when an agent needs to check Botified TTS health, create, list, or delete a voice profile, or synthesize normal, designed, controllable-clone, or faithful-clone speech to an explicit local WAV path.
+description: Generate WAV or Ogg/Opus speech and manage trusted Botified TTS voice profiles through the bundled HTTP helper. Use when an agent needs to check Botified TTS health, create, list, or delete a voice profile, or synthesize normal, designed, controllable-clone, or faithful-clone speech to an explicit local audio path.
 ---
 
 # VoxCPM TTS
@@ -56,13 +56,14 @@ Provide `--prompt-text` only when it exactly matches the reference audio. A
 profile requires that transcript before it can use faithful mode.
 
 Pass only final, already speakable plain text to `--text`. Do not pass Markdown
-or SSML; the service does not parse either. Always provide a new explicit WAV
-output path when synthesizing:
+or SSML; the service does not parse either. Always provide a new explicit
+`.wav` or `.ogg` output path when synthesizing. Use `.ogg` for a smaller file
+that will be published or sent:
 
 ```bash
-# Normal voice
+# Normal voice as Ogg/Opus
 "${TTS}" --env-file "${ENV_FILE}" speak \
-  --text 'Hello.' --output hello.wav
+  --text 'Hello.' --output hello.ogg
 
 # Voice Design
 "${TTS}" --env-file "${ENV_FILE}" speak \

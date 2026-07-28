@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import wave
 from collections.abc import Iterable
 
@@ -10,6 +11,10 @@ from numpy.typing import NDArray
 
 class InvalidWaveform(ValueError):
     """The inference engine returned an invalid waveform."""
+
+
+class AudioEncodingError(RuntimeError):
+    """The audio encoder failed to produce a complete output."""
 
 
 def float32_to_pcm_s16le(waveform: NDArray[np.float32]) -> bytes:
@@ -33,8 +38,62 @@ def pcm_s16le_chunks_to_wav(chunks: Iterable[bytes]) -> bytes:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(48_000)
-        for chunk in chunks:
-            if len(chunk) % 2 != 0:
-                raise ValueError("PCM chunk must contain complete 16-bit samples")
+        for chunk in _validated_pcm_s16le_chunks(chunks):
             wav.writeframesraw(chunk)
     return output.getvalue()
+
+
+def pcm_s16le_chunks_to_ogg_opus(chunks: Iterable[bytes]) -> bytes:
+    pcm = b"".join(_validated_pcm_s16le_chunks(chunks))
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-map",
+                "0:a:0",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "48k",
+                "-application",
+                "voip",
+                "-vbr",
+                "on",
+                "-f",
+                "ogg",
+                "pipe:1",
+            ],
+            input=pcm,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AudioEncodingError("FFmpeg failed to encode audio") from error
+    if result.returncode != 0 or not result.stdout:
+        raise AudioEncodingError("FFmpeg failed to encode audio")
+    return result.stdout
+
+
+def _validated_pcm_s16le_chunks(chunks: Iterable[bytes]) -> Iterable[bytes]:
+    for chunk in chunks:
+        if len(chunk) % 2 != 0:
+            raise ValueError("PCM chunk must contain complete 16-bit samples")
+        yield chunk

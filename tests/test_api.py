@@ -10,7 +10,9 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+import botified_tts.app as app_module
 from botified_tts.app import Readiness, create_app
+from botified_tts.audio import AudioEncodingError
 from botified_tts.engine import EngineError
 from botified_tts.schemas import SynthesisOptions
 from botified_tts.speech import SynthesisSummary
@@ -246,6 +248,76 @@ def test_speech_uses_the_segmenter_and_returns_one_canonical_wav(
     assert summary["result"] == "ok"
 
 
+def test_speech_accepts_ogg_with_exact_content_type_and_vary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoded = b"OggS\x00OpusHead"
+    received_chunks: list[list[bytes]] = []
+
+    def encode(chunks: list[bytes]) -> bytes:
+        received_chunks.append(chunks)
+        return encoded
+
+    monkeypatch.setattr(
+        app_module,
+        "pcm_s16le_chunks_to_ogg_opus",
+        encode,
+    )
+    with _client() as client:
+        response = client.post(
+            "/v1/speech",
+            headers={**AUTH, "Accept": "audio/ogg"},
+            json={"text": "你好。"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/ogg"
+    assert response.headers["vary"] == "Accept"
+    assert response.content == encoded
+    assert received_chunks == [[PCM[:2], PCM[2:]]]
+
+
+def test_ogg_encoder_failure_maps_to_engine_error_and_releases_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_encoding(_: list[bytes]) -> bytes:
+        raise AudioEncodingError
+
+    monkeypatch.setattr(
+        app_module,
+        "pcm_s16le_chunks_to_ogg_opus",
+        fail_encoding,
+    )
+    speech = FakeSpeech()
+    with _client(speech=speech) as client:
+        failed = [
+            client.post(
+                "/v1/speech",
+                headers={**AUTH, "Accept": "audio/ogg"},
+                json={"text": f"request {index}"},
+            )
+            for index in range(16)
+        ]
+        recovered = client.post(
+            "/v1/speech",
+            headers={**AUTH, "Accept": "audio/wav"},
+            json={"text": "after failures"},
+        )
+
+    assert all(response.status_code == 500 for response in failed)
+    assert all(
+        response.json()
+        == _error(
+            "engine_error",
+            "Speech encoding failed",
+            "server_error",
+        )
+        for response in failed
+    )
+    assert recovered.status_code == 200
+    assert len(speech.calls) == 17
+
+
 @pytest.mark.parametrize(
     ("body", "speech_error", "status", "code"),
     (
@@ -396,6 +468,19 @@ def test_admission_rejects_the_seventeenth_request_and_releases_slots() -> None:
                 for index in range(16)
             ]
             await asyncio.wait_for(speech.full.wait(), timeout=2)
+
+            unsupported = await client.post(
+                "/v1/speech",
+                headers={**AUTH, "Accept": "audio/mpeg"},
+                json={"text": "unsupported"},
+            )
+            assert unsupported.status_code == 406
+            assert unsupported.json() == _error(
+                "invalid_request",
+                "Accept must be audio/wav or audio/ogg",
+                "invalid_request_error",
+            )
+            assert speech.entered == 16
 
             busy = await client.post(
                 "/v1/speech",

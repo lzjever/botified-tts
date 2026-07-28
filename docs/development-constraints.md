@@ -84,7 +84,7 @@ alias、双写、迁移框架或长期 deprecated 路径。
 
 首版只服务于稳定、方便的 Botified TTS：
 
-- HTTP 非流式 WAV；
+- HTTP 非流式 WAV 或 Ogg/Opus 完整文件；
 - WebSocket 增量文本输入与 PCM 输出；
 - VoxCPM2 原生 Voice Design、音色克隆、style 和非语言标签；
 - 服务端分段与跨段 continuation；

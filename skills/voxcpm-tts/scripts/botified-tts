@@ -212,6 +212,22 @@ speak() {
 
     [[ -n "${text}" ]] || fail "--text is required"
     [[ -n "${output}" ]] || fail "--output is required"
+    local audio_format
+    local accept
+    local validation_name
+    case "${output}" in
+        *.wav)
+            audio_format="wav"
+            accept="audio/wav"
+            validation_name="WAV"
+            ;;
+        *.ogg)
+            audio_format="ogg"
+            accept="audio/ogg"
+            validation_name="Ogg/Opus"
+            ;;
+        *) fail "--output must end with .wav or .ogg" ;;
+    esac
     [[ -z "${design}" || -z "${voice_id}" ]] \
         || fail "--design and --voice-id are mutually exclusive"
     [[ -z "${mode}" || -n "${voice_id}" ]] \
@@ -248,7 +264,7 @@ speak() {
     if ! content_type="$(
         authorized_curl \
             --request POST \
-            --header 'Accept: audio/wav' \
+            --header "Accept: ${accept}" \
             --header 'Content-Type: application/json' \
             --data-binary "${body}" \
             --output "${temporary}" \
@@ -258,15 +274,20 @@ speak() {
         [[ ! -s "${temporary}" ]] || cat -- "${temporary}" >&2
         fail "speech request failed"
     fi
-    [[ "${content_type%%;*}" == "audio/wav" ]] \
-        || fail "speech response is not audio/wav"
-    python3 - "${temporary}" <<'PY' \
-        || fail "speech response is not a valid WAV"
+    [[ "${content_type%%;*}" == "${accept}" ]] \
+        || fail "speech response is not ${accept}"
+    python3 - "${audio_format}" "${temporary}" <<'PY' \
+        || fail "speech response is not a valid ${validation_name}"
 import pathlib
 import sys
 
-data = pathlib.Path(sys.argv[1]).read_bytes()
-raise SystemExit(not (len(data) > 44 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"))
+audio_format = sys.argv[1]
+data = pathlib.Path(sys.argv[2]).read_bytes()
+if audio_format == "wav":
+    valid = len(data) > 44 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+else:
+    valid = data[:4] == b"OggS" and b"OpusHead" in data[:256]
+raise SystemExit(not valid)
 PY
 
     ln --no-target-directory -- "${temporary}" "${output}" \

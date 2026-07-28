@@ -31,9 +31,14 @@ def _wav() -> bytes:
     return output.getvalue()
 
 
+def _ogg() -> bytes:
+    return b"OggS" + b"\x00" * 24 + b"OpusHead" + b"\x00" * 16
+
+
 class _Server(ThreadingHTTPServer):
     records: list[tuple[str, str, dict[str, str], bytes]]
     fail_speech: bool
+    speech_response: tuple[bytes, str] | None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -84,7 +89,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "application/json",
             )
         elif self.path == "/v1/speech":
-            self._send(200, _wav(), "audio/wav")
+            if self.server.speech_response is not None:
+                body, content_type = self.server.speech_response
+            elif self.headers.get("Accept") == "audio/ogg":
+                body, content_type = _ogg(), "audio/ogg"
+            else:
+                body, content_type = _wav(), "audio/wav"
+            self._send(200, body, content_type)
         else:
             self._send(404)
 
@@ -101,6 +112,7 @@ def _service() -> Iterator[tuple[_Server, str]]:
     server = _Server(("127.0.0.1", 0), _Handler)
     server.records = []
     server.fail_speech = False
+    server.speech_response = None
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
@@ -166,6 +178,7 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
     outputs = [
         tmp_path / f"{name}.wav" for name in ("normal", "design", "clone", "faithful")
     ]
+    ogg_output = tmp_path / "publish.ogg"
 
     with _service() as (server, url):
         health = _run(url, "health", env_file=env_file)
@@ -238,9 +251,19 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
                 env_file=env_file,
             ),
         ]
+        ogg = _run(
+            url,
+            "speak",
+            "--text",
+            "publish",
+            "--output",
+            str(ogg_output),
+            env_file=env_file,
+        )
 
     assert all(
-        result.returncode == 0 for result in (health, created, listed, deleted, *spoken)
+        result.returncode == 0
+        for result in (health, created, listed, deleted, *spoken, ogg)
     )
     assert json.loads(health.stdout) == {"status": "ready"}
     assert json.loads(created.stdout) == {"id": VOICE_ID}
@@ -249,10 +272,12 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
     assert [result.stdout.strip() for result in spoken] == [
         str(path) for path in outputs
     ]
+    assert ogg.stdout.strip() == str(ogg_output)
     assert all(path.read_bytes() == _wav() for path in outputs)
+    assert ogg_output.read_bytes() == _ogg()
     assert all(
         "test-key" not in result.stdout + result.stderr
-        for result in (health, created, listed, deleted, *spoken)
+        for result in (health, created, listed, deleted, *spoken, ogg)
     )
 
     assert [(method, path) for method, path, _, _ in server.records] == [
@@ -264,12 +289,20 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
         ("POST", "/v1/speech"),
         ("POST", "/v1/speech"),
         ("POST", "/v1/speech"),
+        ("POST", "/v1/speech"),
     ]
     assert "Authorization" not in server.records[0][2]
     assert all(
         headers["Authorization"] == "Bearer test-key"
         for _, _, headers, _ in server.records[1:]
     )
+    assert [record[2]["Accept"] for record in server.records[4:]] == [
+        "audio/wav",
+        "audio/wav",
+        "audio/wav",
+        "audio/wav",
+        "audio/ogg",
+    ]
     form = _multipart(
         server.records[1][3],
         server.records[1][2]["Content-Type"],
@@ -296,6 +329,7 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
             "voice": {"type": "profile", "id": VOICE_ID},
             "mode": "faithful",
         },
+        {"text": "publish"},
     ]
 
 
@@ -305,6 +339,7 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
     env_file = tmp_path / "botified-tts.env"
     env_file.write_text("BOTIFIED_TTS_API_KEY=test-key\n", encoding="ascii")
     output = tmp_path / "speech.wav"
+    unsupported_output = tmp_path / "speech.mp3"
     invalid = [
         (
             "speak",
@@ -333,6 +368,7 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
         ),
         ("speak", "--text", "x", "--output", str(output), "--voice-id", "bad"),
         ("speak", "--text", "x"),
+        ("speak", "--text", "x", "--output", str(unsupported_output)),
         ("voice-list", "--unknown"),
         ("speak", "--text", "one", "--text", "two", "--output", str(output)),
     ]
@@ -389,6 +425,42 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
     assert "invalid_request" in failed.stderr
     assert not output.exists()
     assert list(tmp_path.glob(".speech.wav.tmp.*")) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "content_type", "message"),
+    (
+        (_ogg(), "audio/wav", "speech response is not audio/ogg"),
+        (b"OggS without an Opus identification header", "audio/ogg", "valid Ogg/Opus"),
+    ),
+    ids=("mime-mismatch", "invalid-ogg"),
+)
+def test_helper_rejects_invalid_ogg_response_atomically(
+    tmp_path: Path,
+    body: bytes,
+    content_type: str,
+    message: str,
+) -> None:
+    env_file = tmp_path / "botified-tts.env"
+    env_file.write_text("BOTIFIED_TTS_API_KEY=test-key\n", encoding="ascii")
+    output = tmp_path / "speech.ogg"
+
+    with _service() as (server, url):
+        server.speech_response = (body, content_type)
+        result = _run(
+            url,
+            "speak",
+            "--text",
+            "x",
+            "--output",
+            str(output),
+            env_file=env_file,
+        )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not output.exists()
+    assert list(tmp_path.glob(".speech.ogg.tmp.*")) == []
 
 
 def test_helper_rejects_invalid_env_files_without_evaluating_them(
