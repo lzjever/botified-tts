@@ -183,8 +183,10 @@ async def streaming_smoke(
         },
     }
 
-    for text in ("你好，", "这是逐块输入的第一句话。"):
-        await websocket.incoming.put({"type": "append", "text": text})
+    for character in "你好，这是逐字符输入的第一句话。":
+        await websocket.incoming.put(
+            {"type": "append", "text": character}
+        )
 
     first_pcm = await asyncio.wait_for(
         websocket.pcm_chunks.get(),
@@ -455,6 +457,31 @@ async def run(args: argparse.Namespace) -> None:
             (NORMAL_TEXT,),
         )
         results.append(normal_result)
+
+        _, result = await synthesize(
+            speech,
+            args.output_dir,
+            "english",
+            default,
+            (
+                "Hello, this is Botified. "
+                "We are testing clear and natural English speech.",
+            ),
+        )
+        results.append(result)
+
+        _, result = await synthesize(
+            speech,
+            args.output_dir,
+            "mixed",
+            default,
+            (
+                "你好，welcome to Botified。"
+                "今天的任务是验证 Chinese and English 混合语音。",
+            ),
+        )
+        results.append(result)
+
         normal_wav = pcm_s16le_chunks_to_wav(normal_chunks)
         assert normal_result.audio_seconds >= 3, (
             "normal reference must be at least three seconds"
@@ -523,6 +550,7 @@ async def run(args: argparse.Namespace) -> None:
                 "第一段介绍已经完成。",
                 "第二段沿用上一段的生成状态。",
                 "第三段继续保持自然和连贯。",
+                "第四段完成连续生成验证。",
             ),
         )
         results.append(result)
