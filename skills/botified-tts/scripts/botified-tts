@@ -232,7 +232,7 @@ data = pathlib.Path(sys.argv[1]).read_bytes()
 raise SystemExit(not (len(data) > 44 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"))
 PY
 
-    ln -- "${temporary}" "${output}" \
+    ln --no-target-directory -- "${temporary}" "${output}" \
         || fail "--output was created while speech was generated"
     rm -f -- "${temporary}"
     trap - EXIT
