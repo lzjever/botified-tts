@@ -71,6 +71,8 @@ deployment_diagnostics() {
 }
 
 preflight() {
+    local compose_up_help
+
     [[ "$(uname -s)" == "Linux" ]] \
         || fail "only Linux is supported"
     [[ "$(uname -m)" == "x86_64" ]] \
@@ -85,6 +87,13 @@ preflight() {
         || fail "Docker daemon is unavailable"
     docker compose version >/dev/null 2>&1 \
         || fail "Docker Compose is unavailable"
+    compose_up_help="$(docker compose up --help 2>/dev/null)" \
+        || fail "Docker Compose could not report up command capabilities"
+    grep -Eq '(^|[[:space:]])--wait([=[:space:]]|$)' <<<"${compose_up_help}" \
+        || fail "Docker Compose up must support --wait"
+    grep -Eq '(^|[[:space:]])--wait-timeout([=[:space:]]|$)' \
+        <<<"${compose_up_help}" \
+        || fail "Docker Compose up must support --wait-timeout"
 
     [[ "${HOST_GPU}" =~ ^[0-9]+$ ]] \
         || fail "HOST_GPU must be a non-negative GPU index"
@@ -133,18 +142,19 @@ smoke() {
     trap 'rm -rf -- "${temp_dir}"' EXIT
 
     if ! http_status="$(
-        curl \
-            --silent \
-            --show-error \
-            --connect-timeout 5 \
-            --max-time 180 \
-            --output "${wav_file}" \
-            --dump-header "${headers_file}" \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer ${BOTIFIED_TTS_API_KEY}" \
-            --header 'Content-Type: application/json' \
-            --data '{"text":"你好，这是 Botified TTS 部署测试。"}' \
-            "http://127.0.0.1:${PUBLISHED_PORT}/v1/speech"
+        printf 'Authorization: Bearer %s\n' "${BOTIFIED_TTS_API_KEY}" \
+            | curl \
+                --silent \
+                --show-error \
+                --connect-timeout 5 \
+                --max-time 180 \
+                --output "${wav_file}" \
+                --dump-header "${headers_file}" \
+                --write-out '%{http_code}' \
+                --header @- \
+                --header 'Content-Type: application/json' \
+                --data '{"text":"你好，这是 Botified TTS 部署测试。"}' \
+                "http://127.0.0.1:${PUBLISHED_PORT}/v1/speech"
     )"; then
         deployment_diagnostics
         fail "speech smoke request failed"
@@ -194,7 +204,6 @@ main() {
     HOST_GPU="$(env_value HOST_GPU)"
     PUBLISHED_PORT="$(env_value PUBLISHED_PORT)"
     BOTIFIED_TTS_API_KEY="$(env_value BOTIFIED_TTS_API_KEY)"
-    readonly HOST_GPU PUBLISHED_PORT BOTIFIED_TTS_API_KEY
 
     preflight
     compose config --quiet
