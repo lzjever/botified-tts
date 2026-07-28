@@ -386,6 +386,29 @@ class CancellableSpeech:
             self.closed.set()
 
 
+class DrainingCancellableSpeech:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.closed = threading.Event()
+        self.segments: list[str] = []
+
+    async def synthesize(
+        self,
+        _options: SynthesisOptions,
+        segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
+    ) -> AsyncIterator[bytes]:
+        try:
+            async for segment in segments:
+                self.segments.append(segment)
+                self.started.set()
+                await asyncio.sleep(0.1)
+                yield PCM
+        finally:
+            self.closed.set()
+
+
 def test_stream_cancel_closes_active_speech_and_discards_queue() -> None:
     speech = CancellableSpeech()
     with _client(speech=speech) as client:
@@ -406,6 +429,28 @@ def test_stream_cancel_closes_active_speech_and_discards_queue() -> None:
 
     assert speech.closed.wait(timeout=1)
     assert speech.segments == ["第一句。"]
+
+
+def test_stream_cancel_after_finish_stops_draining_speech() -> None:
+    speech = DrainingCancellableSpeech()
+    with _client(speech=speech) as client:
+        with client.websocket_connect(
+            "/v1/speech/stream",
+            headers=AUTH,
+        ) as websocket:
+            _start_stream(websocket)
+            websocket.send_json({"type": "append", "text": "等待结束"})
+            websocket.send_json({"type": "finish"})
+            assert speech.started.wait(timeout=1)
+
+            websocket.send_json({"type": "cancel"})
+            assert websocket.receive_json() == {
+                "type": "done",
+                "cancelled": True,
+            }
+
+    assert speech.closed.wait(timeout=1)
+    assert speech.segments == ["等待结束"]
 
 
 def test_stream_send_timeout_closes_speech(
@@ -564,6 +609,7 @@ def test_coordinate_prefers_precompleted_generation_failure() -> None:
                 receive_task,
                 generate_task,
                 asyncio.Event(),
+                asyncio.Event(),
             )
 
     asyncio.run(exercise())
@@ -585,6 +631,7 @@ def test_coordinate_uses_precompleted_receive_after_normal_generation() -> None:
         assert await session._coordinate(
             receive_task,
             generate_task,
+            asyncio.Event(),
             asyncio.Event(),
         )
 

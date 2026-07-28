@@ -168,8 +168,26 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-This example needs the external `websockets` package; it is not a service
-dependency.
+The client example environment also needs `websockets`; the service pins it as
+the Uvicorn WebSocket transport. After `finish`, the connection remains
+cancelable until the server has sent all accepted audio and its terminal
+`done`.
+
+## Botified companion
+
+The lightweight companion in
+[`companions/botified`](companions/botified/README.md) connects Botified
+`stream_text` observations to the WebSocket API and `/usr/bin/aplay`. It has its
+own locked environment, so installing it does not install Torch, CUDA, or the
+TTS model dependencies:
+
+```bash
+uv sync --project companions/botified --locked --no-dev
+```
+
+Assistant completion starts background draining without blocking later observer
+frames. User input, provider replacement, and stdin EOF cancel both remaining
+server generation and local playback.
 
 ## Limits, errors, and configuration
 
@@ -201,6 +219,8 @@ For focused development checks:
 
 ```bash
 uv run pytest -q tests/test_api.py tests/test_streaming.py tests/test_skill_helper.py
+uv run --project companions/botified --locked pytest -q companions/botified/tests
+uv run --project companions/botified --locked ruff check companions/botified
 ```
 
 On a CUDA development machine, run the focused real-engine smoke from the

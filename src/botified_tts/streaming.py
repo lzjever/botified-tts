@@ -71,9 +71,10 @@ class _StreamingSession:
     async def run(self) -> None:
         acquired = False
         terminal: dict[str, object] | None = None
-        receive_task: asyncio.Task[Literal["finish", "cancel"]] | None = None
+        receive_task: asyncio.Task[Literal["cancel"]] | None = None
         generate_task: asyncio.Task[None] | None = None
         cancel_event = asyncio.Event()
+        finish_event = asyncio.Event()
         summary: SynthesisSummary | None = None
         result = "engine_error"
 
@@ -119,6 +120,7 @@ class _StreamingSession:
                 self._receive_loop(
                     queue,
                     cancel_event,
+                    finish_event,
                     active_idle_deadline,
                     summary,
                 )
@@ -135,6 +137,7 @@ class _StreamingSession:
                 receive_task,
                 generate_task,
                 cancel_event,
+                finish_event,
             )
             terminal = {"type": "done", "cancelled": cancelled}
             result = "cancelled" if cancelled else "ok"
@@ -192,9 +195,10 @@ class _StreamingSession:
 
     async def _coordinate(
         self,
-        receive_task: asyncio.Task[Literal["finish", "cancel"]],
+        receive_task: asyncio.Task[Literal["cancel"]],
         generate_task: asyncio.Task[None],
         cancel_event: asyncio.Event,
+        finish_event: asyncio.Event,
     ) -> bool:
         done, _ = await asyncio.wait(
             {receive_task, generate_task},
@@ -202,61 +206,76 @@ class _StreamingSession:
         )
         if generate_task in done:
             await generate_task
-            if not receive_task.done():
-                raise EngineError(
-                    "engine_error",
-                    "speech stream ended before client finish",
-                )
-
-        outcome = receive_task.result()
-        if outcome == "finish":
-            await generate_task
-            return False
-        cancel_event.set()
-        await _stop_task(generate_task)
-        return True
+        if receive_task.done():
+            receive_task.result()
+            cancel_event.set()
+            await _stop_task(generate_task)
+            return True
+        if not finish_event.is_set():
+            raise EngineError(
+                "engine_error",
+                "speech stream ended before client finish",
+            )
+        await _stop_task(receive_task)
+        return False
 
     async def _receive_loop(
         self,
         queue: asyncio.Queue[str | object],
         cancel_event: asyncio.Event,
+        finish_event: asyncio.Event,
         idle_deadline: float,
         summary: SynthesisSummary,
-    ) -> Literal["finish", "cancel"]:
+    ) -> Literal["cancel"]:
         segmenter = Segmenter()
         loop = asyncio.get_running_loop()
         segment_deadline: float | None = None
         accepted_bytes = 0
+        draining = False
 
         while True:
-            now = loop.time()
-            next_deadline = (
-                idle_deadline
-                if segment_deadline is None
-                else min(idle_deadline, segment_deadline)
-            )
-            try:
-                async with asyncio.timeout(max(0.0, next_deadline - now)):
-                    message = await _receive_client_message(self._websocket)
-            except TimeoutError:
+            if draining:
+                message = await _receive_client_message(self._websocket)
+            else:
                 now = loop.time()
-                if (
-                    segment_deadline is not None
-                    and segment_deadline <= now
-                ):
-                    segments = segmenter.expire_deadline()
-                    _enqueue_segments(queue, segments)
-                    segment_deadline = (
-                        now + _SEGMENT_DEADLINE_SECONDS
-                        if segments and segmenter.has_pending_text
-                        else None
-                    )
-                    continue
-                cancel_event.set()
-                _clear_queue(queue)
-                return "cancel"
+                next_deadline = (
+                    idle_deadline
+                    if segment_deadline is None
+                    else min(idle_deadline, segment_deadline)
+                )
+                try:
+                    async with asyncio.timeout(
+                        max(0.0, next_deadline - now)
+                    ):
+                        message = await _receive_client_message(self._websocket)
+                except TimeoutError:
+                    now = loop.time()
+                    if (
+                        segment_deadline is not None
+                        and segment_deadline <= now
+                    ):
+                        segments = segmenter.expire_deadline()
+                        _enqueue_segments(queue, segments)
+                        segment_deadline = (
+                            now + _SEGMENT_DEADLINE_SECONDS
+                            if segments and segmenter.has_pending_text
+                            else None
+                        )
+                        continue
+                    cancel_event.set()
+                    _clear_queue(queue)
+                    return "cancel"
 
             now = loop.time()
+            if draining:
+                if isinstance(message, CancelMessage):
+                    cancel_event.set()
+                    _clear_queue(queue)
+                    return "cancel"
+                raise InvalidSynthesisOptions(
+                    "only cancel is valid after finish"
+                )
+
             idle_deadline = now + _IDLE_TIMEOUT_SECONDS
             if isinstance(message, AppendMessage):
                 text_bytes = len(message.text.encode("utf-8"))
@@ -293,7 +312,9 @@ class _StreamingSession:
                 segment_deadline = None
                 _enqueue_segments(queue, segmenter.finish())
                 queue.put_nowait(_SEGMENT_END)
-                return "finish"
+                finish_event.set()
+                draining = True
+                continue
 
             if isinstance(message, CancelMessage):
                 cancel_event.set()
