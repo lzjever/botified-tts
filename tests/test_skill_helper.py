@@ -13,8 +13,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
 
-import pytest
-
 
 ROOT = Path(__file__).parents[1]
 HELPER = ROOT / "skills/botified-tts/scripts/botified-tts"
