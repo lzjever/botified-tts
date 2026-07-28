@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly API_KEY="${BOTIFIED_TTS_API_KEY:-}"
+unset BOTIFIED_TTS_API_KEY
+
+fail() {
+    printf 'botified-tts: %s\n' "$*" >&2
+    exit 2
+}
+
+require_value() {
+    [[ $# -ge 2 && -n "$2" ]] || fail "$1 requires a non-empty value"
+}
+
+set_once() {
+    local variable="$1"
+    local flag="$2"
+    local value="$3"
+    [[ -z "${!variable}" ]] || fail "${flag} may only be specified once"
+    printf -v "${variable}" '%s' "${value}"
+}
+
+require_url() {
+    [[ -n "${BOTIFIED_TTS_URL:-}" ]] || fail "BOTIFIED_TTS_URL is required"
+    BASE_URL="${BOTIFIED_TTS_URL}"
+    while [[ "${BASE_URL}" == */ ]]; do
+        BASE_URL="${BASE_URL%/}"
+    done
+    [[ "${BASE_URL}" == http://* || "${BASE_URL}" == https://* ]] \
+        || fail "BOTIFIED_TTS_URL must use http or https"
+    readonly BASE_URL
+}
+
+require_api_key() {
+    [[ -n "${API_KEY}" ]] || fail "BOTIFIED_TTS_API_KEY is required"
+    [[ "${API_KEY}" != *$'\r'* && "${API_KEY}" != *$'\n'* ]] \
+        || fail "BOTIFIED_TTS_API_KEY must not contain newlines"
+}
+
+curl_base() {
+    curl \
+        --disable \
+        --silent \
+        --show-error \
+        --fail-with-body \
+        --connect-timeout 5 \
+        --max-time 600 \
+        --proto '=http,https' \
+        "$@"
+}
+
+authorized_curl() {
+    printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+        | curl_base --header @- "$@"
+}
+
+health() {
+    [[ $# -eq 0 ]] || fail "health accepts no arguments"
+    require_url
+    curl_base "${BASE_URL}/health"
+    printf '\n'
+}
+
+voice_create() {
+    local name=""
+    local file=""
+    local prompt_text=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name|--file|--prompt-text)
+                require_value "$@"
+                case "$1" in
+                    --name) set_once name "$1" "$2" ;;
+                    --file) set_once file "$1" "$2" ;;
+                    --prompt-text) set_once prompt_text "$1" "$2" ;;
+                esac
+                shift 2
+                ;;
+            *) fail "unknown voice-create argument: $1" ;;
+        esac
+    done
+
+    [[ -n "${name}" ]] || fail "--name is required"
+    [[ -n "${file}" ]] || fail "--file is required"
+    [[ -f "${file}" && -r "${file}" ]] \
+        || fail "--file must be a readable regular file"
+    require_url
+    require_api_key
+
+    local form=(
+        --request POST
+        --form-string "name=${name}"
+        --form "file=@${file}"
+    )
+    if [[ -n "${prompt_text}" ]]; then
+        form+=(--form-string "prompt_text=${prompt_text}")
+    fi
+    authorized_curl "${form[@]}" "${BASE_URL}/v1/voices"
+    printf '\n'
+}
+
+voice_list() {
+    [[ $# -eq 0 ]] || fail "voice-list accepts no arguments"
+    require_url
+    require_api_key
+    authorized_curl "${BASE_URL}/v1/voices"
+    printf '\n'
+}
+
+voice_delete() {
+    local voice_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)
+                require_value "$@"
+                set_once voice_id "$1" "$2"
+                shift 2
+                ;;
+            *) fail "unknown voice-delete argument: $1" ;;
+        esac
+    done
+    [[ "${voice_id}" =~ ^voice_[0-9a-f]{32}$ ]] \
+        || fail "--id must be a Botified TTS voice ID"
+    require_url
+    require_api_key
+    authorized_curl --request DELETE "${BASE_URL}/v1/voices/${voice_id}"
+    printf 'deleted %s\n' "${voice_id}"
+}
+
+build_speech_json() {
+    python3 - "$@" <<'PY'
+import json
+import sys
+
+text, style, design, voice_id, mode = sys.argv[1:]
+body = {"text": text}
+if design:
+    body["voice"] = {"type": "design", "description": design}
+elif voice_id:
+    body["voice"] = {"type": "profile", "id": voice_id}
+    body["mode"] = mode
+if style:
+    body["style"] = style
+print(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+speak() {
+    local text=""
+    local output=""
+    local style=""
+    local design=""
+    local voice_id=""
+    local mode=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --text|--output|--style|--design|--voice-id|--mode)
+                require_value "$@"
+                case "$1" in
+                    --text) set_once text "$1" "$2" ;;
+                    --output) set_once output "$1" "$2" ;;
+                    --style) set_once style "$1" "$2" ;;
+                    --design) set_once design "$1" "$2" ;;
+                    --voice-id) set_once voice_id "$1" "$2" ;;
+                    --mode) set_once mode "$1" "$2" ;;
+                esac
+                shift 2
+                ;;
+            *) fail "unknown speak argument: $1" ;;
+        esac
+    done
+
+    [[ -n "${text}" ]] || fail "--text is required"
+    [[ -n "${output}" ]] || fail "--output is required"
+    [[ -z "${design}" || -z "${voice_id}" ]] \
+        || fail "--design and --voice-id are mutually exclusive"
+    [[ -z "${mode}" || -n "${voice_id}" ]] \
+        || fail "--mode requires --voice-id"
+    if [[ -n "${voice_id}" ]]; then
+        [[ "${voice_id}" =~ ^voice_[0-9a-f]{32}$ ]] \
+            || fail "--voice-id must be a Botified TTS voice ID"
+        mode="${mode:-controllable}"
+        [[ "${mode}" == "controllable" || "${mode}" == "faithful" ]] \
+            || fail "--mode must be controllable or faithful"
+        [[ "${mode}" != "faithful" || -z "${style}" ]] \
+            || fail "faithful mode does not accept --style"
+    fi
+    [[ ! -e "${output}" && ! -L "${output}" ]] \
+        || fail "--output already exists"
+
+    local output_dir="${output%/*}"
+    local output_name="${output##*/}"
+    [[ "${output_dir}" != "${output}" ]] || output_dir="."
+    [[ -d "${output_dir}" && -w "${output_dir}" ]] \
+        || fail "--output parent must be a writable directory"
+
+    require_url
+    require_api_key
+    command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+
+    local body
+    local temporary
+    local content_type
+    body="$(build_speech_json "${text}" "${style}" "${design}" "${voice_id}" "${mode}")"
+    temporary="$(mktemp -- "${output_dir}/.${output_name}.tmp.XXXXXX")"
+    trap 'rm -f -- "${temporary}"' EXIT
+
+    if ! content_type="$(
+        authorized_curl \
+            --request POST \
+            --header 'Accept: audio/wav' \
+            --header 'Content-Type: application/json' \
+            --data-binary "${body}" \
+            --output "${temporary}" \
+            --write-out '%{content_type}' \
+            "${BASE_URL}/v1/speech"
+    )"; then
+        [[ ! -s "${temporary}" ]] || cat -- "${temporary}" >&2
+        fail "speech request failed"
+    fi
+    [[ "${content_type%%;*}" == "audio/wav" ]] \
+        || fail "speech response is not audio/wav"
+    python3 - "${temporary}" <<'PY' \
+        || fail "speech response is not a valid WAV"
+import pathlib
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+raise SystemExit(not (len(data) > 44 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"))
+PY
+
+    ln -- "${temporary}" "${output}" \
+        || fail "--output was created while speech was generated"
+    rm -f -- "${temporary}"
+    trap - EXIT
+    printf '%s\n' "${output}"
+}
+
+command -v curl >/dev/null 2>&1 || fail "curl is required"
+[[ $# -gt 0 ]] || fail "a command is required"
+command="$1"
+shift
+
+case "${command}" in
+    health) health "$@" ;;
+    voice-create) voice_create "$@" ;;
+    voice-list) voice_list "$@" ;;
+    voice-delete) voice_delete "$@" ;;
+    speak) speak "$@" ;;
+    *) fail "unknown command: ${command}" ;;
+esac
