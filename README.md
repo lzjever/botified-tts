@@ -34,7 +34,9 @@ Do not commit `deploy/.env` or put the API key in command arguments. Read it
 without evaluating the file:
 
 ```bash
-API_KEY="$(awk -F= '$1 == "BOTIFIED_TTS_API_KEY" { print substr($0, index($0, "=") + 1) }' deploy/.env)"
+API_KEY_FILE=deploy/api-key
+(umask 077; awk -F= '$1 == "BOTIFIED_TTS_API_KEY" { print substr($0, index($0, "=") + 1) }' \
+  deploy/.env > "${API_KEY_FILE}")
 ```
 
 Compose stores registered voices and the pinned model cache in the named volume
@@ -54,7 +56,7 @@ header over standard input so the key does not appear in `curl` arguments:
 
 ```bash
 set -o pipefail
-printf 'Authorization: Bearer %s\n' "${API_KEY}" |
+awk '{ print "Authorization: Bearer " $0 }' "${API_KEY_FILE}" |
   curl --disable --fail-with-body --silent --show-error \
     --proto '=http,https' \
     --header @- \
@@ -68,19 +70,24 @@ For voice profiles and the four synthesis modes, use the bundled helper:
 
 ```bash
 export BOTIFIED_TTS_URL=http://127.0.0.1:8000
-export BOTIFIED_TTS_API_KEY="${API_KEY}"
-TTS=./skills/botified-tts/scripts/botified-tts
+API_KEY_FILE=deploy/api-key
+TTS=./skills/voxcpm-tts/scripts/botified-tts
 
-"${TTS}" voice-create --name assistant --file reference.wav \
+"${TTS}" --api-key-file "${API_KEY_FILE}" voice-create \
+  --name assistant --file reference.wav \
   --prompt-text 'The exact words spoken in the reference.'
-"${TTS}" voice-list
+"${TTS}" --api-key-file "${API_KEY_FILE}" voice-list
 
-"${TTS}" speak --text 'Normal speech.' --output normal.wav
-"${TTS}" speak --text 'Designed speech.' --output design.wav \
+"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
+  --text 'Normal speech.' --output normal.wav
+"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
+  --text 'Designed speech.' --output design.wav \
   --design 'A warm, natural voice'
-"${TTS}" speak --text 'Controllable clone.' --output clone.wav \
+"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
+  --text 'Controllable clone.' --output clone.wav \
   --voice-id voice_0123456789abcdef0123456789abcdef --style 'calm'
-"${TTS}" speak --text 'Faithful clone.' --output faithful.wav \
+"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
+  --text 'Faithful clone.' --output faithful.wav \
   --voice-id voice_0123456789abcdef0123456789abcdef --mode faithful
 ```
 
@@ -88,8 +95,16 @@ TTS=./skills/botified-tts/scripts/botified-tts
 exactly match the reference recording and is required before faithful mode can
 use that profile. The helper also provides `health` and
 `voice-delete --id <voice_id>`, and refuses to overwrite an output file. See
-[`skills/botified-tts/SKILL.md`](skills/botified-tts/SKILL.md) for the concise
-Agent workflow.
+[`skills/voxcpm-tts/SKILL.md`](skills/voxcpm-tts/SKILL.md) for the concise
+Agent workflow. Its raw key file must contain one non-empty ASCII line; the
+helper does not read `BOTIFIED_TTS_API_KEY`. Pass final, already speakable plain
+text; neither the helper nor the service parses Markdown or SSML.
+
+For explicit use, point Botified's agent at this repository's
+`skills/voxcpm-tts` directory and invoke `$voxcpm-tts`. For workspace discovery,
+install that same directory at `.agents/skills/voxcpm-tts` in the Botified
+workspace. Keep `skills/voxcpm-tts` as the single source and do not create
+another helper implementation.
 
 ## Bidirectional streaming
 
