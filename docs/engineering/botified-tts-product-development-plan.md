@@ -671,14 +671,15 @@ generate/send task 直接 await WebSocket send。发送超过 5 秒时取消 Nan
 5. 达到 latency deadline 时，从最近的安全软边界切分；没有软边界且已达到
    deadline 兜底最小长度时，从当前安全位置提交。
 6. 达到 hard maximum 时，从不超过 hard maximum 的最后安全位置强制切分；
-   没有标点时允许直接按字符位置切分。
+   没有标点时允许直接按字符位置切分；异常超长的连续 decimal 也允许在 digit
+   之间切分。
 7. 官方 tag 的完整值及其跨 append 的可能前缀都是受保护区间。例如先收到
    `[laugh`、再收到 `ing]` 时不得在其中切分。一个 `[` 开头的内容一旦不可能
    匹配任何官方 tag，就按普通文本处理。
 8. `flush` 和 `finish` 提交剩余文本；此时尾部 `.` 或未完成的 tag 前缀按普通
    文本处理。
-9. hard maximum 优先于普通边界选择，但必须先在受保护区间之前切分，不切断
-   已识别或仍可能成立的官方 tag。
+9. hard maximum 优先于 decimal 和普通边界保护。完整官方 tag 及仍可能成立的
+   官方 tag 前缀是唯一绝对不可切分的区间；必须在其之前切分，绝不切断 tag。
 
 初始工程默认值：
 
@@ -718,7 +719,7 @@ deadline。timeout 到期时由同一个 receive task 调用 segmenter：
 | HTTP `text` | 8 KiB UTF-8 | `input_too_large` |
 | WebSocket 单个 `append` | 16 KiB UTF-8 | `input_too_large` |
 | WebSocket session 累计文本 | 64 KiB UTF-8 | `input_too_large` |
-| 未切分 buffer | 4 KiB UTF-8 | 按 hard maximum 切分；仍无法切分则拒绝 |
+| 未切分 buffer | 4 KiB UTF-8 | 每次 append 后由 `Segmenter` 按 hard maximum 循环提取，天然保持有界 |
 | `style` | 512 B UTF-8 | `invalid_request` |
 | Voice Design `description` | 1 KiB UTF-8 | `invalid_request` |
 | reference upload | 25 MiB | `invalid_request` |
@@ -731,6 +732,9 @@ deadline。timeout 到期时由同一个 receive task 调用 segmenter：
 `finally` 中释放。没有 slot 时立即返回 `service_busy`；不把请求排进 Nano 的
 无界 waiting queue。admission counter 与 Nano `max_num_seqs` 使用同一个常量，
 但它只是入口资源边界，不实现第二个 scheduler。
+
+未切分 buffer 不设置第二套 byte counter 或独立错误；`Segmenter.append()` 返回
+时已经按上述 hard maximum 完成提取。
 
 HTTP 的 `service_busy` 使用 `503` 并返回 `Retry-After: 1`；这是服务整体的瞬时
 推理容量不可用，不是某个客户端超过 rate quota，因此不使用 `429`。WebSocket
@@ -872,8 +876,12 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
   `pyproject.toml`/`uv.lock`。
 - Linux x86_64 容器固定使用
   `nvidia/cuda:12.6.3-runtime-ubuntu24.04@sha256:2c8193530ecc423e0f123d0c85b68a15d1395adcddabfc943e2523dbfde172e1`。
-  Dockerfile 固定 `uv==0.9.26`，由 uv 安装 Python 3.12.13，并固定 Ubuntu
-  FFmpeg 包 `7:6.1.1-3ubuntu5`。
+  Dockerfile 固定 Linux x86_64
+  `uv==0.10.8@sha256:f99c19c9683591761e0dc9d80db421b17d8c004adf4ac4031cac1fc92777f091`，
+  由 uv 安装 Python 3.12.13，并固定 Ubuntu FFmpeg 包
+  `7:6.1.1-3ubuntu5`。两个 `uv sync` 使用 300 秒 HTTP timeout，并复用
+  BuildKit `/root/.cache/uv` cache mount，避免大 wheel 超时、重复下载或缓存
+  固化进镜像层。
 - runtime 镜像保留 Triton JIT 所需的 `gcc` 和 `libc6-dev`；当前依赖均使用
   已固定 wheel，不使用 CUDA devel 镜像，不安装 nvcc。
 - Nano 使用不可变 git commit。
@@ -910,7 +918,7 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
 当前 verified baseline 为 RTX 4090 24,564 MiB、compute capability 8.9、driver
 575.64.05（driver CUDA capability 12.9）。隔离运行环境为 Python 3.12.13、
 PyTorch/torchaudio 2.9.0+cu126、Triton 3.5.0、FlashAttention 2.8.3，以及第
-12.3 节固定的 CUDA 12.6.3 runtime、uv 0.9.26、FFmpeg 和
+12.3 节固定的 CUDA 12.6.3 runtime、uv 0.10.8、FFmpeg 和
 NumPy/Numba/llvmlite；模型 revision 为
 `bffb3df5a29440629464e5e839f4d214c8714c3d`。
 
@@ -1123,16 +1131,18 @@ runner 非零退出；不通过 traceback 字符串猜测独立 OOM 错误码。
 
 ### 15.2 最小可观测性
 
-结构化日志记录：
+进程 ready 时记录一次启动日志，fatal 时记录一次致命日志。每个 HTTP synthesis
+或 WebSocket session 只记录一条 terminal summary：
 
-- request/session ID；
-- voice type 和 mode；
-- 输入字符数和 segment 数；
-- queue wait；
-- TTFB；
-- audio duration；
-- RTF；
+- request/session ID、voice type 和 mode；
+- accepted chars 和 segment 数；
+- TTFB、audio duration 和 RTF；
 - result/error code。
+
+TTFB 是从 HTTP 请求被接纳或 WebSocket 首个文本 append 被接受，到首个音频
+chunk 可发送的 monotonic elapsed time。RTF 是所有 segment 的推理 wall time
+之和除以生成音频总时长。请求在生成音频前结束时，TTFB、audio duration 和 RTF
+均为 `null`。
 
 默认不记录：
 
@@ -1141,9 +1151,11 @@ runner 非零退出；不通过 traceback 字符串猜测独立 OOM 错误码。
 - reference audio 和 transcript；
 - generated audio；
 - latent；
-- API key。
+- API key；
+- 原始上游异常和 traceback。
 
-首版不建设 metrics endpoint 和 dashboard。出现实际运维需求后再增加。
+该摘要直接保存在请求/session 局部状态中，不增加 observer、event 或 metrics
+层。首版不建设 metrics endpoint 和 dashboard。出现实际运维需求后再增加。
 
 ## 16. 测试与验收
 
