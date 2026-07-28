@@ -37,6 +37,8 @@ from botified_tts.voices import (
     VoiceStore,
 )
 
+MODEL_NAME = "VoxCPM2"
+
 
 @dataclass
 class Readiness:
@@ -79,15 +81,12 @@ class _Admission:
 def create_app(
     *,
     api_key: str,
-    model: str,
     readiness: Readiness,
     voices: VoiceStore,
     speech: SpeechService,
 ) -> Starlette:
     if not api_key:
         raise ValueError("api_key must not be empty")
-    if not model:
-        raise ValueError("model must not be empty")
 
     expected_api_key_digest = hashlib.sha256(api_key.encode("utf-8")).digest()
     admission = _Admission(MAX_CONCURRENT_SYNTHESIS)
@@ -145,7 +144,7 @@ def create_app(
             {
                 "status": "ready" if readiness.ready else "not_ready",
                 "cuda": True,
-                "model": model,
+                "model": MODEL_NAME,
                 "sample_rate": 48_000,
             },
             status_code=200 if readiness.ready else 503,

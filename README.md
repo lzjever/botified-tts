@@ -1,239 +1,153 @@
 # Botified TTS
 
-Botified TTS is a standalone VoxCPM2 service for Botified. It supports ordinary
-speech, Voice Design, controllable and faithful voice cloning, style and native
-VoxCPM2 tags, complete HTTP WAV responses, and bidirectional WebSocket
-streaming.
+Botified TTS is a standalone VoxCPM2 speech service for Botified. It provides
+HTTP WAV synthesis, bidirectional WebSocket streaming, Voice Design,
+controllable and faithful voice cloning, style instructions, and native
+VoxCPM2 text tags.
 
-The first release supports Linux x86_64, one selected NVIDIA GPU, a CUDA
-12-compatible driver, Docker Compose, and NVIDIA Container Toolkit. There is no
-CPU, ROCm, Windows, Apple Silicon, or multi-GPU fallback. If CUDA is unavailable
-or the selected GPU is invalid, deployment exits during the host GPU and NVIDIA
-container runtime preflight, before building. After the image is built, the
-application checks PyTorch CUDA before downloading the model or creating a Nano
-worker.
+The service requires Linux x86_64, Docker, an NVIDIA GPU with a CUDA-compatible
+host driver, and NVIDIA Container Toolkit configured for Docker. There is no
+CPU, ROCm, Apple Silicon, Windows, or multi-GPU fallback.
 
-## Deploy
+## Run the service
 
-The only deployment command is:
+Service users do not need to check out this repository. Create the only private
+configuration file:
 
 ```bash
-./scripts/deploy.sh
+umask 077
+{
+  printf 'BOTIFIED_TTS_API_KEY=%s\n' "$(openssl rand -hex 32)"
+  printf '%s\n' 'BOTIFIED_TTS_MODEL_SOURCE=modelscope'
+  printf '%s\n' 'BOTIFIED_TTS_LOG_LEVEL=INFO'
+} > botified-tts.env
 ```
 
-On first use it creates `deploy/.env` with mode `0600`, a random 32-byte API
-key, `HOST_GPU=0`, and `PUBLISHED_PORT=8000`. To select another physical GPU or
-host port, edit only those values and keep the file private:
+`BOTIFIED_TTS_MODEL_SOURCE` is required and accepts only `modelscope` or
+`huggingface`. Each source uses a fixed repository and immutable revision.
+There is no automatic detection or cross-source fallback. The API key must be
+unquoted and match `[A-Za-z0-9._~-]+`.
+
+Start the fixed release image:
 
 ```bash
-chmod 0600 deploy/.env
-${EDITOR:-vi} deploy/.env
+docker run -d \
+  --name botified-tts \
+  --restart on-failure:3 \
+  --gpus '"device=0"' \
+  --env-file ./botified-tts.env \
+  -p 8000:8000 \
+  -v botified-tts-data:/data \
+  ghcr.io/lzjever/botified-tts:v0.1.0
 ```
 
-Do not commit `deploy/.env` or put the API key in command arguments. Read it
-without evaluating the file:
+Check readiness and failures with:
 
 ```bash
-API_KEY_FILE=deploy/api-key
-(umask 077; awk -F= '$1 == "BOTIFIED_TTS_API_KEY" { print substr($0, index($0, "=") + 1) }' \
-  deploy/.env > "${API_KEY_FILE}")
+docker inspect --format '{{.State.Health.Status}}' botified-tts
+docker logs botified-tts
 ```
 
-Compose stores registered voices and the pinned model cache in the named volume
-mounted at `/data` (`/data/voices` and `/data/model-cache`), so container
-rebuilds preserve both.
+The ready state is `healthy`. Registered voices and the selected source's model
+cache persist in the `botified-tts-data` volume. Docker fails to start the
+container if its GPU request cannot be satisfied or NVIDIA Container Toolkit
+does not expose the device. If the container starts but the application CUDA
+preflight fails, the application exits before model download or Nano worker
+creation and logs `cuda_unavailable` or `cuda_device_invalid`.
 
-Check readiness without authentication:
+## Integrate with Botified
 
-```bash
-curl --fail --silent --show-error http://127.0.0.1:8000/health
-```
+Botified integrators check out this repository on the Botified host. Configure
+Botified `skills.explicit` to point directly to the checkout's
+[`skills/voxcpm-tts/SKILL.md`](skills/voxcpm-tts/SKILL.md). Do not copy or
+symlink the Skill.
 
-## HTTP and voice profiles
-
-The HTTP speech endpoint returns mono 48 kHz PCM s16le WAV. Pass the Bearer
-header over standard input so the key does not appear in `curl` arguments:
-
-```bash
-set -o pipefail
-awk '{ print "Authorization: Bearer " $0 }' "${API_KEY_FILE}" |
-  curl --disable --fail-with-body --silent --show-error \
-    --proto '=http,https' \
-    --header @- \
-    --header 'Content-Type: application/json' \
-    --data-binary '{"text":"你好，这是 Botified TTS。"}' \
-    --output hello.wav \
-    http://127.0.0.1:8000/v1/speech
-```
-
-For voice profiles and the four synthesis modes, use the bundled helper:
-
-```bash
-export BOTIFIED_TTS_URL=http://127.0.0.1:8000
-API_KEY_FILE=deploy/api-key
-TTS=./skills/voxcpm-tts/scripts/botified-tts
-
-"${TTS}" --api-key-file "${API_KEY_FILE}" voice-create \
-  --name assistant --file reference.wav \
-  --prompt-text 'The exact words spoken in the reference.'
-"${TTS}" --api-key-file "${API_KEY_FILE}" voice-list
-
-"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
-  --text 'Normal speech.' --output normal.wav
-"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
-  --text 'Designed speech.' --output design.wav \
-  --design 'A warm, natural voice'
-"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
-  --text 'Controllable clone.' --output clone.wav \
-  --voice-id voice_0123456789abcdef0123456789abcdef --style 'calm'
-"${TTS}" --api-key-file "${API_KEY_FILE}" speak \
-  --text 'Faithful clone.' --output faithful.wav \
-  --voice-id voice_0123456789abcdef0123456789abcdef --mode faithful
-```
-
-`voice-create` prints the real voice ID to use. Its optional prompt text must
-exactly match the reference recording and is required before faithful mode can
-use that profile. The helper also provides `health` and
-`voice-delete --id <voice_id>`, and refuses to overwrite an output file. See
-[`skills/voxcpm-tts/SKILL.md`](skills/voxcpm-tts/SKILL.md) for the concise
-Agent workflow. Its raw key file must contain one non-empty ASCII line; the
-helper does not read `BOTIFIED_TTS_API_KEY`. Pass final, already speakable plain
-text; neither the helper nor the service parses Markdown or SSML.
-
-For explicit use, point Botified's agent at this repository's
-`skills/voxcpm-tts` directory and invoke `$voxcpm-tts`. For workspace discovery,
-install that same directory at `.agents/skills/voxcpm-tts` in the Botified
-workspace. Keep `skills/voxcpm-tts` as the single source and do not create
-another helper implementation.
-
-## Bidirectional streaming
-
-The WebSocket accepts incremental text while returning binary mono 48 kHz PCM
-s16le chunks. The server performs sentence-aware segmentation internally. This
-minimal client writes the raw stream into a WAV file:
-
-```python
-import asyncio
-import json
-import os
-import wave
-
-from websockets.asyncio.client import connect
-
-
-async def receive_audio(websocket, pcm: bytearray) -> dict:
-    while True:
-        message = await websocket.recv()
-        if isinstance(message, bytes):
-            pcm.extend(message)
-            continue
-        event = json.loads(message)
-        if event.get("type") == "error":
-            raise RuntimeError(event)
-        if event.get("type") == "done":
-            return event
-        raise RuntimeError(f"unexpected event: {event}")
-
-
-async def main() -> None:
-    base = os.environ["BOTIFIED_TTS_URL"].rstrip("/")
-    scheme = "wss" if base.startswith("https://") else "ws"
-    uri = f"{scheme}://{base.split('://', 1)[1]}/v1/speech/stream"
-    headers = {"Authorization": f"Bearer {os.environ['BOTIFIED_TTS_API_KEY']}"}
-    pcm = bytearray()
-
-    async with connect(uri, additional_headers=headers) as websocket:
-        await websocket.send(json.dumps({"type": "start"}))
-        ready = json.loads(await websocket.recv())
-        if ready.get("type") != "ready":
-            raise RuntimeError(ready)
-
-        async with asyncio.TaskGroup() as tasks:
-            receiver = tasks.create_task(receive_audio(websocket, pcm))
-            for text in ("你好，", "这是逐块输入。", "服务会同时流式返回声音。"):
-                await websocket.send(json.dumps({"type": "append", "text": text}))
-            await websocket.send(json.dumps({"type": "finish"}))
-            # On user interruption, send {"type": "cancel"} instead of finish.
-        done = receiver.result()
-        if done.get("cancelled"):
-            print("stream cancelled")
-
-    with wave.open("stream.wav", "wb") as output:
-        output.setnchannels(ready["audio"]["channels"])
-        output.setsampwidth(2)
-        output.setframerate(ready["audio"]["sample_rate"])
-        output.writeframes(pcm)
-
-
-asyncio.run(main())
-```
-
-The client example environment also needs `websockets`; the service pins it as
-the Uvicorn WebSocket transport. After `finish`, the connection remains
-cancelable until the server has sent all accepted audio and its terminal
-`done`.
-
-## Botified companion
-
-The lightweight companion in
-[`companions/botified`](companions/botified/README.md) connects Botified
-`stream_text` observations to the WebSocket API and `/usr/bin/aplay`. It has its
-own locked environment, so installing it does not install Torch, CUDA, or the
-TTS model dependencies:
+Install the companion's independent lightweight environment:
 
 ```bash
 uv sync --project companions/botified --locked --no-dev
 ```
 
-Assistant completion starts background draining without blocking later observer
-frames. User input, provider replacement, and stdin EOF cancel both remaining
-server generation and local playback.
+The companion turns Botified `stream_text` observations into live audio and
+cancels playback on user interruption, provider replacement, or stdin close.
+Its profile + mode + style and Voice Design + style task preset examples are in
+the [companion README](companions/botified/README.md). Both use the checkout's
+absolute `botified-tts.env` path and the complete WebSocket endpoint.
 
-## Limits, errors, and configuration
+## Develop
 
-HTTP text is limited to 8 KiB UTF-8. A WebSocket `append` is limited to 16 KiB
-and a session to 64 KiB. Reference uploads are limited to 25 MiB. Capacity is
-bounded; callers should handle `service_busy`. Stable errors include
-`invalid_api_key`, `invalid_request`, `invalid_voice`, `input_too_large`,
-`service_busy`, `engine_error`, and WebSocket `client_too_slow`. REST errors use
-a JSON error envelope; WebSocket errors are JSON events. Cancel completes as
-`{"type":"done","cancelled":true}`.
-
-The application reads exactly these eight environment variables:
-
-```text
-BOTIFIED_TTS_HOST=0.0.0.0
-BOTIFIED_TTS_PORT=8000
-BOTIFIED_TTS_MODEL=openbmb/VoxCPM2
-BOTIFIED_TTS_MODEL_REVISION=<immutable-revision>
-BOTIFIED_TTS_GPU_DEVICE=0
-BOTIFIED_TTS_DATA_DIR=/data
-BOTIFIED_TTS_API_KEY=<secret>
-BOTIFIED_TTS_LOG_LEVEL=INFO
-```
-
-`HOST_GPU` and `PUBLISHED_PORT` are separate deployment-only variables from
-`deploy/.env`; they are not injected into the application.
-
-For focused development checks:
+The local test suite additionally requires `ffmpeg`:
 
 ```bash
-uv run pytest -q tests/test_api.py tests/test_streaming.py tests/test_skill_helper.py
-uv run --project companions/botified --locked pytest -q companions/botified/tests
-uv run --project companions/botified --locked ruff check companions/botified
+command -v ffmpeg
+uv sync --locked
+uv run pytest -q
 ```
 
-On a CUDA development machine, run the focused real-engine smoke from the
-repository root:
+Optional source execution still requires CUDA:
 
 ```bash
-uv run python tests/gpu_smoke.py \
-  --data-dir /var/tmp/botified-tts-gpu-smoke/data \
-  --output-dir /var/tmp/botified-tts-gpu-smoke/output
+BOTIFIED_TTS_DATA_DIR="$PWD/.data" \
+  uv run --env-file ./botified-tts.env botified-tts
 ```
 
-`--data-dir` holds the model cache and temporary runtime data.
-`--output-dir` receives the generated WAV files. The script covers CUDA
-preflight, model loading and warmup, ordinary speech, Voice Design, both clone
-modes, style, native tags, continuation, incremental text before `finish`,
-stream cancellation, fixed PCM chunks, RTF, and idle Nano child failure.
+## Build the image
+
+Power users can build from the repository root:
+
+```bash
+docker build --platform linux/amd64 -t botified-tts:local .
+```
+
+Run it with the same env file, GPU, port, and volume from the service command
+above, replacing only `ghcr.io/lzjever/botified-tts:v0.1.0` with
+`botified-tts:local`.
+
+## API and capabilities
+
+All authenticated endpoints use `Authorization: Bearer <API key>`.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Public readiness, CUDA, logical model name, and sample rate |
+| `POST /v1/speech` | Synthesize a complete mono 48 kHz PCM s16le WAV |
+| `POST /v1/voices` | Register a trusted reference voice |
+| `GET /v1/voices` | List registered voice profiles |
+| `DELETE /v1/voices/{voice_id}` | Delete a voice profile |
+| `WS /v1/speech/stream` | Append text while receiving binary PCM audio |
+
+Canonical synthesis options are top-level fields:
+
+| Use | Options |
+|---|---|
+| Ordinary speech | `{}` |
+| Voice Design | `{"voice":{"type":"design","description":"A warm, natural voice"}}`, with optional `"style"` |
+| Controllable clone | `{"voice":{"type":"profile","id":"voice_..."},"mode":"controllable"}`, with optional `"style"` |
+| Faithful clone | `{"voice":{"type":"profile","id":"voice_..."},"mode":"faithful"}`; `"style"` is not accepted |
+
+For `POST /v1/speech`, add the required top-level `"text"` field to the selected
+options. For WebSocket streaming, add the required top-level `"type":"start"`
+field to the same options, then send `append` events followed by `finish` or
+`cancel`.
+
+`POST /v1/voices` accepts multipart fields `name`, `file`, and optional
+`prompt_text`. A profile used in faithful mode must have a `prompt_text` that
+exactly matches the words spoken in its reference recording.
+
+The service also supports VoxCPM2 native tags, sentence-aware segmentation,
+continuation, and cancellation. It receives final speakable plain text and does
+not parse Markdown or SSML. The bundled
+[`voxcpm-tts` Skill](skills/voxcpm-tts/SKILL.md) provides the concise HTTP
+workflow for synthesis and voice management.
+
+WebSocket clients send a `start` event, then any number of incremental `append`
+events, followed by `finish` or `cancel`. The server returns JSON lifecycle
+events and binary mono 48 kHz PCM s16le chunks. Text segmentation is internal,
+so callers may append token-sized input or larger chunks.
+
+HTTP text is limited to 8 KiB UTF-8. Each WebSocket append is limited to 16 KiB
+and each session to 64 KiB. Reference uploads are limited to 25 MiB. Synthesis
+capacity is bounded at 16 concurrent requests; callers should handle
+`service_busy`. Stable errors include `invalid_api_key`, `invalid_request`,
+`invalid_voice`, `input_too_large`, `service_busy`, `engine_error`, and
+WebSocket `client_too_slow`.

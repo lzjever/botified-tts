@@ -5,10 +5,12 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from websockets.asyncio.client import connect
 
@@ -16,6 +18,8 @@ FRAME_OPEN = "<botified>"
 FRAME_CLOSE = "</botified>"
 OBSERVE_REQUEST_ID = "tts-preview"
 APLAYER = Path("/usr/bin/aplay")
+API_KEY_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
+DEFAULT_START_MESSAGE = '{"type":"start"}'
 _EOF = object()
 
 
@@ -176,6 +180,7 @@ class _TtsSession:
         cls,
         tts_url: str,
         api_key: str,
+        start_message: str,
         sink_factory: SinkFactory,
         connector: Connector,
     ) -> _TtsSession:
@@ -186,9 +191,10 @@ class _TtsSession:
             close_timeout=2,
         )
         try:
-            await websocket.send(json.dumps({"type": "start"}))
+            await websocket.send(start_message)
             raw_ready = await websocket.recv()
             ready = _json_event(raw_ready)
+            _raise_tts_error(ready)
             if ready != {
                 "type": "ready",
                 "audio": {
@@ -261,10 +267,7 @@ class _TtsSession:
                 await self.sink.write(raw)
                 continue
             event = _json_event(raw)
-            if event.get("type") == "error":
-                error = event.get("error")
-                code = error.get("code") if isinstance(error, dict) else None
-                raise RuntimeError(f"TTS WebSocket error: {code or 'unknown'}")
+            _raise_tts_error(event)
             if event.get("type") == "done":
                 return event
             raise RuntimeError("TTS WebSocket returned an unexpected event")
@@ -315,11 +318,13 @@ class _TtsManager:
         self,
         tts_url: str,
         api_key: str,
+        start_message: str,
         sink_factory: SinkFactory,
         connector: Connector,
     ) -> None:
         self._tts_url = tts_url
         self._api_key = api_key
+        self._start_message = start_message
         self._sink_factory = sink_factory
         self._connector = connector
         self._active: _ActiveSession | None = None
@@ -340,6 +345,7 @@ class _TtsManager:
             session = await _TtsSession.open(
                 self._tts_url,
                 self._api_key,
+                self._start_message,
                 self._sink_factory,
                 self._connector,
             )
@@ -407,6 +413,7 @@ class PreviewSidecar:
         *,
         tts_url: str,
         api_key: str,
+        start_message: str = DEFAULT_START_MESSAGE,
         sink_factory: SinkFactory | None = None,
         connector: Connector = connect,
         emit: Callable[[dict[str, object]], None] | None = None,
@@ -414,6 +421,7 @@ class PreviewSidecar:
         self._manager = _TtsManager(
             tts_url,
             api_key,
+            start_message,
             sink_factory or AplaySink.open,
             connector,
         )
@@ -545,6 +553,21 @@ def _json_event(raw: object) -> dict[str, object]:
     return value
 
 
+def _raise_tts_error(event: dict[str, object]) -> None:
+    if event.get("type") != "error":
+        return
+    error = event.get("error")
+    if not isinstance(error, dict):
+        raise TypeError("TTS WebSocket error: unknown: unknown error")
+    code = error.get("code")
+    message = error.get("message")
+    if not isinstance(code, str) or not code:
+        code = "unknown"
+    if not isinstance(message, str) or not message:
+        message = "unknown error"
+    raise RuntimeError(f"TTS WebSocket error: {code}: {message}")
+
+
 def emit_frame(payload: dict[str, object]) -> None:
     encoded = json.dumps(
         payload,
@@ -574,31 +597,102 @@ async def stdin_frames() -> AsyncIterator[dict[str, object]]:
             yield frame
 
 
-def read_api_key(path: Path) -> str:
+def read_api_key_from_env_file(path: Path) -> str:
     try:
-        key = path.read_text(encoding="utf-8").rstrip("\r\n")
-    except OSError as error:
-        raise RuntimeError(f"could not read API key file: {path}") from error
-    if not key or key != key.strip() or not key.isascii():
-        raise RuntimeError("API key file must contain one non-empty ASCII key")
-    return key
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError(f"could not read env file: {path}") from error
+    keys: list[str] = []
+    for line in contents.split("\n"):
+        name, separator, value = line.partition("=")
+        if separator and name == "BOTIFIED_TTS_API_KEY":
+            keys.append(value)
+    if len(keys) != 1 or API_KEY_PATTERN.fullmatch(keys[0]) is None:
+        raise RuntimeError(
+            "env file must contain exactly one literal BOTIFIED_TTS_API_KEY "
+            "matching [A-Za-z0-9._~-]+"
+        )
+    return keys[0]
 
 
-def parse_args() -> argparse.Namespace:
+def build_start_message(
+    *,
+    voice_id: str | None,
+    design: str | None,
+    mode: str | None,
+    style: str | None,
+) -> str:
+    if voice_id is not None and design is not None:
+        raise ValueError("voice_id and design are mutually exclusive")
+    event: dict[str, object] = {"type": "start"}
+    if voice_id is not None:
+        event["voice"] = {"type": "profile", "id": voice_id}
+    elif design is not None:
+        event["voice"] = {"type": "design", "description": design}
+    if mode is not None:
+        event["mode"] = mode
+    if style is not None:
+        event["style"] = style
+    return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_tts_url(value: str) -> str:
+    try:
+        endpoint = urlsplit(value)
+        port = endpoint.port
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "--tts-url must be a complete ws:// or wss:// endpoint"
+        ) from error
+    if (
+        endpoint.scheme not in {"ws", "wss"}
+        or not endpoint.hostname
+        or port == 0
+        or endpoint.path != "/v1/speech/stream"
+        or "?" in value
+        or "#" in value
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or any(character.isspace() for character in endpoint.netloc)
+    ):
+        raise argparse.ArgumentTypeError(
+            "--tts-url must be a complete ws:// or wss:// host"
+            "/v1/speech/stream endpoint without query or fragment"
+        )
+    return value
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Speak Botified assistant preview through botified-tts.",
     )
     parser.add_argument(
         "--tts-url",
+        type=parse_tts_url,
         default="ws://127.0.0.1:8000/v1/speech/stream",
     )
-    parser.add_argument("--api-key-file", type=Path, required=True)
-    return parser.parse_args()
+    parser.add_argument("--env-file", type=Path, required=True)
+    voice = parser.add_mutually_exclusive_group()
+    voice.add_argument("--voice-id")
+    voice.add_argument("--design")
+    parser.add_argument("--mode", choices=("controllable", "faithful"))
+    parser.add_argument("--style")
+    return parser.parse_args(argv)
 
 
 async def async_main(args: argparse.Namespace) -> None:
-    api_key = read_api_key(args.api_key_file)
-    sidecar = PreviewSidecar(tts_url=args.tts_url, api_key=api_key)
+    api_key = read_api_key_from_env_file(args.env_file)
+    start_message = build_start_message(
+        voice_id=args.voice_id,
+        design=args.design,
+        mode=args.mode,
+        style=args.style,
+    )
+    sidecar = PreviewSidecar(
+        tts_url=args.tts_url,
+        api_key=api_key,
+        start_message=start_message,
+    )
     await sidecar.run(stdin_frames())
 
 

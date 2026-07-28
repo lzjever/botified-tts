@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
 
-from sidecar import AplaySink, PreviewSidecar, read_api_key
+from sidecar import (
+    AplaySink,
+    PreviewSidecar,
+    build_start_message,
+    parse_args,
+    read_api_key_from_env_file,
+)
 
 
 class FakeSink:
@@ -175,9 +181,16 @@ def test_reassembles_preview_and_switches_provider_with_full_duplex_audio() -> N
             sinks.append(sink)
             return sink
 
+        start_message = build_start_message(
+            voice_id="voice_" + "1" * 32,
+            design=None,
+            mode="controllable",
+            style="calm and conversational",
+        )
         sidecar = PreviewSidecar(
             tts_url=url,
             api_key="secret",
+            start_message=start_message,
             sink_factory=open_sink,
             emit=emitted.append,
         )
@@ -209,12 +222,28 @@ def test_reassembles_preview_and_switches_provider_with_full_duplex_audio() -> N
 
         assert len(sessions) == 2
         assert sessions[0] == [
-            {"type": "start"},
+            {
+                "type": "start",
+                "voice": {
+                    "type": "profile",
+                    "id": "voice_" + "1" * 32,
+                },
+                "mode": "controllable",
+                "style": "calm and conversational",
+            },
             {"type": "append", "text": "你好。"},
             {"type": "cancel"},
         ]
         assert sessions[1] == [
-            {"type": "start"},
+            {
+                "type": "start",
+                "voice": {
+                    "type": "profile",
+                    "id": "voice_" + "1" * 32,
+                },
+                "mode": "controllable",
+                "style": "calm and conversational",
+            },
             {"type": "append", "text": "新的回答。"},
             {"type": "finish"},
         ]
@@ -555,10 +584,233 @@ def test_observer_rejection_is_fatal() -> None:
         asyncio.run(sidecar.run(frames(rejected)))
 
 
-def test_api_key_file_and_aplay_failures_are_explicit(tmp_path: Path) -> None:
-    key_file = tmp_path / "tts.key"
-    key_file.write_text("top-secret\n", encoding="utf-8")
-    assert read_api_key(key_file) == "top-secret"
+def test_builds_default_and_design_start_messages() -> None:
+    assert (
+        build_start_message(
+            voice_id=None,
+            design=None,
+            mode=None,
+            style=None,
+        )
+        == '{"type":"start"}'
+    )
+    assert json.loads(
+        build_start_message(
+            voice_id=None,
+            design="A warm, natural voice",
+            mode=None,
+            style="gentle",
+        )
+    ) == {
+        "type": "start",
+        "voice": {
+            "type": "design",
+            "description": "A warm, natural voice",
+        },
+        "style": "gentle",
+    }
+
+
+def test_cli_accepts_start_options_and_rejects_conflicts(tmp_path: Path) -> None:
+    env_file = tmp_path / "botified-tts.env"
+    args = parse_args(
+        [
+            "--env-file",
+            str(env_file),
+            "--tts-url",
+            "wss://tts.example/v1/speech/stream",
+            "--voice-id",
+            "voice_" + "1" * 32,
+            "--mode",
+            "faithful",
+            "--style",
+            "calm",
+        ]
+    )
+    assert args.env_file == env_file
+    assert args.tts_url == "wss://tts.example/v1/speech/stream"
+    assert args.mode == "faithful"
+
+    defaults = parse_args(["--env-file", str(env_file)])
+    assert defaults.tts_url == "ws://127.0.0.1:8000/v1/speech/stream"
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--env-file",
+                str(env_file),
+                "--voice-id",
+                "voice_" + "1" * 32,
+                "--design",
+                "warm",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parse_args(["--env-file", str(env_file), "--mode", "unsupported"])
+
+
+@pytest.mark.parametrize(
+    "tts_url",
+    [
+        "http://tts.example/v1/speech/stream",
+        "ws://tts.example",
+        "not-a-url",
+        "ws://tts.example/v1/speech/stream?voice=test",
+        "wss://tts.example/v1/speech/stream#fragment",
+    ],
+)
+def test_cli_rejects_incomplete_or_non_websocket_tts_urls(
+    tmp_path: Path,
+    tts_url: str,
+) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--env-file",
+                str(tmp_path / "botified-tts.env"),
+                "--tts-url",
+                tts_url,
+            ]
+        )
+
+
+def test_reads_api_key_literal_from_shared_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / "botified-tts.env"
+    env_file.write_text(
+        "BOTIFIED_TTS_MODEL_SOURCE=modelscope\n"
+        "BOTIFIED_TTS_API_KEY=AbC.0_~-z\n"
+        "BOTIFIED_TTS_LOG_LEVEL=INFO\n",
+        encoding="utf-8",
+    )
+
+    assert read_api_key_from_env_file(env_file) == "AbC.0_~-z"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "BOTIFIED_TTS_LOG_LEVEL=INFO\n",
+        "BOTIFIED_TTS_API_KEY=first\nBOTIFIED_TTS_API_KEY=second\n",
+        "BOTIFIED_TTS_API_KEY=\n",
+        'BOTIFIED_TTS_API_KEY="quoted"\n',
+        "BOTIFIED_TTS_API_KEY=has space\n",
+        "BOTIFIED_TTS_API_KEY=$(command)\n",
+        "BOTIFIED_TTS_API_KEY=${SECRET}\n",
+        "BOTIFIED_TTS_API_KEY=内部密钥\n",
+    ],
+)
+def test_rejects_unsafe_or_ambiguous_api_key_env_files(
+    tmp_path: Path,
+    contents: str,
+) -> None:
+    env_file = tmp_path / "botified-tts.env"
+    env_file.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="BOTIFIED_TTS_API_KEY"):
+        read_api_key_from_env_file(env_file)
+
+
+def test_missing_env_file_failure_is_explicit(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="could not read env file"):
+        read_api_key_from_env_file(tmp_path / "missing.env")
+
+
+def test_handshake_error_preserves_code_and_message_without_opening_player() -> None:
+    async def exercise() -> None:
+        sink_opened = False
+
+        async def handler(websocket: ServerConnection) -> None:
+            assert json.loads(await websocket.recv()) == {"type": "start"}
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "code": "invalid_voice",
+                            "message": "Voice profile not found",
+                        },
+                    }
+                )
+            )
+
+        async def open_sink() -> FakeSink:
+            nonlocal sink_opened
+            sink_opened = True
+            return FakeSink()
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            sidecar = PreviewSidecar(
+                tts_url=f"ws://127.0.0.1:{port}/v1/speech/stream",
+                api_key="secret-not-in-error",
+                sink_factory=open_sink,
+                emit=lambda _: None,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="invalid_voice.*Voice profile not found",
+            ) as caught:
+                await sidecar.run(
+                    frames(
+                        observe_result(),
+                        assistant_text("obs-1", "provider-1", "hello"),
+                    )
+                )
+
+        assert not sink_opened
+        assert "secret-not-in-error" not in str(caught.value)
+
+    asyncio.run(exercise())
+
+
+def test_streaming_error_preserves_code_and_message() -> None:
+    async def exercise() -> None:
+        error_sent = asyncio.Event()
+
+        async def handler(websocket: ServerConnection) -> None:
+            await send_ready(websocket)
+            async for raw in websocket:
+                if json.loads(raw)["type"] == "append":
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "code": "engine_error",
+                                    "message": "Synthesis failed",
+                                },
+                            }
+                        )
+                    )
+                    error_sent.set()
+
+        async def delayed_frames() -> AsyncIterator[dict[str, object]]:
+            yield observe_result()
+            yield assistant_text("obs-1", "provider-1", "hello")
+            await error_sent.wait()
+            await asyncio.sleep(5)
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            sidecar = PreviewSidecar(
+                tts_url=f"ws://127.0.0.1:{port}/v1/speech/stream",
+                api_key="secret",
+                sink_factory=lambda: asyncio.sleep(0, result=FakeSink()),
+                emit=lambda _: None,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="engine_error.*Synthesis failed",
+            ):
+                await asyncio.wait_for(
+                    sidecar.run(delayed_frames()),
+                    timeout=1,
+                )
+
+    asyncio.run(exercise())
+
+
+def test_aplay_failures_are_explicit(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="aplay executable"):
         asyncio.run(AplaySink.open(tmp_path / "missing-aplay"))

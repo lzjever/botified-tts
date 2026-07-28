@@ -13,19 +13,18 @@ from botified_tts.config import (
 )
 
 
-API_KEY_ENV = {"BOTIFIED_TTS_API_KEY": "test-secret"}
+REQUIRED_ENV = {
+    "BOTIFIED_TTS_API_KEY": "test-secret",
+    "BOTIFIED_TTS_MODEL_SOURCE": "modelscope",
+}
 
 
 def test_settings_load_product_defaults() -> None:
-    settings = Settings.from_env(API_KEY_ENV)
+    settings = Settings.from_env(REQUIRED_ENV)
 
     assert settings.host == "0.0.0.0"
     assert settings.port == 8000
-    assert settings.model == "openbmb/VoxCPM2"
-    assert (
-        settings.model_revision
-        == "bffb3df5a29440629464e5e839f4d214c8714c3d"
-    )
+    assert settings.model_source == "modelscope"
     assert settings.gpu_device == 0
     assert settings.data_dir == Path("/data")
     assert settings.api_key == "test-secret"
@@ -40,8 +39,7 @@ def test_settings_load_supported_overrides() -> None:
             "PATH": "/usr/bin",
             "BOTIFIED_TTS_HOST": "127.0.0.1",
             "BOTIFIED_TTS_PORT": "9000",
-            "BOTIFIED_TTS_MODEL": "example/model",
-            "BOTIFIED_TTS_MODEL_REVISION": "a" * 40,
+            "BOTIFIED_TTS_MODEL_SOURCE": "huggingface",
             "BOTIFIED_TTS_GPU_DEVICE": "2",
             "BOTIFIED_TTS_DATA_DIR": "/srv/tts",
             "BOTIFIED_TTS_API_KEY": "another-secret",
@@ -51,8 +49,7 @@ def test_settings_load_supported_overrides() -> None:
 
     assert settings.host == "127.0.0.1"
     assert settings.port == 9000
-    assert settings.model == "example/model"
-    assert settings.model_revision == "a" * 40
+    assert settings.model_source == "huggingface"
     assert settings.gpu_device == 2
     assert settings.data_dir == Path("/srv/tts")
     assert settings.api_key == "another-secret"
@@ -69,14 +66,13 @@ def test_settings_load_supported_overrides() -> None:
         ("BOTIFIED_TTS_GPU_DEVICE", "device-0"),
         ("BOTIFIED_TTS_LOG_LEVEL", "TRACE"),
         ("BOTIFIED_TTS_HOST", ""),
-        ("BOTIFIED_TTS_MODEL", ""),
-        ("BOTIFIED_TTS_MODEL_REVISION", "main"),
+        ("BOTIFIED_TTS_MODEL_SOURCE", "auto"),
         ("BOTIFIED_TTS_DATA_DIR", "relative/path"),
         ("BOTIFIED_TTS_API_KEY", ""),
     ],
 )
 def test_settings_reject_invalid_values(name: str, value: str) -> None:
-    environ = dict(API_KEY_ENV)
+    environ = dict(REQUIRED_ENV)
     environ[name] = value
 
     with pytest.raises(InvalidConfiguration):
@@ -87,20 +83,65 @@ def test_settings_reject_unknown_prefixed_variable() -> None:
     with pytest.raises(InvalidConfiguration, match="BOTIFIED_TTS_TIMEOUT"):
         Settings.from_env(
             {
-                **API_KEY_ENV,
+                **REQUIRED_ENV,
                 "BOTIFIED_TTS_TIMEOUT": "30",
             }
         )
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["BOTIFIED_TTS_MODEL", "BOTIFIED_TTS_MODEL_REVISION"],
+)
+def test_settings_reject_removed_model_overrides(name: str) -> None:
+    with pytest.raises(InvalidConfiguration, match=name):
+        Settings.from_env({**REQUIRED_ENV, name: "removed"})
+
+
 def test_settings_require_api_key() -> None:
     with pytest.raises(InvalidConfiguration, match="BOTIFIED_TTS_API_KEY"):
-        Settings.from_env({})
+        Settings.from_env({"BOTIFIED_TTS_MODEL_SOURCE": "modelscope"})
+
+
+def test_settings_require_model_source_without_a_default() -> None:
+    with pytest.raises(InvalidConfiguration, match="BOTIFIED_TTS_MODEL_SOURCE"):
+        Settings.from_env({"BOTIFIED_TTS_API_KEY": "test-secret"})
+
+
+@pytest.mark.parametrize("api_key", ["a", "Az09._~-"])
+def test_settings_accept_api_key_token_grammar(api_key: str) -> None:
+    settings = Settings.from_env(
+        {
+            "BOTIFIED_TTS_API_KEY": api_key,
+            "BOTIFIED_TTS_MODEL_SOURCE": "modelscope",
+        }
+    )
+
+    assert settings.api_key == api_key
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    ['"quoted"', "has space", "key=value"],
+)
+def test_settings_reject_api_key_outside_token_grammar(api_key: str) -> None:
+    with pytest.raises(InvalidConfiguration, match="BOTIFIED_TTS_API_KEY"):
+        Settings.from_env(
+            {
+                "BOTIFIED_TTS_API_KEY": api_key,
+                "BOTIFIED_TTS_MODEL_SOURCE": "modelscope",
+            }
+        )
 
 
 def test_settings_reject_non_ascii_api_key() -> None:
-    with pytest.raises(InvalidConfiguration, match="ASCII"):
-        Settings.from_env({"BOTIFIED_TTS_API_KEY": "内部密钥"})
+    with pytest.raises(InvalidConfiguration, match="BOTIFIED_TTS_API_KEY"):
+        Settings.from_env(
+            {
+                "BOTIFIED_TTS_API_KEY": "内部密钥",
+                "BOTIFIED_TTS_MODEL_SOURCE": "modelscope",
+            }
+        )
 
 
 class FakeCuda:

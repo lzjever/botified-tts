@@ -22,16 +22,21 @@ from botified_tts.engine import (
     VoxCPMEngine,
 )
 
-MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d"
+HUGGINGFACE_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d"
+MODELSCOPE_REVISION = "2e7c0dfff6646cef46c8bf106460a3dbce23a591"
 WAVEFORM_SAMPLES = 7680
 
 
-def _settings(tmp_path: Path, *, device: int = 0) -> Settings:
+def _settings(
+    tmp_path: Path,
+    *,
+    source: str = "huggingface",
+    device: int = 0,
+) -> Settings:
     return Settings(
         host="127.0.0.1",
         port=8000,
-        model="openbmb/VoxCPM2",
-        model_revision=MODEL_REVISION,
+        model_source=source,  # type: ignore[arg-type]
         gpu_device=device,
         data_dir=tmp_path,
         api_key="test-secret",
@@ -133,11 +138,25 @@ class _FakePool:
 def _install_fake_runtime(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    snapshot_download: Any,
+    source: str = "huggingface",
+    download: Any,
     pool_class: type[_FakePool] = _FakePool,
 ) -> None:
-    huggingface_hub = ModuleType("huggingface_hub")
-    huggingface_hub.snapshot_download = snapshot_download  # type: ignore[attr-defined]
+    if source == "huggingface":
+        huggingface_hub = ModuleType("huggingface_hub")
+        huggingface_hub.snapshot_download = download  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
+        monkeypatch.setitem(sys.modules, "modelscope_hub", None)
+    else:
+        modelscope_hub = ModuleType("modelscope_hub")
+
+        class FakeHubApi:
+            def download_repo(self, **kwargs: object) -> str | Path:
+                return download(**kwargs)
+
+        modelscope_hub.HubApi = FakeHubApi  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "modelscope_hub", modelscope_hub)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", None)
 
     nano = ModuleType("nanovllm_voxcpm")
     nano.__path__ = []  # type: ignore[attr-defined]
@@ -167,7 +186,6 @@ def _install_fake_runtime(
     transformers.tokenizer_loads = tokenizer_loads  # type: ignore[attr-defined]
     utils.tokenizer_masks = tokenizer_masks  # type: ignore[attr-defined]
 
-    monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm", nano)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm.models", models)
@@ -184,27 +202,49 @@ def _install_fake_runtime(
     )
 
 
+@pytest.mark.parametrize("source", ["huggingface", "modelscope"])
 def test_create_checks_cuda_before_runtime_imports(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    source: str,
 ) -> None:
     def reject_cuda(device: int) -> None:
         raise CudaPreflightError("cuda_unavailable", "no CUDA")
 
     monkeypatch.setattr(engine_module, "require_cuda", reject_cuda)
     monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    monkeypatch.setitem(sys.modules, "modelscope_hub", None)
     monkeypatch.setitem(sys.modules, "nanovllm_voxcpm", None)
     monkeypatch.setitem(sys.modules, "transformers", None)
 
     with pytest.raises(CudaPreflightError, match="cuda_unavailable"):
-        asyncio.run(VoxCPMEngine.create(_settings(tmp_path)))
+        asyncio.run(VoxCPMEngine.create(_settings(tmp_path, source=source)))
 
 
+@pytest.mark.parametrize(
+    ("source", "repo_id", "revision"),
+    [
+        (
+            "huggingface",
+            "openbmb/VoxCPM2",
+            HUGGINGFACE_REVISION,
+        ),
+        (
+            "modelscope",
+            "OpenBMB/VoxCPM2",
+            MODELSCOPE_REVISION,
+        ),
+    ],
+)
 def test_create_downloads_exact_snapshot_and_completes_warmup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    source: str,
+    repo_id: str,
+    revision: str,
 ) -> None:
-    events: list[object] = []
+    selected_devices: list[int] = []
+    download_calls: list[dict[str, object]] = []
     _FakePool.instances = []
     _FakePool.ready_error = None
     _FakePool.model_info = {"sample_rate": 48000, "channels": 1}
@@ -216,34 +256,38 @@ def test_create_downloads_exact_snapshot_and_completes_warmup(
     monkeypatch.setattr(
         engine_module,
         "require_cuda",
-        lambda device: events.append(("cuda", device)),
+        lambda device: selected_devices.append(device),
     )
 
-    def snapshot_download(**kwargs: object) -> str:
-        events.append(("download", kwargs))
-        return "/models/voxcpm2-snapshot"
+    def download(**kwargs: object) -> str | Path:
+        download_calls.append(kwargs)
+        model_path = f"/models/{source}-voxcpm2"
+        return Path(model_path) if source == "modelscope" else model_path
 
     _install_fake_runtime(
         monkeypatch,
-        snapshot_download=snapshot_download,
+        source=source,
+        download=download,
     )
 
-    engine = asyncio.run(VoxCPMEngine.create(_settings(tmp_path, device=2)))
+    engine = asyncio.run(
+        VoxCPMEngine.create(
+            _settings(tmp_path, source=source, device=2),
+        )
+    )
     pool = _FakePool.instances[0]
 
-    assert events == [
-        ("cuda", 2),
-        (
-            "download",
-            {
-                "repo_id": "openbmb/VoxCPM2",
-                "revision": MODEL_REVISION,
-                "cache_dir": tmp_path / "model-cache",
-            },
-        ),
-    ]
+    assert selected_devices == [2]
+    expected_download = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "cache_dir": tmp_path / "model-cache" / source,
+    }
+    if source == "modelscope":
+        expected_download["repo_type"] = "model"
+    assert download_calls == [expected_download]
     assert pool.kwargs == {
-        "model_path": "/models/voxcpm2-snapshot",
+        "model_path": f"/models/{source}-voxcpm2",
         "devices": [2],
         "max_num_seqs": MAX_CONCURRENT_SYNTHESIS,
         "gpu_memory_utilization": 0.8,
@@ -254,14 +298,65 @@ def test_create_downloads_exact_snapshot_and_completes_warmup(
     assert pool.generate_calls[0]["max_generate_length"] == 28
     transformers = sys.modules["transformers"]
     utils = sys.modules["nanovllm_voxcpm.models.voxcpm2.utils"]
-    assert transformers.tokenizer_loads == ["/models/voxcpm2-snapshot"]  # type: ignore[attr-defined]
+    assert transformers.tokenizer_loads == [f"/models/{source}-voxcpm2"]  # type: ignore[attr-defined]
     assert len(utils.tokenizer_masks) == 1  # type: ignore[attr-defined]
     assert pool.streams[0].closed is True
 
     asyncio.run(engine.close())
 
 
-@pytest.mark.parametrize("failure_stage", ["download", "ready", "warmup"])
+@pytest.mark.parametrize("source", ["huggingface", "modelscope"])
+def test_selected_source_download_failure_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source: str,
+) -> None:
+    calls: list[str] = []
+    _FakePool.instances = []
+    monkeypatch.setattr(engine_module, "require_cuda", lambda device: None)
+
+    def selected_download(**kwargs: object) -> str:
+        calls.append(source)
+        raise RuntimeError("selected source failed")
+
+    other_source = "modelscope" if source == "huggingface" else "huggingface"
+
+    def fallback_download(**kwargs: object) -> str:
+        calls.append(other_source)
+        return "/models/fallback-must-not-be-used"
+
+    _install_fake_runtime(
+        monkeypatch,
+        source=source,
+        download=selected_download,
+    )
+    if source == "huggingface":
+        modelscope_hub = ModuleType("modelscope_hub")
+
+        class FallbackHubApi:
+            def download_repo(self, **kwargs: object) -> str:
+                return fallback_download(**kwargs)
+
+        modelscope_hub.HubApi = FallbackHubApi  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "modelscope_hub", modelscope_hub)
+    else:
+        huggingface_hub = ModuleType("huggingface_hub")
+        huggingface_hub.snapshot_download = fallback_download  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
+
+    with pytest.raises(EngineError) as caught:
+        asyncio.run(
+            VoxCPMEngine.create(
+                _settings(tmp_path, source=source),
+            )
+        )
+
+    assert caught.value.code == "model_load_failed"
+    assert calls == [source]
+    assert _FakePool.instances == []
+
+
+@pytest.mark.parametrize("failure_stage", ["ready", "warmup"])
 def test_create_cleans_pool_and_reports_model_load_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -282,14 +377,12 @@ def test_create_cleans_pool_and_reports_model_load_failure(
     )
     monkeypatch.setattr(engine_module, "require_cuda", lambda device: None)
 
-    def snapshot_download(**kwargs: object) -> str:
-        if failure_stage == "download":
-            raise RuntimeError("download failed")
+    def download(**kwargs: object) -> str:
         return "/models/voxcpm2-snapshot"
 
     _install_fake_runtime(
         monkeypatch,
-        snapshot_download=snapshot_download,
+        download=download,
     )
 
     with pytest.raises(EngineError) as caught:
@@ -322,7 +415,7 @@ def test_create_rejects_incompatible_model_info(
     monkeypatch.setattr(engine_module, "require_cuda", lambda device: None)
     _install_fake_runtime(
         monkeypatch,
-        snapshot_download=lambda **kwargs: "/models/voxcpm2-snapshot",
+        download=lambda **kwargs: "/models/voxcpm2-snapshot",
     )
 
     with pytest.raises(EngineError) as caught:
@@ -345,7 +438,7 @@ def test_create_cleans_pool_when_cancelled(
     monkeypatch.setattr(engine_module, "require_cuda", lambda device: None)
     _install_fake_runtime(
         monkeypatch,
-        snapshot_download=lambda **kwargs: "/models/voxcpm2-snapshot",
+        download=lambda **kwargs: "/models/voxcpm2-snapshot",
     )
 
     try:

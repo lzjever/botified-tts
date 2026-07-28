@@ -18,7 +18,7 @@ from botified_tts.voices import InvalidVoice, VoiceMetadata
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
-MODEL = "openbmb/VoxCPM2"
+MODEL_NAME = "VoxCPM2"
 PCM = b"\x01\x00\xff\xff"
 
 
@@ -90,7 +90,6 @@ def _client(
 ) -> TestClient:
     app = create_app(
         api_key=api_key,
-        model=MODEL,
         readiness=readiness or Readiness(ready=True),
         voices=voices or FakeVoices(),
         speech=speech or FakeSpeech(),
@@ -150,7 +149,7 @@ def test_health_is_public_and_ready_gate_precedes_protected_work() -> None:
     assert unavailable.json() == {
         "status": "not_ready",
         "cuda": True,
-        "model": MODEL,
+        "model": MODEL_NAME,
         "sample_rate": 48_000,
     }
     assert protected.status_code == 500
@@ -163,7 +162,7 @@ def test_health_is_public_and_ready_gate_precedes_protected_work() -> None:
     assert ready.json() == {
         "status": "ready",
         "cuda": True,
-        "model": MODEL,
+        "model": MODEL_NAME,
         "sample_rate": 48_000,
     }
     assert unauthenticated.status_code == 401
@@ -377,7 +376,6 @@ def test_admission_rejects_the_seventeenth_request_and_releases_slots() -> None:
         speech = BlockingSpeech()
         app = create_app(
             api_key="test-secret",
-            model=MODEL,
             readiness=Readiness(ready=True),
             voices=FakeVoices(),
             speech=speech,

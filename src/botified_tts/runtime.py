@@ -46,7 +46,6 @@ async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
     speech = SpeechService(engine, voices)
     app = create_app(
         api_key=settings.api_key,
-        model=settings.model,
         readiness=readiness,
         voices=voices,
         speech=speech,

@@ -8,21 +8,20 @@ from pathlib import Path
 from typing import Literal
 
 
-DEFAULT_MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d"
 MAX_CONCURRENT_SYNTHESIS = 16
 ENV_PREFIX = "BOTIFIED_TTS_"
 ENV_NAMES = {
     "BOTIFIED_TTS_HOST",
     "BOTIFIED_TTS_PORT",
-    "BOTIFIED_TTS_MODEL",
-    "BOTIFIED_TTS_MODEL_REVISION",
+    "BOTIFIED_TTS_MODEL_SOURCE",
     "BOTIFIED_TTS_GPU_DEVICE",
     "BOTIFIED_TTS_DATA_DIR",
     "BOTIFIED_TTS_API_KEY",
     "BOTIFIED_TTS_LOG_LEVEL",
 }
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
+API_KEY_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
+ModelSource = Literal["modelscope", "huggingface"]
 CudaErrorCode = Literal["cuda_unavailable", "cuda_device_invalid"]
 
 
@@ -42,8 +41,7 @@ class CudaPreflightError(RuntimeError):
 class Settings:
     host: str
     port: int
-    model: str
-    model_revision: str
+    model_source: ModelSource
     gpu_device: int
     data_dir: Path
     api_key: str
@@ -73,20 +71,15 @@ class Settings:
             minimum=1,
             maximum=65535,
         )
-        model = _plain_value(
-            values,
-            "BOTIFIED_TTS_MODEL",
-            "openbmb/VoxCPM2",
-        )
-        model_revision = _plain_value(
-            values,
-            "BOTIFIED_TTS_MODEL_REVISION",
-            DEFAULT_MODEL_REVISION,
-        )
-        if REVISION_PATTERN.fullmatch(model_revision) is None:
+        try:
+            model_source = values["BOTIFIED_TTS_MODEL_SOURCE"]
+        except KeyError as error:
             raise InvalidConfiguration(
-                "BOTIFIED_TTS_MODEL_REVISION must be a 40-character "
-                "lowercase commit SHA"
+                "BOTIFIED_TTS_MODEL_SOURCE is required"
+            ) from error
+        if model_source not in ("modelscope", "huggingface"):
+            raise InvalidConfiguration(
+                "BOTIFIED_TTS_MODEL_SOURCE must be modelscope or huggingface"
             )
 
         gpu_device = _decimal_value(
@@ -114,13 +107,11 @@ class Settings:
             ) from error
         if (
             not isinstance(api_key, str)
-            or not api_key
-            or api_key != api_key.strip()
-            or not api_key.isascii()
+            or API_KEY_PATTERN.fullmatch(api_key) is None
         ):
             raise InvalidConfiguration(
-                "BOTIFIED_TTS_API_KEY must be a non-empty ASCII value "
-                "without surrounding whitespace"
+                "BOTIFIED_TTS_API_KEY must match [A-Za-z0-9._~-]+ "
+                "without quotes"
             )
 
         log_level = _plain_value(
@@ -137,8 +128,7 @@ class Settings:
         return cls(
             host=host,
             port=port,
-            model=model,
-            model_revision=model_revision,
+            model_source=model_source,
             gpu_device=gpu_device,
             data_dir=data_dir,
             api_key=api_key,

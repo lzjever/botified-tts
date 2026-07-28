@@ -199,8 +199,8 @@ BOTIFIED_TTS_MODEL_SOURCE=modelscope|huggingface
   `settings.data_dir / "model-cache" / settings.model_source`。
 - CUDA preflight 早于 SDK import、下载和 Nano child 创建。
 - 选中 source 失败返回 `model_load_failed`，不调用另一来源。
-- Engine 把所选 SDK 返回的本地模型路径交给 Nano；runtime 与 health 使用逻辑
-  模型名 `VoxCPM2`，不再读取被删除的 `Settings.model`。
+- Engine 把所选 SDK 返回的本地模型路径交给 Nano；app health 单一固定逻辑名
+  `VoxCPM2`，runtime 不接收或传递模型展示参数。
 
 ### 4.4 Root Docker image
 
@@ -224,11 +224,16 @@ admission 和 runtime fatal 的服务行为。
 Companion integration 使用 fake Botified frames/WebSocket/player，只验证 start
 mapping、replacement、握手 error、barge-in、finish 后读事件和资源回收。
 
-唯一真实 GPU 文件为 `tests/gpu_integration.py`，同一 engine 生命周期覆盖：
+唯一真实 GPU 文件为 `tests/gpu_integration.py`，唯一 CLI 选择为
+`--full-source modelscope|huggingface`。非 full source 先完成
+create/load/wait/ordinary warmup 并 close；full source 在同一 engine 生命周期
+覆盖：
 
 1. CUDA、source、tokenizer、Nano create/load/wait 和 ordinary warmup。
-2. 一次 Voice Design，生成可复用 clone reference；fixture `prompt_text` 只保存
-   实际 spoken text，排除 description/style control prefix。
+2. 一次 Voice Design，spoken text 预留足够长度，生成的 clone reference 必须
+   自然落在 VoiceStore `[3, 60]` 秒范围内，短则失败；禁止通过补静音、拼接额外
+   生成结果或重试满足时长。fixture `prompt_text` 只保存精确 spoken text，排除
+   description/style control prefix。
 3. 同一 reference 的 controllable clone + style。
 4. 同一 reference 与 exact spoken transcript 的 faithful clone。
 5. 两段 continuation，文本包含一个原生非语言 tag，第二段使用第一段完整
@@ -238,7 +243,7 @@ mapping、replacement、握手 error、barge-in、finish 后读事件和资源�
    不读取或修改私有进程拓扑。
 
 脚本不启动 HTTP/WS，不跑语言矩阵，不硬断言 RTF。两个 source 各完成 create 与
-warmup；完整路径只运行一次。
+warmup；只有 full source 运行完整路径。
 
 ### 4.6 发布顺序
 
@@ -256,7 +261,7 @@ warmup；完整路径只运行一次。
 | 阶段 | 改动 | 最小测试 | 完成结果 |
 |---|---|---|---|
 | 1. Botified 集成 | helper/companion 统一 env-file，删除 raw key；companion 增加 immutable start 与握手 error；同步 companion README、preset、Skill、根 README；Skill 只保留 `skills.explicit` | 默认 start；profile+mode+style replacement；design+style；握手 error 不创建 player；env 缺失/重复/空值/引号/非法字符/shell 文本；secret 不进入输出 | 同一 env-file 启动服务、helper、companion；实时朗读可固定音色或 Voice Design；错误 key/voice 不再误报 audio |
-| 2. 双下载来源 | `Settings` 增加必填 source，删除公开 model/revision；engine 增加两份 spec 和单一 switch；runtime 使用本地模型路径，health 使用 `VoxCPM2`；固定 `modelscope-hub==0.1.8` 并更新根 lock | source 缺失/非法；两个 SDK 固定参数；失败无 fallback；CUDA 失败时 SDK/Nano 未 import、下载或创建；runtime/health 不访问 `Settings.model` | 两个来源显式可选且内容固定；用户不能任意组合 model/revision；Nano 收到本地路径，health 返回逻辑名 |
+| 2. 双下载来源 | `Settings` 增加必填 source，删除公开 model/revision；engine 增加两份 spec 和单一 switch，把 SDK 本地路径传给 Nano；app health 单一固定 `VoxCPM2`，runtime 不传模型展示参数；固定 `modelscope-hub==0.1.8` 并更新根 lock | source 缺失/非法；两个 SDK 固定参数；失败无 fallback；CUDA 失败时 SDK/Nano 未 import、下载或创建；runtime 不接收或传递模型展示参数 | 两个来源显式可选且内容固定；用户不能任意组合 model/revision；Nano 收到本地路径，app health 返回固定逻辑名 |
 | 3. 镜像与文档 | 移动根 Dockerfile；把 tracked `.dockerignore` 改为严格 allow-list；删除 Compose/`deploy.sh`；`.gitignore` 加 `/botified-tts.env`、`/.data/`；按四类用户重写 README | 根 pytest、companion tests/Ruff、根 `docker build`；context 不含 env-file、`.data/`、`.reference/` 或 companion | 普通用户只 pull/run，开发者只用 uv，Power user 只用根 Dockerfile；无第二套生产启动方式 |
 | 4. GPU 与发布 | 旧 GPU 脚本改名并收敛为 `tests/gpu_integration.py`；删除重复协议、语言矩阵、硬 RTF、私有拓扑；根 package 更新 `0.1.0`，确认 companion 已是 `0.1.0` 且无需版本 diff；按固定顺序发布 | 两 source 各 create/warmup；一个 source 完成 design、两 clone、style、continuation、cancel 恢复；waveform 非空/finite、chunk 7680 samples；container `healthy` | 根 package 与 companion 均为 `0.1.0`，Git/GHCR 为 `v0.1.0`；image 可匿名拉取；Release 只指向 image |
 
@@ -269,8 +274,8 @@ warmup；完整路径只运行一次。
 - 握手错误保留 code/message，不创建 player，不泄露 key。
 - Docker、helper、companion 共用 env-file，不存在 raw key 路径。
 - Source 必填、无默认/无 fallback；spec/cache 各只有一个 owner。
-- runtime 使用所选 source 的本地模型路径，health 返回 `VoxCPM2`，两者不依赖
-  已删除的 `Settings.model`。
+- Engine 把所选 source 的本地模型路径传给 Nano；app health 单一固定
+  `VoxCPM2`，runtime 不接收或传递模型展示参数。
 - CUDA 不可用时在 SDK import、下载和 Nano child 前非零退出。
 - 普通用户一个 `docker run` 达到 `healthy`；开发者可 sync/test/run；Power user
   可从根 Dockerfile build 并复用运行命令。
@@ -293,7 +298,8 @@ warmup；完整路径只运行一次。
 `src/botified_tts/config.py`、`src/botified_tts/engine.py`、
 `src/botified_tts/runtime.py`、`src/botified_tts/app.py`、`tests/test_config.py`、
 `tests/test_engine.py`、`tests/test_runtime.py`、`tests/test_api.py`、
-`tests/test_skill_helper.py`、`companions/botified/sidecar.py`、
+`tests/test_streaming.py`、`tests/test_skill_helper.py`、
+`companions/botified/sidecar.py`、
 `companions/botified/tests/test_sidecar.py`、`companions/botified/README.md`、
 `skills/voxcpm-tts/SKILL.md`、`skills/voxcpm-tts/scripts/botified-tts`。
 

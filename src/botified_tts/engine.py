@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from botified_tts.config import (
     MAX_CONCURRENT_SYNTHESIS,
+    ModelSource,
     Settings,
     require_cuda,
 )
@@ -22,6 +23,24 @@ WAVEFORM_SAMPLES = 7680
 MAX_GENERATE_LENGTH_RATIO = 6
 MAX_GENERATE_LENGTH_BONUS = 10
 MAX_GENERATE_LENGTH_CAP = 2000
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    repo_id: str
+    revision: str
+
+
+MODEL_SPECS: dict[ModelSource, ModelSpec] = {
+    "modelscope": ModelSpec(
+        repo_id="OpenBMB/VoxCPM2",
+        revision="2e7c0dfff6646cef46c8bf106460a3dbce23a591",
+    ),
+    "huggingface": ModelSpec(
+        repo_id="openbmb/VoxCPM2",
+        revision="bffb3df5a29440629464e5e839f4d214c8714c3d",
+    ),
+}
 
 
 class EngineError(RuntimeError):
@@ -54,7 +73,31 @@ class VoxCPMEngine:
 
         pool = None
         try:
-            from huggingface_hub import snapshot_download
+            spec = MODEL_SPECS[settings.model_source]
+            cache_dir = (
+                settings.data_dir
+                / "model-cache"
+                / settings.model_source
+            )
+            if settings.model_source == "huggingface":
+                from huggingface_hub import snapshot_download
+
+                model_path = snapshot_download(
+                    repo_id=spec.repo_id,
+                    revision=spec.revision,
+                    cache_dir=cache_dir,
+                )
+            else:
+                from modelscope_hub import HubApi
+
+                model_path = HubApi().download_repo(
+                    repo_id=spec.repo_id,
+                    repo_type="model",
+                    revision=spec.revision,
+                    cache_dir=cache_dir,
+                )
+            model_path = str(model_path)
+
             from nanovllm_voxcpm.models.voxcpm2.server import (
                 AsyncVoxCPM2ServerPool,
             )
@@ -63,11 +106,6 @@ class VoxCPMEngine:
             )
             from transformers import LlamaTokenizerFast
 
-            model_path = snapshot_download(
-                repo_id=settings.model,
-                revision=settings.model_revision,
-                cache_dir=settings.data_dir / "model-cache",
-            )
             text_tokenizer = mask_multichar_chinese_tokens(
                 LlamaTokenizerFast.from_pretrained(model_path),
             )

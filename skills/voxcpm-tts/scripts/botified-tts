@@ -2,7 +2,7 @@
 set -euo pipefail
 
 unset BOTIFIED_TTS_API_KEY
-API_KEY_FILE=""
+ENV_FILE=""
 API_KEY=""
 
 fail() {
@@ -34,48 +34,43 @@ require_url() {
 }
 
 require_api_key() {
-    [[ -n "${API_KEY_FILE}" ]] || fail "--api-key-file is required"
-    [[ -f "${API_KEY_FILE}" && -r "${API_KEY_FILE}" ]] \
-        || fail "--api-key-file must be a readable regular file"
+    [[ -n "${ENV_FILE}" ]] || fail "--env-file is required"
+    [[ -f "${ENV_FILE}" && -r "${ENV_FILE}" ]] \
+        || fail "--env-file must be a readable regular file"
     command -v python3 >/dev/null 2>&1 || fail "python3 is required"
     API_KEY="$(
-        python3 - "${API_KEY_FILE}" <<'PY'
+        python3 - "${ENV_FILE}" <<'PY'
 import pathlib
+import re
 import sys
 
-data = pathlib.Path(sys.argv[1]).read_bytes()
-if b"\r" in data or data.count(b"\n") > 1 or (
-    b"\n" in data and not data.endswith(b"\n")
-):
+try:
+    data = pathlib.Path(sys.argv[1]).read_bytes()
+except OSError:
+    print("botified-tts: could not read --env-file", file=sys.stderr)
+    raise SystemExit(2)
+
+prefix = b"BOTIFIED_TTS_API_KEY="
+values = [
+    line.split(b"=", 1)[1]
+    for line in data.split(b"\n")
+    if line.startswith(prefix)
+]
+if len(values) != 1:
     print(
-        "botified-tts: --api-key-file must contain one non-empty ASCII line",
+        "botified-tts: --env-file must contain exactly one "
+        "BOTIFIED_TTS_API_KEY entry",
         file=sys.stderr,
     )
     raise SystemExit(2)
-if data.endswith(b"\n"):
-    data = data[:-1]
-if not data:
+value = values[0]
+if re.fullmatch(rb"[A-Za-z0-9._~-]+", value) is None:
     print(
-        "botified-tts: --api-key-file must contain one non-empty ASCII line",
+        "botified-tts: BOTIFIED_TTS_API_KEY must match [A-Za-z0-9._~-]+",
         file=sys.stderr,
     )
     raise SystemExit(2)
-if any(byte > 0x7F for byte in data):
-    print("botified-tts: --api-key-file must contain only ASCII", file=sys.stderr)
-    raise SystemExit(2)
-if data[:1].isspace() or data[-1:].isspace():
-    print(
-        "botified-tts: --api-key-file must not have leading or trailing whitespace",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-if any(byte < 0x20 or byte == 0x7F for byte in data):
-    print(
-        "botified-tts: --api-key-file must contain printable ASCII",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-sys.stdout.buffer.write(data)
+sys.stdout.buffer.write(value)
 PY
     )" || exit $?
 }
@@ -283,9 +278,9 @@ PY
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --api-key-file)
+        --env-file)
             require_value "$@"
-            set_once API_KEY_FILE "$1" "$2"
+            set_once ENV_FILE "$1" "$2"
             shift 2
             ;;
         --*) fail "unknown global argument: $1" ;;

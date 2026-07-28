@@ -4,5 +4,5 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
-deploy/.env
-deploy/api-key
+/botified-tts.env
+/.data/

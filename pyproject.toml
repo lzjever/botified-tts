@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "botified-tts"
-version = "0.0.0"
+version = "0.1.0"
 description = "Independent Botified TTS service"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
   "huggingface-hub==1.25.1",
   "llvmlite==0.48.0",
+  "modelscope-hub==0.1.8",
   "nano-vllm-voxcpm",
   "numba==0.66.0",
   "numpy==2.4.6",

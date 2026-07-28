@@ -13,15 +13,12 @@ import botified_tts.runtime as runtime
 from botified_tts.config import CudaPreflightError, Settings
 from botified_tts.engine import EngineError
 
-MODEL_REVISION = "bffb3df5a29440629464e5e839f4d214c8714c3d"
-
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         host="127.0.0.1",
         port=18000,
-        model="openbmb/VoxCPM2",
-        model_revision=MODEL_REVISION,
+        model_source="modelscope",
         gpu_device=0,
         data_dir=tmp_path,
         api_key="test-secret",
@@ -94,7 +91,6 @@ def _install_composition(
         captured.readiness = kwargs["readiness"]
         assert kwargs == {
             "api_key": settings.api_key,
-            "model": settings.model,
             "readiness": captured.readiness,
             "voices": voice_store,
             "speech": speech,

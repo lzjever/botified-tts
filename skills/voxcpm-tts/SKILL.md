@@ -8,16 +8,31 @@ description: Generate WAV speech and manage trusted Botified TTS voice profiles 
 Resolve `scripts/botified-tts` relative to this `SKILL.md` and use that bundled
 helper. Do not reimplement its HTTP calls.
 
-Set the service URL. For authenticated commands, pass the raw API key file as
-the global option before the command. The file must contain one non-empty ASCII
-line with no leading or trailing whitespace:
+Configure Botified `skills.explicit` to point directly to this repository's
+`skills/voxcpm-tts/SKILL.md`. Do not copy or symlink the Skill, and do not
+create a second discovery path.
+
+Set the HTTP service URL and use the same private `botified-tts.env` format as
+the Docker service:
 
 ```bash
 export BOTIFIED_TTS_URL=http://127.0.0.1:8000
 TTS=<skill-directory>/scripts/botified-tts
+ENV_FILE=/opt/botified-tts/botified-tts.env
 
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key voice-list
+"${TTS}" --env-file "${ENV_FILE}" voice-list
 ```
+
+The env file may contain the service's other variables, but must contain
+exactly one literal API key assignment:
+
+```text
+BOTIFIED_TTS_API_KEY=replace_with_random_hex
+BOTIFIED_TTS_MODEL_SOURCE=modelscope
+```
+
+The unquoted key must match `[A-Za-z0-9._~-]+`. The helper does not source the
+file or evaluate quotes, interpolation, command substitution, or shell syntax.
 
 Check health when service status is uncertain:
 
@@ -28,12 +43,12 @@ Check health when service status is uncertain:
 Manage voice profiles:
 
 ```bash
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key voice-create \
+"${TTS}" --env-file "${ENV_FILE}" voice-create \
   --name assistant \
   --file reference.wav \
   --prompt-text 'The exact words spoken in the reference.'
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key voice-list
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key voice-delete \
+"${TTS}" --env-file "${ENV_FILE}" voice-list
+"${TTS}" --env-file "${ENV_FILE}" voice-delete \
   --id voice_0123456789abcdef0123456789abcdef
 ```
 
@@ -46,24 +61,24 @@ output path when synthesizing:
 
 ```bash
 # Normal voice
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key speak \
+"${TTS}" --env-file "${ENV_FILE}" speak \
   --text 'Hello.' --output hello.wav
 
 # Voice Design
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key speak \
+"${TTS}" --env-file "${ENV_FILE}" speak \
   --text 'Hello.' \
   --output designed.wav \
   --design 'A warm, natural young voice'
 
 # Controllable clone; this is the default profile mode
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key speak \
+"${TTS}" --env-file "${ENV_FILE}" speak \
   --text 'Hello.' \
   --output clone.wav \
   --voice-id voice_0123456789abcdef0123456789abcdef \
   --style 'calm and conversational'
 
 # Faithful clone; style is not accepted
-"${TTS}" --api-key-file /secure/path/botified-tts-api-key speak \
+"${TTS}" --env-file "${ENV_FILE}" speak \
   --text 'Hello.' \
   --output faithful.wav \
   --voice-id voice_0123456789abcdef0123456789abcdef \

@@ -3,6 +3,10 @@ FROM ghcr.io/astral-sh/uv:0.10.8@sha256:f99c19c9683591761e0dc9d80db421b17d8c004a
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04@sha256:2c8193530ecc423e0f123d0c85b68a15d1395adcddabfc943e2523dbfde172e1
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    BOTIFIED_TTS_DATA_DIR=/data \
+    BOTIFIED_TTS_GPU_DEVICE=0 \
+    BOTIFIED_TTS_HOST=0.0.0.0 \
+    BOTIFIED_TTS_PORT=8000 \
     PATH="/app/.venv/bin:/root/.local/bin:${PATH}" \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy

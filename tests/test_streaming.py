@@ -20,7 +20,6 @@ from botified_tts.speech import SynthesisSummary
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
-MODEL = "openbmb/VoxCPM2"
 PCM = b"\x01\x00\xff\xff"
 
 
@@ -32,7 +31,6 @@ class _UnusedVoices:
 def _client(*, speech: object) -> TestClient:
     app = create_app(
         api_key="test-secret",
-        model=MODEL,
         readiness=Readiness(ready=True),
         voices=_UnusedVoices(),  # type: ignore[arg-type]
         speech=speech,  # type: ignore[arg-type]
