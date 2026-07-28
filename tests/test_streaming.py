@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ import botified_tts.streaming as streaming_module
 from botified_tts.app import Readiness, create_app
 from botified_tts.engine import EngineError
 from botified_tts.schemas import SynthesisOptions
+from botified_tts.speech import SynthesisSummary
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
@@ -60,13 +62,44 @@ class StreamingSpeech:
         self,
         _options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
         self.calls += 1
         async for segment in segments:
             self.segments.append(segment)
+            if summary is not None:
+                summary.record_segment()
             if self.error is not None:
                 raise self.error
-            yield len(self.segments).to_bytes(2, "little")
+            pcm = len(self.segments).to_bytes(2, "little")
+            if summary is not None:
+                summary.record_pcm(pcm)
+            yield pcm
+
+
+_SUMMARY_FIELDS = {
+    "id",
+    "voice_type",
+    "mode",
+    "accepted_chars",
+    "segments",
+    "ttfb",
+    "audio_duration",
+    "rtf",
+    "result",
+}
+
+
+def _summaries(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    values: list[dict[str, object]] = []
+    for record in caplog.records:
+        if record.name != "uvicorn.error.botified_tts":
+            continue
+        value = json.loads(record.getMessage())
+        if set(value) == _SUMMARY_FIELDS:
+            values.append(value)
+    return values
 
 
 def test_stream_start_auth_and_http_share_one_admission() -> None:
@@ -144,18 +177,28 @@ class BlockingFirstSegmentSpeech:
         self,
         _options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
         self.calls += 1
         async for segment in segments:
             self.segments.append(segment)
+            if summary is not None:
+                summary.record_segment()
             if len(self.segments) == 1:
                 self.first_seen.set()
                 while not self.release.is_set():
                     await asyncio.sleep(0.001)
-            yield len(self.segments).to_bytes(2, "little")
+            pcm = len(self.segments).to_bytes(2, "little")
+            if summary is not None:
+                summary.record_pcm(pcm)
+            yield pcm
 
 
-def test_stream_receives_while_generation_blocks_and_finish_drains() -> None:
+def test_stream_receives_while_generation_blocks_and_finish_drains(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.botified_tts")
     speech = BlockingFirstSegmentSpeech()
     with _client(speech=speech) as client:
         with client.websocket_connect(
@@ -179,6 +222,18 @@ def test_stream_receives_while_generation_blocks_and_finish_drains() -> None:
 
     assert speech.calls == 1
     assert speech.segments == ["第一句。", "第二句。"]
+    summaries = _summaries(caplog)
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert str(summary["id"]).startswith("session_")
+    assert summary["voice_type"] == "default"
+    assert summary["mode"] is None
+    assert summary["accepted_chars"] == 8
+    assert summary["segments"] == 2
+    assert isinstance(summary["ttfb"], float)
+    assert summary["audio_duration"] == pytest.approx(4 / 96_000)
+    assert summary["rtf"] == 0.0
+    assert summary["result"] == "ok"
 
 
 def test_stream_flush_keeps_one_speech_session() -> None:
@@ -226,8 +281,10 @@ def test_stream_deadline_is_not_reset_by_later_append(
     async def observe(
         options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
-        async for chunk in original(options, segments):
+        async for chunk in original(options, segments, summary=summary):
             first_seen.set()
             yield chunk
 
@@ -264,11 +321,15 @@ class SinkSpeech:
         self,
         _options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
         self.calls += 1
         try:
             async for segment in segments:
                 self.segments.append(segment)
+                if summary is not None:
+                    summary.record_segment()
                 await asyncio.sleep(0)
         finally:
             self.closed.set()
@@ -309,11 +370,16 @@ class CancellableSpeech:
         self,
         _options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
         self.calls += 1
         try:
             async for segment in segments:
                 self.segments.append(segment)
+                if summary is not None:
+                    summary.record_segment()
+                    summary.record_pcm(PCM)
                 yield PCM
                 await asyncio.Event().wait()
         finally:
@@ -414,7 +480,10 @@ def test_stream_idle_cancels_without_waiting_during_drain(
             }
 
 
-def test_stream_engine_error_is_one_terminal_error_event() -> None:
+def test_stream_engine_error_is_one_terminal_error_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.botified_tts")
     speech = StreamingSpeech(
         EngineError("engine_error", "secret engine detail")
     )
@@ -436,6 +505,12 @@ def test_stream_engine_error_is_one_terminal_error_event() -> None:
                 },
             }
             assert "secret engine detail" not in str(event)
+    summaries = _summaries(caplog)
+    assert len(summaries) == 1
+    assert summaries[0]["result"] == "engine_error"
+    assert summaries[0]["ttfb"] is None
+    assert summaries[0]["audio_duration"] is None
+    assert summaries[0]["rtf"] is None
 
 
 def test_stream_ready_send_does_not_extend_active_idle_deadline(
@@ -524,6 +599,8 @@ class BlockingCloseSpeech:
         self,
         _options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> BlockingCloseStream:
         return BlockingCloseStream(segments, self.close_started)
 

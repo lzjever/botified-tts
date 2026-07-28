@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Literal
 
@@ -20,7 +21,7 @@ from botified_tts.schemas import (
     parse_client_message,
 )
 from botified_tts.segmenter import Segmenter
-from botified_tts.speech import SpeechService
+from botified_tts.speech import SpeechService, SynthesisSummary
 from botified_tts.voices import InvalidVoice
 
 
@@ -73,6 +74,8 @@ class _StreamingSession:
         receive_task: asyncio.Task[Literal["finish", "cancel"]] | None = None
         generate_task: asyncio.Task[None] | None = None
         cancel_event = asyncio.Event()
+        summary: SynthesisSummary | None = None
+        result = "engine_error"
 
         await self._websocket.accept()
         try:
@@ -91,6 +94,11 @@ class _StreamingSession:
             if not self._try_acquire():
                 raise _Rejected("service_busy", "Service is busy")
             acquired = True
+            summary = SynthesisSummary(
+                id=f"session_{uuid.uuid4().hex}",
+                ttfb_started_at=None,
+            )
+            summary.set_options(first.options)
             active_idle_deadline = (
                 asyncio.get_running_loop().time() + _IDLE_TIMEOUT_SECONDS
             )
@@ -112,6 +120,7 @@ class _StreamingSession:
                     queue,
                     cancel_event,
                     active_idle_deadline,
+                    summary,
                 )
             )
             generate_task = asyncio.create_task(
@@ -119,6 +128,7 @@ class _StreamingSession:
                     first,
                     queue,
                     cancel_event,
+                    summary,
                 )
             )
             cancelled = await self._coordinate(
@@ -127,31 +137,42 @@ class _StreamingSession:
                 cancel_event,
             )
             terminal = {"type": "done", "cancelled": cancelled}
+            result = "cancelled" if cancelled else "ok"
         except _IdleTimeout:
             terminal = {"type": "done", "cancelled": True}
+            result = "cancelled"
         except _ClientTooSlow:
+            result = "client_too_slow"
             terminal = _ws_error(
                 "client_too_slow",
                 "Client is too slow",
             )
         except InputTooLarge as error:
+            result = "input_too_large"
             terminal = _ws_error("input_too_large", str(error))
         except InvalidVoice as error:
+            result = "invalid_voice"
             terminal = _ws_error("invalid_voice", str(error))
         except InvalidSynthesisOptions as error:
+            result = "invalid_request"
             terminal = _ws_error("invalid_request", str(error))
         except EngineError:
+            result = "engine_error"
             terminal = _ws_error(
                 "engine_error",
                 "Speech synthesis failed",
             )
         except _Rejected as error:
+            result = error.code
             terminal = _ws_error(error.code, error.message)
         except WebSocketDisconnect:
+            result = "client_disconnected"
             terminal = None
         except asyncio.CancelledError:
+            result = "cancelled"
             raise
         except Exception:
+            result = "engine_error"
             terminal = _ws_error(
                 "engine_error",
                 "Internal server error",
@@ -164,6 +185,8 @@ class _StreamingSession:
                 await _best_effort_send_json(self._websocket, terminal)
             if acquired:
                 self._release()
+            if summary is not None:
+                summary.log_terminal(result)
             with contextlib.suppress(_CleanupFailed):
                 await _bounded_cleanup(self._websocket.close())
 
@@ -198,6 +221,7 @@ class _StreamingSession:
         queue: asyncio.Queue[str | object],
         cancel_event: asyncio.Event,
         idle_deadline: float,
+        summary: SynthesisSummary,
     ) -> Literal["finish", "cancel"]:
         segmenter = Segmenter()
         loop = asyncio.get_running_loop()
@@ -241,6 +265,7 @@ class _StreamingSession:
                         "WebSocket session text exceeds 65536 UTF-8 bytes"
                     )
                 accepted_bytes += text_bytes
+                summary.accept_text(message.text)
                 segments = segmenter.append(message.text)
                 _enqueue_segments(queue, segments)
                 if segments:
@@ -284,10 +309,12 @@ class _StreamingSession:
         start: StartMessage,
         queue: asyncio.Queue[str | object],
         cancel_event: asyncio.Event,
+        summary: SynthesisSummary,
     ) -> None:
         stream = self._speech.synthesize(
             start.options,
             _segment_source(queue, cancel_event),
+            summary=summary,
         )
         primary_failure = False
         try:

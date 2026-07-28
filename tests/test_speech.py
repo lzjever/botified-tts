@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
@@ -14,7 +15,7 @@ from botified_tts.schemas import (
     ProfileVoice,
     SynthesisOptions,
 )
-from botified_tts.speech import SpeechService
+from botified_tts.speech import SpeechService, SynthesisSummary
 from botified_tts.voices import (
     InvalidVoice,
     VoiceMetadata,
@@ -164,12 +165,14 @@ async def _collect(
     service: SpeechService,
     options: SynthesisOptions,
     *segments: str,
+    summary: SynthesisSummary | None = None,
 ) -> list[bytes]:
     return [
         chunk
         async for chunk in service.synthesize(
             options,
             _segments(*segments),
+            summary=summary,
         )
     ]
 
@@ -323,8 +326,22 @@ def test_segments_are_serial_and_use_only_last_complete_continuation() -> None:
         mode=None,
         style=" (calm) ",
     )
+    summary = SynthesisSummary(
+        id="req_test",
+        ttfb_started_at=time.monotonic(),
+    )
+    summary.accept_text("onetwothree")
 
-    output = asyncio.run(_collect(service, options, "one", "two", "three"))
+    output = asyncio.run(
+        _collect(
+            service,
+            options,
+            "one",
+            "two",
+            "three",
+            summary=summary,
+        )
+    )
 
     assert len(output) == 3
     assert engine.generate_calls == [
@@ -348,6 +365,13 @@ def test_segments_are_serial_and_use_only_last_complete_continuation() -> None:
         },
     ]
     assert all(stream.closed for stream in engine.streams)
+    terminal = summary.terminal("ok")
+    assert terminal["accepted_chars"] == 11
+    assert terminal["segments"] == 3
+    assert terminal["ttfb"] is not None
+    assert terminal["audio_duration"] == pytest.approx(0.48)
+    assert isinstance(terminal["rtf"], float)
+    assert terminal["rtf"] >= 0
 
 
 @pytest.mark.parametrize(

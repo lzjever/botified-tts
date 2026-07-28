@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 import signal
 from collections.abc import Generator, Iterable
 
@@ -17,6 +19,7 @@ GRACEFUL_SHUTDOWN_SECONDS = 10
 SHUTDOWN_TIMEOUT_SECONDS = 15
 CLEANUP_TIMEOUT_SECONDS = 15
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+_LOGGER = logging.getLogger("uvicorn.error.botified_tts")
 
 
 class RuntimeServer(uvicorn.Server):
@@ -76,6 +79,7 @@ async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
             installed_signals.append(handled_signal)
 
         readiness.ready = True
+        _LOGGER.info('{"event":"ready"}')
         http_task = asyncio.create_task(server.serve())
         fatal_task = asyncio.create_task(engine.wait_for_fatal())
         done, _ = await asyncio.wait(
@@ -190,4 +194,14 @@ def _consume_task_result(task: asyncio.Task[None]) -> None:
 
 
 def main() -> None:
-    asyncio.run(serve(Settings.from_env()))
+    try:
+        asyncio.run(serve(Settings.from_env()))
+    except Exception:
+        _LOGGER.critical(
+            json.dumps(
+                {"event": "fatal", "result": "engine_error"},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1) from None

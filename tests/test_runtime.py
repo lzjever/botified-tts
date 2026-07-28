@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -106,7 +107,9 @@ def _install_composition(
 def test_normal_http_shutdown_cancels_fatal_waiter_and_closes_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.botified_tts")
     async def exercise() -> tuple[_FakeEngine, SimpleNamespace, list[object]]:
         events: list[object] = []
 
@@ -152,6 +155,13 @@ def test_normal_http_shutdown_cancels_fatal_waiter_and_closes_once(
     assert "fatal.cancel" in events
     assert captured.readiness.ready is False
     assert engine.close_calls == 1
+    ready_logs = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "uvicorn.error.botified_tts"
+        and json.loads(record.getMessage()).get("event") == "ready"
+    ]
+    assert ready_logs == [{"event": "ready"}]
 
 
 def test_http_error_is_propagated_after_fatal_waiter_is_cancelled(
@@ -603,6 +613,7 @@ def test_fatal_with_blocking_close_is_bounded_and_preserves_fatal(
 def test_main_loads_environment_and_runs_serve(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = _settings(tmp_path)
     calls: list[object] = []
@@ -621,3 +632,22 @@ def test_main_loads_environment_and_runs_serve(
     runtime.main()
 
     assert calls == ["settings", ("serve", settings)]
+
+    async def failing_serve(_: Settings) -> None:
+        raise RuntimeError("RAW_FATAL_SENTINEL")
+
+    monkeypatch.setattr(runtime, "serve", failing_serve)
+    with pytest.raises(SystemExit) as caught:
+        runtime.main()
+
+    assert caught.value.code == 1
+    fatal_logs = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "uvicorn.error.botified_tts"
+        and json.loads(record.getMessage()).get("event") == "fatal"
+    ]
+    assert fatal_logs == [{"event": "fatal", "result": "engine_error"}]
+    assert "RAW_FATAL_SENTINEL" not in "\n".join(
+        record.getMessage() for record in caplog.records
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import wave
 from collections.abc import AsyncIterator
 
@@ -12,6 +13,7 @@ from starlette.testclient import TestClient
 from botified_tts.app import Readiness, create_app
 from botified_tts.engine import EngineError
 from botified_tts.schemas import SynthesisOptions
+from botified_tts.speech import SynthesisSummary
 from botified_tts.voices import InvalidVoice, VoiceMetadata
 
 
@@ -29,13 +31,21 @@ class FakeSpeech:
         self,
         options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
-        received = [segment async for segment in segments]
+        received: list[str] = []
+        async for segment in segments:
+            received.append(segment)
+            if summary is not None:
+                summary.record_segment()
         self.calls.append((options, received))
         if self.error is not None:
             raise self.error
-        yield PCM[:2]
-        yield PCM[2:]
+        for chunk in (PCM[:2], PCM[2:]):
+            if summary is not None:
+                summary.record_pcm(chunk)
+            yield chunk
 
 
 class FakeVoices:
@@ -73,12 +83,13 @@ class FakeVoices:
 
 def _client(
     *,
+    api_key: str = "test-secret",
     readiness: Readiness | None = None,
     voices: FakeVoices | None = None,
     speech: FakeSpeech | None = None,
 ) -> TestClient:
     app = create_app(
-        api_key="test-secret",
+        api_key=api_key,
         model=MODEL,
         readiness=readiness or Readiness(ready=True),
         voices=voices or FakeVoices(),
@@ -96,6 +107,30 @@ def _error(code: str, message: str, error_type: str) -> dict[str, object]:
             "code": code,
         }
     }
+
+
+_SUMMARY_FIELDS = {
+    "id",
+    "voice_type",
+    "mode",
+    "accepted_chars",
+    "segments",
+    "ttfb",
+    "audio_duration",
+    "rtf",
+    "result",
+}
+
+
+def _summaries(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    values: list[dict[str, object]] = []
+    for record in caplog.records:
+        if record.name != "uvicorn.error.botified_tts":
+            continue
+        value = json.loads(record.getMessage())
+        if set(value) == _SUMMARY_FIELDS:
+            values.append(value)
+    return values
 
 
 def test_health_is_public_and_ready_gate_precedes_protected_work() -> None:
@@ -170,7 +205,10 @@ def test_invalid_authorization_is_rejected_before_business_logic(
     assert speech.calls == []
 
 
-def test_speech_uses_the_segmenter_and_returns_one_canonical_wav() -> None:
+def test_speech_uses_the_segmenter_and_returns_one_canonical_wav(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.botified_tts")
     speech = FakeSpeech()
     with _client(speech=speech) as client:
         response = client.post(
@@ -195,6 +233,18 @@ def test_speech_uses_the_segmenter_and_returns_one_canonical_wav() -> None:
     options, segments = speech.calls[0]
     assert options.style == "自然"
     assert segments == ["第一句。", "第二句。"]
+    summaries = _summaries(caplog)
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert str(summary["id"]).startswith("req_")
+    assert summary["voice_type"] == "default"
+    assert summary["mode"] is None
+    assert summary["accepted_chars"] == 8
+    assert summary["segments"] == 2
+    assert isinstance(summary["ttfb"], float)
+    assert summary["audio_duration"] == pytest.approx(len(PCM) / 96_000)
+    assert summary["rtf"] == 0.0
+    assert summary["result"] == "ok"
 
 
 @pytest.mark.parametrize(
@@ -250,19 +300,51 @@ def test_speech_maps_public_input_and_engine_errors(
     }
 
 
-def test_unexpected_exception_is_fixed_engine_error_without_details() -> None:
-    secret = "database-password-must-not-leak"
-    with _client(speech=FakeSpeech(RuntimeError(secret))) as client:
+def test_terminal_summary_does_not_log_sensitive_content_or_raw_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="uvicorn.error.botified_tts")
+    sentinels = {
+        "TEXT_SENTINEL",
+        "STYLE_SENTINEL",
+        "DESCRIPTION_SENTINEL",
+        "REFERENCE_SENTINEL",
+        "TRANSCRIPT_SENTINEL",
+        "AUDIO_SENTINEL",
+        "LATENT_SENTINEL",
+        "API_KEY_SENTINEL",
+        "RAW_EXCEPTION_SENTINEL",
+    }
+    upstream = RuntimeError("|".join(sorted(sentinels - {"API_KEY_SENTINEL"})))
+    with _client(
+        api_key="API_KEY_SENTINEL",
+        speech=FakeSpeech(upstream),
+    ) as client:
         response = client.post(
             "/v1/speech",
-            headers=AUTH,
-            json={"text": "hello"},
+            headers={"Authorization": "Bearer API_KEY_SENTINEL"},
+            json={
+                "text": "TEXT_SENTINEL",
+                "style": "STYLE_SENTINEL",
+                "voice": {
+                    "type": "design",
+                    "description": "DESCRIPTION_SENTINEL",
+                },
+            },
         )
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "engine_error"
     assert response.json()["error"]["type"] == "server_error"
-    assert secret not in response.text
+    summaries = _summaries(caplog)
+    assert len(summaries) == 1
+    assert summaries[0]["result"] == "engine_error"
+    application_logs = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "uvicorn.error.botified_tts"
+    )
+    assert all(sentinel not in application_logs for sentinel in sentinels)
 
 
 class BlockingSpeech:
@@ -275,13 +357,18 @@ class BlockingSpeech:
         self,
         _options: SynthesisOptions,
         segments: AsyncIterator[str],
+        *,
+        summary: SynthesisSummary | None = None,
     ) -> AsyncIterator[bytes]:
         async for _ in segments:
-            pass
+            if summary is not None:
+                summary.record_segment()
         self.entered += 1
         if self.entered == 16:
             self.full.set()
         await self.release.wait()
+        if summary is not None:
+            summary.record_pcm(PCM)
         yield PCM
 
 

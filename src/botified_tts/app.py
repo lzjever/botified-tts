@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import time
+import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass
 
@@ -25,7 +28,7 @@ from botified_tts.schemas import (
     parse_speech_request,
 )
 from botified_tts.segmenter import Segmenter
-from botified_tts.speech import SpeechService
+from botified_tts.speech import SpeechService, SynthesisSummary
 from botified_tts.streaming import _StreamingSession
 from botified_tts.voices import (
     MAX_UPLOAD_BYTES,
@@ -158,8 +161,15 @@ def create_app(
                 error_type="server_error",
                 headers={"Retry-After": "1"},
             )
+        summary = SynthesisSummary(
+            id=f"req_{uuid.uuid4().hex}",
+            ttfb_started_at=time.monotonic(),
+        )
+        result = "engine_error"
         try:
             speech_request = await _parse_speech_body(request)
+            summary.set_options(speech_request.options)
+            summary.accept_text(speech_request.text)
             segments = _segment_text(speech_request)
             try:
                 chunks = [
@@ -167,25 +177,38 @@ def create_app(
                     async for chunk in speech.synthesize(
                         speech_request.options,
                         segments,
+                        summary=summary,
                     )
                 ]
             except InvalidVoice as error:
+                result = "invalid_voice"
                 raise _ApiError(404, "invalid_voice", str(error)) from error
             except InvalidSynthesisOptions as error:
+                result = "invalid_request"
                 raise _ApiError(400, "invalid_request", str(error)) from error
             except EngineError as error:
+                result = "engine_error"
                 raise _ApiError(
                     500,
                     "engine_error",
                     "Speech synthesis failed",
                     error_type="server_error",
                 ) from error
-            return Response(
+            response = Response(
                 pcm_s16le_chunks_to_wav(chunks),
                 media_type="audio/wav",
             )
+            result = "ok"
+            return response
+        except _ApiError as error:
+            result = error.code
+            raise
+        except asyncio.CancelledError:
+            result = "cancelled"
+            raise
         finally:
             admission.release()
+            summary.log_terminal(result)
 
     async def create_voice(request: Request) -> Response:
         authorize(request)

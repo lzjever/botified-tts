@@ -105,6 +105,23 @@ def test_possible_official_tag_prefix_is_protected_across_appends() -> None:
     assert segmenter.append("ing]结束。") == ["[laughing]结束。"]
 
 
+def test_overlong_decimal_is_bounded_without_losing_text_or_splitting_tag() -> None:
+    first = "1" * 2500 + "." + "2" * 2500 + "界" * 1000 + "x" * 155 + "[laugh"
+    second = "ing]结束。"
+    segmenter = Segmenter()
+
+    segments = segmenter.append(first)
+    assert len(segmenter.pending_text.encode("utf-8")) < 4096
+    segments.extend(segmenter.append(second))
+    assert len(segmenter.pending_text.encode("utf-8")) < 4096
+    segments.extend(segmenter.finish())
+
+    assert "".join(segments) == first + second
+    assert all(segments)
+    assert sum("[laughing]" in segment for segment in segments) == 1
+    assert all("[laugh" not in segment or "[laughing]" in segment for segment in segments)
+
+
 def test_deadline_expiration_is_pure_state_and_fires_at_12_characters() -> None:
     segmenter = Segmenter()
 

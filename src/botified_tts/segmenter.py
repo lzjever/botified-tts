@@ -141,6 +141,10 @@ class Segmenter:
         for cut in range(HARD_MAX_CHARS, 0, -1):
             if self._is_safe_cut(cut, protected):
                 return cut
+        official_tags = self._official_tag_ranges()
+        for cut in range(HARD_MAX_CHARS, 0, -1):
+            if self._is_safe_cut(cut, official_tags):
+                return cut
         return None
 
     def _deadline_cut(self) -> int | None:
@@ -159,20 +163,11 @@ class Segmenter:
         return None
 
     def _protected_ranges(self) -> list[_ProtectedRange]:
-        ranges: list[_ProtectedRange] = []
-
-        for start, char in enumerate(self._buffer):
-            if char != "[":
-                continue
-
-            remainder = self._buffer[start:]
-            complete = next((tag for tag in OFFICIAL_TAGS if remainder.startswith(tag)), None)
-            if complete is not None:
-                ranges.append(_ProtectedRange(start, start + len(complete)))
-            elif any(tag.startswith(remainder) for tag in OFFICIAL_TAGS):
-                ranges.append(_ProtectedRange(start, len(self._buffer), protect_end=True))
-
-        ranges.extend(_ProtectedRange(match.start(), match.end()) for match in _DECIMAL.finditer(self._buffer))
+        ranges = self._official_tag_ranges()
+        ranges.extend(
+            _ProtectedRange(match.start(), match.end())
+            for match in _DECIMAL.finditer(self._buffer)
+        )
 
         trailing_decimal = _TRAILING_DECIMAL_PREFIX.search(self._buffer)
         if trailing_decimal is not None:
@@ -184,6 +179,20 @@ class Segmenter:
                 )
             )
 
+        return ranges
+
+    def _official_tag_ranges(self) -> list[_ProtectedRange]:
+        ranges: list[_ProtectedRange] = []
+        for start, char in enumerate(self._buffer):
+            if char != "[":
+                continue
+
+            remainder = self._buffer[start:]
+            complete = next((tag for tag in OFFICIAL_TAGS if remainder.startswith(tag)), None)
+            if complete is not None:
+                ranges.append(_ProtectedRange(start, start + len(complete)))
+            elif any(tag.startswith(remainder) for tag in OFFICIAL_TAGS):
+                ranges.append(_ProtectedRange(start, len(self._buffer), protect_end=True))
         return ranges
 
     def _is_safe_cut(self, cut: int, protected: list[_ProtectedRange]) -> bool:
