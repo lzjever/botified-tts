@@ -49,6 +49,18 @@ class _FakeEngine:
             raise self.close_error
 
 
+def test_uvicorn_runtime_can_accept_websocket_upgrades() -> None:
+    config = runtime.uvicorn.Config(
+        object(),
+        ws="auto",
+        log_config=None,
+    )
+
+    config.load()
+
+    assert config.ws_protocol_class is not None
+
+
 def _install_composition(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,

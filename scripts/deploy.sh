@@ -126,6 +126,58 @@ preflight() {
         || fail "fixed CUDA runtime cannot access HOST_GPU=${HOST_GPU}"
 }
 
+websocket_smoke() {
+    if ! HOST_GPU="${HOST_GPU}" \
+        PUBLISHED_PORT="${PUBLISHED_PORT}" \
+        BOTIFIED_TTS_API_KEY="${BOTIFIED_TTS_API_KEY}" \
+        timeout 20 docker compose \
+            --file "${COMPOSE_FILE}" \
+            exec -T tts python - <<'PY'
+import json
+import os
+
+from websockets.sync.client import connect
+
+
+def receive_json(websocket):
+    message = websocket.recv(timeout=5)
+    assert isinstance(message, str), "expected a JSON text message"
+    value = json.loads(message)
+    assert isinstance(value, dict), "expected a JSON object"
+    return value
+
+
+api_key = os.environ["BOTIFIED_TTS_API_KEY"]
+with connect(
+    "ws://127.0.0.1:8000/v1/speech/stream",
+    additional_headers={"Authorization": f"Bearer {api_key}"},
+    open_timeout=5,
+    close_timeout=5,
+    proxy=None,
+) as websocket:
+    websocket.send(json.dumps({"type": "start"}))
+    assert receive_json(websocket) == {
+        "type": "ready",
+        "audio": {
+            "encoding": "pcm_s16le",
+            "sample_rate": 48_000,
+            "channels": 1,
+        },
+    }
+    websocket.send(json.dumps({"type": "cancel"}))
+    assert receive_json(websocket) == {
+        "type": "done",
+        "cancelled": True,
+    }
+PY
+    then
+        deployment_diagnostics
+        fail "WebSocket smoke failed"
+    fi
+
+    printf 'WebSocket start/cancel smoke passed.\n'
+}
+
 smoke() {
     local temp_dir
     local wav_file
@@ -212,6 +264,7 @@ main() {
         deployment_diagnostics
         fail "service did not become healthy"
     fi
+    websocket_smoke
     smoke
 }
 
