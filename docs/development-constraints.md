@@ -55,6 +55,13 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - 只使用 VoxCPM2 和 Nano-vLLM-VoxCPM，不建立通用模型插件系统。
 - Botified 对接只使用本仓库内的薄 companion；它使用独立轻量依赖，不加入根
   Python package 或根 uv workspace，也不引入 Torch/CUDA。
+- Docker、Skill helper 和 companion 共用同一份 `botified-tts.env`；helper 与
+  companion 只安全解析其中恰好一条 API key。token 必须是不加引号的
+  `[A-Za-z0-9._~-]+`，按第一个 `=` 后的字面值读取，不 quote、interpolate 或
+  source shell。helper 的 URL 只用 `BOTIFIED_TTS_URL`，companion 的 URL 只用
+  `--tts-url`。
+- 固定模型 spec 只保存 repo ID 和 revision；模型 cache 只从 `Settings` 的
+  data dir 与 model source 推导，不保存第二份路径配置。
 - 只保留当前产品需要的 VoiceStore、合成、分段、音频和部署模块。
 - 只有出现真实重复或明确 ownership 问题时才增加抽象。
 - 不为目录整齐而预拆 domain、repository、service、use-case 等层级。
@@ -68,9 +75,10 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - 不测试测试脚本、fixture、mock 调用顺序、报告生成器或 gate 是否存在。
 - 不重复测试上游框架和推理库已经覆盖的内部行为。
 - 不为假设场景建立大规模参数、语言、并发或故障矩阵。
-- 按风险选择最小验证范围；需要 CUDA 事实时使用一次真实 GPU smoke，不用复杂
-  模拟器代替硬件结论。
-- 同一个行为不得在 unit、integration、smoke 和人工验收中重复建设多套等价测试。
+- 按风险选择最小验证范围；需要 CUDA 事实时使用一份可选运行的真实 GPU
+  integration，不用复杂模拟器代替硬件结论。
+- 同一个行为不得在 unit、service integration 和 GPU integration 中重复建设
+  多套等价测试。
 
 ## 6. 范围控制
 
@@ -81,12 +89,13 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - VoxCPM2 原生 Voice Design、音色克隆、style 和非语言标签；
 - 服务端分段与跨段 continuation；
 - 最小音色创建、列表和删除；
-- CUDA-only 一键部署；
+- CUDA-only；普通用户使用公开的固定版本镜像、私有 env-file 和唯一
+  `docker run`；
 - 本仓库内的最小 Botified companion；
 - 最小 Agent Skill。
 
 OpenAI 兼容、Artifact/Job、多 GPU 调度、多租户治理、复杂播放状态、自动质量
-平台、LoRA 和其他模型不因“将来可能需要”进入项目。
+平台、LoRA、Compose、部署脚本和其他模型不因“将来可能需要”进入项目。
 
 新增范围必须来自明确业务需求。实现过程中发现任何偏离本边界的代码或文档，
 立即原地清理。
