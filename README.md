@@ -187,3 +187,18 @@ For focused development checks:
 ```bash
 uv run pytest -q tests/test_api.py tests/test_streaming.py tests/test_skill_helper.py
 ```
+
+On a CUDA development machine, run the focused real-engine smoke from the
+repository root:
+
+```bash
+uv run python tests/gpu_smoke.py \
+  --data-dir /var/tmp/botified-tts-gpu-smoke/data \
+  --output-dir /var/tmp/botified-tts-gpu-smoke/output
+```
+
+`--data-dir` holds the model cache and temporary runtime data.
+`--output-dir` receives the generated WAV files. The script covers CUDA
+preflight, model loading and warmup, ordinary speech, Voice Design, both clone
+modes, style, native tags, continuation, incremental text before `finish`,
+stream cancellation, fixed PCM chunks, RTF, and idle Nano child failure.
