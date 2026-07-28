@@ -1,6 +1,6 @@
 # Botified TTS 产品开发计划
 
-> 状态：后续产品改进已收敛，可交付开发
+> 状态：产品与架构收敛完成，可交付开发
 > 目标仓库：`botified-tts`
 > 研究基线：2026-07-27
 > 项目约束：`docs/development-constraints.md`；发生冲突时以项目约束为准
@@ -31,8 +31,7 @@ PCM；它不是第二个服务或通用 bridge。
 6. 服务端完成句子级分段，并利用上一完整语音段保持跨段连续性。
 7. 支持可复用音色的创建、列表和删除。
 8. 无 CUDA 时在模型下载和加载前明确失败，不尝试 CPU。
-9. 普通用户使用公开的固定版本 CUDA 镜像、私有 env-file 和唯一
-   `docker run`。
+9. 使用 Docker Compose 一键部署。
 10. 提供本仓库内的最小 Botified companion。
 11. 提供一个最小 Agent Skill。
 
@@ -46,7 +45,7 @@ PCM；它不是第二个服务或通用 bridge。
 - 一个服务实例使用一张 GPU。
 - 一个合成核心同时服务 HTTP 和 WebSocket。
 - 一个本地目录保存注册音色，不引入数据库。
-- 一个生产启动命令：`docker run`。
+- 一个 Docker Compose 部署方式。
 - 仅支持当前 Botified 所需的纯文本输入和两种输出方式。
 - companion 使用独立的轻量 Python 项目，不加入服务根 package 或根 uv
   workspace，也不安装 Torch/CUDA 依赖。
@@ -76,9 +75,7 @@ PCM；它不是第二个服务或通用 bridge。
 | 语气词和非语言声音 | 直接写入 `text` 的 VoxCPM2 原生标签 |
 | 跨段连续性 | 上一个完整生成段的 text + generated latents |
 | 中断 | 取消并结束当前 WebSocket session |
-| 普通用户部署 | 固定版本 GHCR image + env-file + `docker run` |
-| Power user 构建 | 根目录 Dockerfile |
-| 开发者运行 | 根目录 `uv.lock` + `uv` |
+| 部署 | `./scripts/deploy.sh` |
 
 ## 3. 产品边界
 
@@ -99,8 +96,7 @@ PCM；它不是第二个服务或通用 bridge。
 - 最小本地音色创建、列表和删除。
 - 文本自动分段、强制 flush、finish 和 cancel。
 - CUDA preflight、模型 warmup、健康检查。
-- 公开的 Linux x86_64 CUDA 固定版本镜像。
-- 私有 env-file 和唯一 `docker run` 生产启动方式。
+- Docker Compose 一键部署。
 - Botified 调用示例和最小 Agent Skill。
 - 本仓库内消费 Botified `stream_text`、调用 WebSocket、播放 PCM 并转发
   barge-in cancel 的薄 companion。
@@ -122,12 +118,6 @@ PCM；它不是第二个服务或通用 bridge。
 - 多 GPU 调度、sticky routing 和故障迁移。
 - LoRA 训练、在线加载或音色微调。
 - Prometheus 平台、自动音质评分或大规模 benchmark 矩阵。
-- Docker Compose、部署脚本、systemd、Kubernetes 和 Podman 安装器。
-- 自动选择模型下载源、下载失败后的跨源 fallback。
-- 把 VoxCPM2 权重打包进应用镜像。
-- 多架构镜像和中国镜像 registry 同步。
-- 项目许可证选择；这是用户或产品 owner 另行作出的法律决定，不分配给开发团队，
-  本计划不作推荐。
 - Voice Profile 授权证明、来源核验、滥用检测和合规审计。
 - 多租户、用户、组织、RBAC、计费和管理后台。
 
@@ -423,7 +413,7 @@ HTTP body 和 WebSocket `start` 共用一个 `SynthesisOptions`：
 HTTP body 是 `text + SynthesisOptions`；WebSocket `start` 只包含
 `SynthesisOptions`，文本由后续 `append` 提供。
 
-`cfg_value`、`temperature` 和 `inference_timesteps` 在当前推理基线固定为服务内部
+`cfg_value`、`temperature` 和 `inference_timesteps` 在 Phase 0 固定为服务内部
 默认值，不进入公共 API。`max_generate_length` 由 `VoxCPMEngine` 使用与 Nano
 相同的 tokenizer 对本次实际完整 target text 计数；首段 control prefix 也参与
 计数。公式固定为 `min(target_token_count * 6 + 10, 2000)`。
@@ -444,7 +434,7 @@ ready 时：
 {
   "status": "ready",
   "cuda": true,
-  "model": "VoxCPM2",
+  "model": "openbmb/VoxCPM2",
   "sample_rate": 48000
 }
 ```
@@ -452,8 +442,8 @@ ready 时：
 服务只在 CUDA preflight、模型加载和 warmup 成功后开始接受请求。正常运行时
 `/health` 返回 ready `200`；runtime fatal 一经发现就撤销 ready 并开始有界
 停服，在退出窗口不得继续返回 ready。preflight 或模型加载失败时记录稳定错误码
-并退出，不启动一个长期返回 `503` 的后台状态服务。容器进程退出就是启动失败；
-Docker `HEALTHCHECK` 只观察 `/health` 是否 ready。
+并退出，不启动一个长期返回 `503` 的后台状态服务。deploy 脚本通过容器退出或
+health timeout 判断启动失败。
 
 Nano `wait_for_ready()` 不包含首次 generation compile；warmup 必须实际完成一条
 固定短文本生成并丢弃结果，不能只等待 worker ready。
@@ -482,9 +472,6 @@ iterator，最后封装成一个 48 kHz mono WAV。它不创建 job、artifact �
 ```http
 Authorization: Bearer <BOTIFIED_TTS_API_KEY>
 ```
-
-`BOTIFIED_TTS_API_KEY` 只允许不加引号的 `[A-Za-z0-9._~-]+`。服务 `Settings`、
-Skill helper 和 companion 使用同一校验规则。
 
 这是内部服务的最小访问边界，不增加账号、角色、租户或审计体系。
 
@@ -813,6 +800,10 @@ spoken-only 没有可观察优势，分支已删除，不作为配置或备用�
 - crossfade；
 - 断线恢复。
 
+技术 spike 必须确认该方法相较每段只使用静态 reference 没有明显的重复音素、
+截断、异常静音或持续语速漂移。验证通过后只保留 continuation 实现，不将两种
+策略做成公开配置。
+
 ## 12. Nano-vLLM-VoxCPM 集成
 
 ### 12.1 选择 Nano
@@ -868,9 +859,8 @@ fork 的 focused tests 只证明本项目新增的边界行为：关闭 AsyncPoo
 确实关闭 inner stream；step exception/child exit 会使 active、pending、后续
 submit 和 fatal waiter 全部有界失败。waiter 同时覆盖 fatal 前等待、fatal 后
 立即失败、AsyncPool 任一 child fatal 和 normal stop 不误报。cancel 的实际
-child 释放只在同一份真实 GPU integration 中验证一次，不再复制等价测试。idle
-child fatal 只有在 Nano 提供稳定 owner 接口时才做一次真实验证；不得通过读取
-或修改私有进程拓扑实现。
+child 释放和 idle child kill 只在同一份真实 GPU 部署 smoke 中各验证一次，不再
+复制等价测试。
 
 fork 不包含：
 
@@ -915,66 +905,15 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
 - `pyproject.toml` 和 `uv.lock` 不包含未使用的 torchcodec。
 - Hatch 仅为当前固定的 FlashAttention wheel direct reference 启用
   `allow-direct-references`，不增加第二套依赖安装路径。
-- 模型下载源是唯一公开选择，必须显式设置
-  `BOTIFIED_TTS_MODEL_SOURCE=modelscope|huggingface`，没有默认值，不根据地区
-  或 model ID 猜测，也不在下载失败后切换来源。
-- 应用内部固定且只支持以下两份 spec：
-
-  | source | model ID | immutable revision |
-  |---|---|---|
-  | `modelscope` | `OpenBMB/VoxCPM2` | `2e7c0dfff6646cef46c8bf106460a3dbce23a591` |
-  | `huggingface` | `openbmb/VoxCPM2` | `bffb3df5a29440629464e5e839f4d214c8714c3d` |
-
-- 不再公开 `BOTIFIED_TTS_MODEL` 或 `BOTIFIED_TTS_MODEL_REVISION`。升级模型必须
-  修改内部 spec、运行现有测试并随新镜像版本发布，不能由运行用户拼接任意组合。
-- Hugging Face 使用现有固定 `huggingface-hub`；ModelScope 只增加轻量固定依赖
-  `modelscope-hub==0.1.8`，不引入完整 ModelScope 平台。CUDA preflight 必须早于
-  两个 SDK 的 import 和下载。
-- 选择 source 后只计算一次：
-
-  ```python
-  cache_dir = settings.data_dir / "model-cache" / settings.model_source
-  ```
-
-- Hugging Face 路径只使用现代 SDK：
-
-  ```python
-  from huggingface_hub import snapshot_download
-
-  local_path = snapshot_download(
-      repo_id=spec.repo_id,
-      revision=spec.revision,
-      cache_dir=cache_dir,
-  )
-  ```
-
-- ModelScope 路径只使用现代 `modelscope-hub` API，不使用顶层或兼容层
-  `snapshot_download`：
-
-  ```python
-  from modelscope_hub import HubApi
-
-  api = HubApi()
-  local_path = api.download_repo(
-      repo_id=spec.repo_id,
-      repo_type="model",
-      revision=spec.revision,
-      cache_dir=cache_dir,
-  )
-  ```
-
-- 固定 spec 只包含 repo ID 和 revision。cache 只由
-  `settings.data_dir / "model-cache" / settings.model_source` 计算，两个 SDK
-  都传入该值，再把本地 snapshot path 传给 Nano；生产环境解析为
-  `/data/model-cache/<source>`，上述开发命令解析为
-  `$PWD/.data/model-cache/<source>`。未选 SDK 不 import，失败直接返回
-  `model_load_failed`。
+- VoxCPM2 使用不可变 Hugging Face revision。容器通过 CUDA preflight 后，应用
+  调用 `snapshot_download(repo_id, revision=<immutable-sha>,
+  cache_dir=/data/model-cache)`，再把返回的本地 snapshot path 传给 Nano。
+  不把 repo ID 直接传给 Nano，因为当前 Nano 的下载路径不接受 revision。
 - 运行时不得 `pip install -U`。
 - 不建设逐文件 hash、processor fingerprint 或 release attestation 平台。
-- 不在运行时重复校验模型仓库逐文件 hash，也不对两个内容一致的来源重复运行
-  完整 GPU 路径。
+- 每次升级只运行本项目的 focused GPU smoke 和 Botified 端到端验收。
 
-## 13. 三条运行路径与Botified集成说明
+## 13. CUDA 与一键部署
 
 ### 13.1 支持环境
 
@@ -983,7 +922,7 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
 - Linux x86_64；
 - CUDA 可见且所选 device 有效的 NVIDIA GPU；
 - CUDA 12.x 兼容驱动；
-- Docker 和 NVIDIA Container Toolkit；
+- Docker、Docker Compose 和 NVIDIA Container Toolkit；
 - 单个可见 GPU。
 
 不支持 CPU fallback、Apple Silicon、Windows 或 ROCm。
@@ -991,22 +930,32 @@ optional extra 或备用解码路径。系统 FFmpeg 是 Botified `VoiceStore` �
 当前 verified baseline 为 RTX 4090 24,564 MiB、compute capability 8.9、driver
 575.64.05（driver CUDA capability 12.9）。隔离运行环境为 Python 3.12.13、
 PyTorch/torchaudio 2.9.0+cu126、Triton 3.5.0、FlashAttention 2.8.3，以及第
-12.3 节固定的 CUDA 12.6.3 runtime、uv 0.10.8、FFmpeg、
-NumPy/Numba/llvmlite 和两份模型 spec。
+12.3 节固定的 CUDA 12.6.3 runtime、uv 0.10.8、FFmpeg 和
+NumPy/Numba/llvmlite；模型 revision 为
+`bffb3df5a29440629464e5e839f4d214c8714c3d`。
 
 该环境 warm generation 的 TTFB 为 0.1408 秒、生成阶段 RTF 为 0.1130；
 `wait_for_ready()` 约 17.89 秒后首次 generation 仍有约 12.25 秒 compile，因此
 ready 前必须执行真实生成 warmup。`gpu_memory_utilization=0.8` 时观测峰值显存
 18,849 MiB。以上只证明当前 4090 配置，不代表最低显存或最低 compute
-capability。其他 CUDA GPU 可以启动尝试但标记为未验证；应用不根据未经实测的
-硬件阈值拒绝设备。
+capability。其他 CUDA GPU 可以启动尝试但标记为未验证；部署脚本不根据未经实测
+的硬件阈值拒绝设备。
 
 ### 13.2 CUDA fail-fast
 
-`docker run --gpus` 负责在 NVIDIA Container Toolkit 或指定宿主 GPU 不可用时
-直接失败。容器只暴露用户选择的一张宿主 GPU，因此应用固定使用容器内 device
-0。应用 entrypoint 在 import 模型下载 SDK、初始化 Nano 和下载 VoxCPM2 权重
-前检查：
+`./scripts/deploy.sh` 在构建镜像/启动前检查：
+
+1. `docker`；
+2. `docker compose`；
+3. `nvidia-smi`；
+4. 所选 GPU device 是否存在，并输出型号、显存和 compute capability 供故障
+   定位。
+
+host preflight 检查 `HOST_GPU` 指定的宿主物理设备；Compose 只把该设备暴露给
+容器，所以下面的容器 preflight 固定检查逻辑 device 0。
+
+应用镜像构建完成后，容器 entrypoint 在 import/初始化 Nano 和下载 VoxCPM2
+权重前检查 Docker 内 GPU 可见性：
 
 ```python
 torch.cuda.is_available()
@@ -1022,135 +971,73 @@ selected_device_is_valid
 - 不创建 Nano worker；
 - 不尝试 CPU。
 
-Power user 构建镜像不要求构建机有 GPU；GPU 事实只在容器实际启动时判断。不再
-维护第二套 host preflight 脚本。
-
-### 13.3 三条使用路径
-
-普通 TTS 服务消费者不需要 checkout 仓库，只使用公开固定版本镜像、私有
-env-file 和唯一生产启动命令：
+### 13.3 唯一部署方式
 
 ```bash
-docker run -d \
-  --name botified-tts \
-  --restart on-failure:3 \
-  --gpus '"device=0"' \
-  --env-file ./botified-tts.env \
-  -p 8000:8000 \
-  -v botified-tts-data:/data \
-  ghcr.io/lzjever/botified-tts:v0.1.0
+./scripts/deploy.sh
 ```
 
-宿主 GPU index 和发布端口只通过 `--gpus` 与 `-p` 选择，不进入应用 env。
-`botified-tts-data` 持久保存：
+脚本：
+
+1. 完成 CUDA preflight；
+2. 自动生成或读取权限为 `0600` 的 `deploy/.env`；文件或 API key 不存在时
+   生成 32-byte 随机 ASCII key，不要求用户预先提供；
+3. 使用固定 base image digest 的 Dockerfile 执行 `docker compose build`；
+4. `docker compose up -d --wait --wait-timeout 900`；
+5. 通过容器 healthcheck 等待 `/health` ready；healthcheck 的 interval 和
+   timeout 均为 5 秒，最多重试 180 次；
+6. 在 180 秒 timeout 内生成一条固定短文本 WAV 作为 smoke。
+
+host CUDA preflight 失败时不开始 build。Docker 内 GPU 检测失败时不得下载
+VoxCPM2 模型权重。health timeout 或容器退出时，脚本输出容器状态和查看日志的
+命令并非零退出。
+
+Compose 挂载 `/data` 持久卷：
 
 ```text
 /data/voices
-/data/model-cache/modelscope
-/data/model-cache/huggingface
+/data/model-cache
 ```
 
 容器重建不重复下载模型或丢失注册音色。镜像包含 reference WAV/FLAC/MP3
-解码所需的 FFmpeg，并保留 Docker `HEALTHCHECK`；ready 表示 CUDA、模型下载、
-Nano 加载和 warmup 已完成。容器进程退出表示启动失败，`HEALTHCHECK` 只检查
-ready；运行后只用以下命令观察状态：
+解码所需的 FFmpeg。Compose 使用 NVIDIA `device_ids` 只暴露 `HOST_GPU`
+选择的一个宿主 GPU，使用 named volume 挂载 `/data`，并保留
+`restart: on-failure`；不增加容器内 worker restart。
 
-```bash
-docker inspect --format '{{.State.Health.Status}}' botified-tts
-```
+不同时维护 systemd、Podman、裸机 pip 和 Kubernetes 安装器。
 
-结果必须为 `healthy`。未达到 `healthy` 或容器退出时只查看：
-
-```bash
-docker logs botified-tts
-```
-
-部署验证不额外发起合成请求。不增加容器内 worker restart。
-
-Botified integrator 必须 checkout 当前仓库，才能让 Botified
-`skills.explicit` 指向 Skill，并用独立 nested uv 环境运行 companion。该路径
-不修改 Botified 仓库。
-
-开发者 checkout 当前仓库后直接运行：
-
-```bash
-command -v ffmpeg
-uv sync --locked
-uv run pytest -q
-# 可选：直接运行源码
-BOTIFIED_TTS_DATA_DIR="$PWD/.data" uv run --env-file ./botified-tts.env botified-tts
-```
-
-完整本地测试唯一额外系统依赖是 `ffmpeg`；找不到时在 `uv sync` 和测试前直接
-失败，不提供安装脚本、skip 或备用解码路径。
-
-开发时 `BOTIFIED_TTS_HOST`、`BOTIFIED_TTS_PORT`、`BOTIFIED_TTS_GPU_DEVICE` 和
-`BOTIFIED_TTS_DATA_DIR` 都是同一个 `Settings` 的可选 override；生产镜像固定
-这些值，普通用户的 env-file 不展示它们。这不是生产部署方式。
-
-Power user 使用根目录 Dockerfile：
-
-```bash
-docker build --platform linux/amd64 -t botified-tts:local .
-```
-
-构建完成后复用上面的 env-file、volume 和同一个 `docker run`，只替换 image
-名称。不保留 Compose、部署脚本、systemd、Podman、裸机 pip 或 Kubernetes
-安装器。
+首版不依赖尚未定义的镜像 registry、发布 owner 或应用镜像 digest。未来若明确
+要求发布预构建镜像，原地替换唯一部署路径，不与本地 build 长期并存。
 
 ### 13.4 配置
 
-普通用户的 `botified-tts.env` 权限必须为 `0600`，只包含两个必填值和一个可选
-值：
-
-```text
-BOTIFIED_TTS_API_KEY=replace_with_random_hex
-BOTIFIED_TTS_MODEL_SOURCE=modelscope
-BOTIFIED_TTS_LOG_LEVEL=INFO
-```
-
-`BOTIFIED_TTS_LOG_LEVEL` 可省略；`BOTIFIED_TTS_MODEL_SOURCE` 也可以显式写为
-`huggingface`。同一份 `botified-tts.env` 原样用于 Docker、Skill helper 和
-Botified companion，不再创建单独的 key file。helper 和 companion 只通过
-`--env-file ./botified-tts.env` 接收它，并安全解析恰好一条
-`BOTIFIED_TTS_API_KEY=`。值按第一个 `=` 后的字面内容读取，必须是不加引号的
-`[A-Za-z0-9._~-]+`；`Settings`、helper 和 companion 采用相同 grammar，不处理
-quote 或 interpolation，不把文件作为 shell 脚本 source。helper 的 URL 只读取
-`BOTIFIED_TTS_URL`；companion 的 URL 只接受 `--tts-url`。URL 不写入该文件。
-
-容器镜像固定：
+应用进程仍且只读取以下八个环境变量：
 
 ```text
 BOTIFIED_TTS_HOST=0.0.0.0
 BOTIFIED_TTS_PORT=8000
+BOTIFIED_TTS_MODEL=openbmb/VoxCPM2
+BOTIFIED_TTS_MODEL_REVISION=<immutable-revision>
 BOTIFIED_TTS_GPU_DEVICE=0
 BOTIFIED_TTS_DATA_DIR=/data
+BOTIFIED_TTS_API_KEY=<secret>
+BOTIFIED_TTS_LOG_LEVEL=INFO
 ```
 
-模型 ID 和 revision 不属于运行配置。Nano 内部调优值保留为代码中的已验证
-默认值，只有出现真实业务需求后才开放配置。
+`deploy/.env` 另允许两个只供 deploy script 和 Compose 插值的部署变量：
 
-### 13.5 `v0.1.0` 发布
+```text
+HOST_GPU=0
+PUBLISHED_PORT=8000
+```
 
-根 package 和 companion 的 `project.version` 都固定为 `0.1.0`；companion 跟随
-根 package 与仓库 tag，但不独立发布。首版发布只执行以下顺序：
+它们不注入应用容器，也不使用 `BOTIFIED_TTS_` 前缀。Compose 用 `HOST_GPU`
+选择宿主物理 GPU、用 `PUBLISHED_PORT` 发布服务；容器只看到所选 GPU，因此固定
+`BOTIFIED_TTS_GPU_DEVICE=0`，并固定监听 `BOTIFIED_TTS_PORT=8000`。其他应用
+配置仍通过上列已有变量传入，不增加 host GPU 或 published port 的应用变量。
 
-1. 在最终实现 commit 创建本地 Git tag `v0.1.0`。
-2. 同一台可信、磁盘充足且有 CUDA 的 host 从 `v0.1.0` clean checkout，使用根
-   Dockerfile 构建 Linux x86_64 image，并直接标记最终 local tag
-   `ghcr.io/lzjever/botified-tts:v0.1.0`。
-3. 在同一台 host 使用第 13.3 节唯一 `docker run` 启动这个 local image，并只
-   通过 Docker health 确认 `healthy`；失败时查看 `docker logs`。
-4. 健康后先推送 Git tag `v0.1.0`。
-5. 再推送同一个已经验证的 image，并将 GHCR package 设为 public。
-6. 创建一条简短 GitHub Release；正文只指向该固定 image，不附带 asset、
-   changelog 或报告。
-
-固定版本 tag 一经发布不覆盖。首版不增加 GitHub workflow、publish script、
-`latest` tag、attestation 或自动化发布平台。VoxCPM2 权重不进入镜像。
-
-中国镜像 registry 同步不在当前范围；只有出现真实拉取需求后，才把同一个固定
-版本 image 同步到一个明确 registry，不新增第二套构建。
+不同时维护 YAML 和第二套 service config。Nano 内部调优值保留为代码中的已验证
+默认值，只有出现真实部署调优需求后才开放配置。
 
 ## 14. Botified 与 Agent Skill
 
@@ -1166,19 +1053,10 @@ managed task。本仓库不修改 Botified 或 Botified Gateway。
 - 用户打断或新回答替换旧回答时，立即发送 `cancel` 并停止本地播放；
 - 把 PCM 交给宿主机 `aplay`；
 - 使用独立 `pyproject.toml` 和 `uv.lock`，运行时只依赖轻量 WebSocket client。
-- 只用 `--env-file ./botified-tts.env` 读取与服务部署相同格式的 API key，只
-  用 `--tts-url` 接收服务 URL。
-- 通过进程级 CLI 接收 immutable start options：`--voice-id` 与 `--design`
-  二选一，另支持 `--mode` 和 `--style`；每个初始或 replacement session 都
-  复用同一份 canonical `start`。
 
 companion 是 Botified managed task 启动的薄客户端，不是独立服务或通用 bridge。
 它接收已经适合朗读的纯文本并原样传递，不解析 Markdown/SSML。启用实时朗读的
 Botified 工作区应在其 `AGENTS.md` 中要求 Agent 输出适合朗读的纯文本。
-
-WebSocket 握手收到 `error` 时必须先解码安全的 code/message，再校验 `ready`
-audio。错误握手不创建 `aplay` sink；异常、stdout 和 stderr 都不包含 API key。
-不得把 `invalid_api_key` 等服务错误误报为 audio 不兼容。
 
 ### 14.2 Agent Skill
 
@@ -1187,7 +1065,7 @@ audio。错误握手不创建 `aplay` sink；异常、stdout 和 stderr 都不�
 ```text
 skills/voxcpm-tts/
 ├── SKILL.md
-└── scripts/botified-tts
+└── scripts/voxcpm-tts
 ```
 
 薄 helper 只提供：
@@ -1203,19 +1081,18 @@ speak
 `speak` 可以使用普通、Voice Design、controllable clone 和 faithful clone，并把
 WAV 写到显式输出路径。helper 复用公开 HTTP API，不实现第二套 TTS pipeline。
 
-helper 和 companion 使用同一参数 `--env-file ./botified-tts.env`。两者都只把
-该文件当作数据逐行读取，要求恰好一条 `BOTIFIED_TTS_API_KEY=`，拒绝缺失、重复
-或格式错误的 key，不 source shell，也不执行 shell 语法。helper 只从
-`BOTIFIED_TTS_URL` 读取 URL，不提供 URL CLI 参数；companion 只使用
-`--tts-url`，不读取 URL 环境变量。`speak --text` 必须是已经适合朗读的纯文本，
-可以包含 VoxCPM2 原生非语言标签。
+helper 只读取：
+
+```text
+BOTIFIED_TTS_URL
+```
+
+API key 只通过 `--api-key-file` 指向的明文文件读取，与 companion 使用同一种
+传递方式，避免 Botified 对 `*API_KEY*` 环境变量的过滤。`speak --text` 必须是
+已经适合朗读的纯文本，可以包含 VoxCPM2 原生非语言标签。
 
 Skill 用于 Agent 显式生成语音文件。它不能接管同一次 LLM 回答的逐 token
 stream；实时朗读由本仓库 companion 调用 WebSocket。
-
-Botified 只推荐一种发现方式：在其配置中让 `skills.explicit` 指向当前 checkout
-内的 `skills/voxcpm-tts/SKILL.md`。不推荐复制或 symlink Skill，不创建第二份
-helper。Botified 仓库始终只读。
 
 ## 15. 错误与日志
 
@@ -1289,7 +1166,7 @@ chunk 可发送的 monotonic elapsed time。RTF 是所有 segment 的推理 wall
 该摘要直接保存在请求/session 局部状态中，不增加 observer、event 或 metrics
 层。首版不建设 metrics endpoint 和 dashboard。出现实际运维需求后再增加。
 
-## 16. 最小测试范围
+## 16. 测试与验收
 
 测试只验证本项目拥有的行为，不重复测试 PyTorch、CUDA、FastAPI 或 Nano 的
 内部测试。
@@ -1308,19 +1185,13 @@ chunk 可发送的 monotonic elapsed time。RTF 是所有 segment 的推理 wall
 - admission slot 满时立即 `service_busy`，所有 HTTP/WS 结束路径都释放 slot。
 - 单个 append、累计已接受文本和未切分 buffer 的各自上限触发固定错误；累计文本
   不因进入 queue 或完成生成而重复计数或返还，所有终态都释放 session。
-- `MODEL_SOURCE` 缺失或非法时明确失败；两个固定 model spec 的参数正确，选中源
-  失败不调用另一来源。
-- CUDA preflight 失败时 Hugging Face、ModelScope 和 Nano 均未 import、下载或
-  创建。
-- `Settings`、helper 和 companion 共用 API key grammar；env-file parser 要求
-  恰好一条 `BOTIFIED_TTS_API_KEY=`，覆盖缺失、重复、空值、引号和非法字符，
-  并验证按第一个 `=` 后的字面值读取、不执行 shell 内容、不输出 secret。
+- CUDA preflight 失败时模型下载/加载函数没有被调用。
 
 Nano fork 的 focused unit tests 覆盖 `wait_for_fatal()` 的 wait-before-fatal、
 fatal-before-wait、AsyncPool 任一 child fatal，以及 normal stop 不触发 fatal。
 不在本项目重复模拟 Nano queue、process watcher 或 scheduler。
 
-### 16.2 API、service 与 companion integration
+### 16.2 API 集成测试
 
 使用一个最小 fake Nano adapter，只验证本项目协议：
 
@@ -1337,51 +1208,56 @@ fatal-before-wait、AsyncPool 任一 child fatal，以及 normal stop 不触发 
 fake 不模拟 Nano scheduler、KV cache、FlashAttention 或 CUDA OOM 的内部过程。
 
 companion 使用 fake Botified frames、fake TTS WebSocket 和 fake `aplay` 覆盖：
-文本顺序、immutable start options 在 replacement session 中复用、握手错误先于
-sink 创建且不泄露 key、finish 后不阻塞事件读取、barge-in cancel、旧 session
+文本顺序、start 选项、finish 后不阻塞事件读取、barge-in cancel、旧 session
 完成不影响新 session，以及所有后台任务和播放器均被回收。
 
-### 16.3 可选真实 GPU integration
+### 16.3 真实 GPU smoke
 
-仓库只保留一个显式运行的 `tests/gpu_integration.py`。同一个 engine 生命周期
-覆盖真正不同的 Nano 路径：
+一个脚本在目标 GPU 上依次覆盖：
 
-1. CUDA preflight、所选 source 下载、tokenizer、Nano pool create/load、
-   `wait_for_ready()` 和普通合成路径的真实 warmup；
-2. 用一次 Voice Design 生成结果创建并保存本次脚本复用的 clone reference
-   fixture；其 `prompt_text` 只保存生成音频实际朗读的 spoken text，明确排除
-   Voice Design 的 description/style control prefix，并同时作为 faithful 的
-   exact transcript；
-3. 使用该 fixture 完成 controllable clone + style 的 reference-role latent
-   路径；
-4. 使用同一 fixture 完成 faithful clone 的 prompt-role latent、exact
-   transcript 和 reference latent 路径；
-5. 完成两段 continuation；文本中只放一个 VoxCPM2 原生非语言 tag，第二段使用
-   第一段 terminal completion 的完整 generated latents；
-6. 关闭真实 outer stream 后 cancel 到达 Nano child，随后同一 pool 可以完成一条
-   短生成；
-7. 仅当 Nano 提供稳定 owner 接口时，最后触发一次真实 child fatal，并通过公开
-   `wait_for_fatal()` 有界失败；否则删除该项，不注入私有进程拓扑。
+1. CUDA 检测、模型加载和 warmup；
+2. 普通 TTS；
+3. Voice Design；
+4. controllable reference clone + style；
+5. faithful clone；
+6. 非语言标签；
+7. WebSocket 增量文本；
+8. 两个以上 segment 的 continuation；
+9. AsyncPool outer `aclose()` 后 cancel 到达 child，且下一请求正常；
+10. 服务 idle 时终止 Nano child，无需下一请求即撤销 ready 并非零退出；
+11. RTF 小于 1；
+12. 每个音频 chunk 均为 7680 samples，输出频率为 6.25/s。
 
-warmup 已覆盖 ordinary；Voice Design 只生成上述一份可复用 fixture，不再增加
-独立重复 case。每次真实生成顺带断言 waveform 非空、finite、每个 chunk 为
-7680 samples；continuation 同时断言 completion latents 非空。
+不建设 8/16/32 并发矩阵、全语言矩阵、自动 WER/UTMOS 平台或 worker restart
+仿真。
 
-功能开发和 `v0.1.0` 首发前，使用同一脚本分别选择 `modelscope` 与
-`huggingface`，各至少完成一次 create → warmup。完整路径只使用其中一个 source
-运行一次，不建立双 source 参数矩阵或第二份脚本。
+### 16.4 人工听测
 
-该脚本不启动真实 HTTP/WebSocket，不测试语言或原生 tag 矩阵，不硬断言 RTF，
-不建立并发 benchmark、自动音质平台、worker restart 仿真或人工听测流程。
+使用一套固定样本，覆盖：
+
+- 普通话；
+- 英语；
+- 中英混合；
+- Voice Design；
+- 两种 clone；
+- style 和 `[laughing]`/`[sigh]`/`[Uhm]`；
+- 逐字输入与大 chunk 输入；
+- 至少四个连续 segments。
+
+只验收业务可感知问题：
+
+- 音色是否稳定；
+- style 是否明显；
+- faithful 是否接近 reference；
+- 是否丢字、重字；
+- 边界是否出现 click、异常静音、重复/截断音素；
+- 长回答是否明显加速或漂移。
 
 ## 17. 仓库结构
 
 ```text
 botified-tts/
 ├── AGENTS.md
-├── .gitignore
-├── .dockerignore
-├── Dockerfile
 ├── README.md
 ├── pyproject.toml
 ├── uv.lock
@@ -1402,7 +1278,12 @@ botified-tts/
 │   ├── test_api.py
 │   ├── test_runtime.py
 │   ├── test_streaming.py
-│   └── gpu_integration.py
+│   └── gpu_smoke.py
+├── deploy/
+│   ├── Dockerfile
+│   └── compose.yaml
+├── scripts/
+│   └── deploy.sh
 ├── companions/botified/
 │   ├── README.md
 │   ├── pyproject.toml
@@ -1411,7 +1292,7 @@ botified-tts/
 │   └── tests/test_sidecar.py
 ├── skills/voxcpm-tts/
 │   ├── SKILL.md
-│   └── scripts/botified-tts
+│   └── scripts/voxcpm-tts
 └── docs/engineering/
     └── botified-tts-product-development-plan.md
 ```
@@ -1419,115 +1300,115 @@ botified-tts/
 不要预先创建 repository/service/use-case/domain 多层目录。只有文件真实变大并
 出现明确职责边界时才拆分。
 
-## 18. 后续改进阶段
+## 18. 开发阶段
 
-### 阶段 1：修正未推送的 Botified 集成
+### Phase 0：推理技术 Spike
 
-当前本地 companion 与 Skill 改动尚未发布，先就地消除两个已知用户问题：
+目标是在写完整服务前消除唯一高风险问题。
 
-- companion 增加进程级 immutable start options，并让 replacement session
-  复用；
-- 握手先处理服务 error，再创建 sink 和校验 audio；
-- companion 与 Skill helper 都改为只接受同一 `--env-file`，安全解析恰好一条
-  API key，删除 raw key file 参数和读取路径；
-- companion README 和 Botified task preset 改用 `--env-file` 与唯一
-  `--tts-url`；
-- Skill 文档只保留 `skills.explicit`；
-- 增加 start mapping、replacement、invalid key、不创建 sink、env-file
-  missing/duplicate/malformed/shell syntax 和不泄露 secret 的 focused tests。
+交付：
 
-删除空 `start` 的唯一旧路径、错误的 audio 误报和 Skill copy/symlink 文档，
-不增加 companion config 文件或第二个 client。
+- 将 VoxCPM2 HF revision、Nano commit、容器 base digest、Python、PyTorch、
+  CUDA、FlashAttention 和 FFmpeg 版本固定到实际交付文件；
+- 写回 RTX 4090 24 GiB、compute capability 8.9 和实测软件组合的 verified
+  support baseline，不推断最低硬件；
+- target GPU 上完成普通、design、两种 clone 和 style；
+- 验证官方 non-verbal tag；
+- 实现并验证 role-aware latent encoding；
+- 让 Nano terminal completion 返回独立聚合的本 segment generated latents；
+- 使用第 11 节已验证的 full model target continuation，不保留 spoken-only
+  分支；
+- 修复 AsyncPool outer→inner `aclose()` 后重新验证 cancel 到达 child；
+- 验证 step exception 和 child 意外退出均使 async 调用有界失败，并可由公开
+  fatal waiter 在 idle 状态观测；
+- 测得 TTFB、RTF、实际 audio chunk 时长和显存占用。
 
-companion README 和 task preset 只给两个最小 start 示例：
+退出条件：
 
-```bash
---env-file /opt/botified-tts/botified-tts.env \
-  --tts-url ws://127.0.0.1:8000/v1/speech/stream \
-  --voice-id voice_01k... --mode controllable --style '自然、亲切'
---env-file /opt/botified-tts/botified-tts.env \
-  --tts-url ws://127.0.0.1:8000/v1/speech/stream \
-  --design '温暖自然的年轻女性声音' --style '平静'
-```
+- reference GPU 上 RTF < 1；
+- continuation 无明显质量倒退；
+- controllable 与 faithful 模式行为和官方一致；
+- outer `aclose()` 能停止实际 child request；
+- child fatal 不留下悬挂 stream/future，active 或 idle 时服务随后均非零退出；
+- 对 Nano fork 的改动不超出第 12.2 节。
 
-TLS 部署显式传入 `wss://.../v1/speech/stream`；companion 不转换 URL。
+如果 continuation 验证失败，先解决或明确模型限制，不用 crossfade、回滚状态机
+或第二套策略掩盖。
 
-### 阶段 2：固定双模型来源
+### Phase 1：服务 V1
 
-- 配置只增加必填 `MODEL_SOURCE`，删除公开 model/revision；
-- 在现有 config/engine owner 内加入只含 repo ID/revision 的两项固定 spec 和
-  单一 source switch；
-- 固定 `modelscope-hub==0.1.8`，cache 只由 data dir 与 source 计算；
-- Hugging Face 只用 `huggingface_hub.snapshot_download`，ModelScope 只用
-  `modelscope_hub.HubApi.download_repo`；
-- 保证 CUDA 检测早于两个 SDK import/download；
-- 单元测试 source 校验、固定参数、无 fallback 和 CUDA fail-fast。
+交付：
 
-删除 HF-only 下载路径、任意 model/revision 组合和跨源 fallback，不建立 downloader
-插件层。
+- canonical schema；
+- VoiceStore；
+- SpeechService 与 Nano adapter；
+- 顶层 HTTP/fatal runtime supervisor；
+- segmenter 和 continuation；
+- `/health`、voice 创建/列表/删除、`POST /v1/speech`；
+- WebSocket；
+- WAV/PCM；
+- 错误、日志和 focused tests。
 
-### 阶段 3：收敛镜像与使用文档
+退出条件：
 
-- 把 Dockerfile 移到仓库根，并增加只允许 Dockerfile、`.dockerignore`、
-  `pyproject.toml`、`uv.lock` 和 `src/**` 进入 context 的严格 `.dockerignore`；
-- 删除 Compose、`deploy.sh` 及其配置、测试和文档；
-- `.gitignore` 增加 `/botified-tts.env` 和 `/.data/`；
-- README 依次说明普通服务消费者、Botified integrator、开发者和 Power user；
-- README 写明唯一 `docker run`、只用 `docker inspect` 判断 ready、失败看
-  `docker logs`；
-- README 使用 `umask 077` 和 `openssl rand -hex 32` 创建唯一
-  `botified-tts.env`，token 不加引号；
-- README 说明完整本地测试唯一额外系统依赖是 `ffmpeg`，并在
-  `uv sync --locked`、`uv run pytest -q` 和可选源码直跑命令前先执行
-  `command -v ffmpeg` fail-fast；不提供安装脚本、skip 或备用解码；
-- 保留 Docker `HEALTHCHECK`、`/data` volume 和应用 CUDA fail-fast。
+- HTTP 和 WebSocket 共用同一核心；
+- 任意 text chunk 粒度不丢字不重字；
+- cancel 和慢客户端有界；
+- idle Nano fatal 无需下一请求即可使 runner 失败；
+- 单元与 API 集成测试通过。
 
-Docker 构建只需完成根 Dockerfile build；不为删除的部署脚本建立替代测试。
+### Phase 2：部署与 Botified 交付
 
-### 阶段 4：真实 GPU integration 与 `v0.1.0`
+交付：
 
-- 将现有 GPU 脚本收敛为第 16.3 节的一份 opt-in integration；
-- 两个 source 各完成一次 create → warmup，完整 Nano 路径只运行一次；
-- 删除重复 HTTP/WS、语言/tag、RTF 阈值和私有 child 拓扑路径；
-- 根 package 与 companion 的 `project.version` 都固定为 `0.1.0`，companion
-  跟随根版本和仓库 tag，不独立发布；
-- 严格按第 13.5 节顺序，在同一可信 CUDA host 从 tagged clean checkout 构建和
-  验证，先推送 Git tag，再推送同一个已验证 image，最后创建只指向该 image 的
-  GitHub Release。
+- 固定依赖和模型 revision；
+- Dockerfile、Compose 和 `deploy.sh`；
+- CUDA 双重 fail-fast；
+- README 和调用示例；
+- 使用独立轻量依赖的 `companions/botified/`；
+- Agent Skill；
+- 不修改 Botified 的 `stream_text` 到 WebSocket 真实联调；
+- 一次真实 GPU smoke 和固定样本听测。
 
-不增加 workflow、publish script、`latest` tag、release asset、changelog、
-发布报告或自动化发布平台。
+退出条件：
+
+- 满足支持表的 fresh CUDA host 一条命令 ready；
+- 无 CUDA 时在模型下载前明确失败；
+- 本仓库 companion 使用现有 Botified 完成一次真实回答的连续播放和 barge-in
+  cancel；
+- Definition of Done 全部满足。
 
 ## 19. 风险与处理
 
 | 风险 | 最小处理 |
 |---|---|
 | Nano 上游差异 | 第 12.2 节固定五项薄 fork 改动 |
-| 分段连续性 | 上一完整段 continuation + 真实 completion latents |
+| 分段质量 | 上一完整段 continuation + 固定听测 |
 | 资源积压 | 固定输入/队列上限、send timeout、cancel |
-| 环境不兼容 | 支持表、容器内 CUDA fail-fast、固定依赖 |
-| 下载源不可用 | 显式失败并提示所选 source，不跨源 fallback |
+| 环境不兼容 | 支持表、host/container preflight、固定依赖 |
 
-## 20. 产品完成状态
+## 20. Definition of Done
 
-产品完成时满足以下当前事实：
-
-- companion 的 immutable start options、replacement、finish 后 barge-in 和
-  握手错误均按第 14 节工作，且不泄露 API key；
-- ModelScope 与 Hugging Face 都使用内部固定 spec，source 必填、无默认、无
-  fallback，CUDA 失败时不 import SDK、不下载模型、不创建 Nano child；
-- HTTP WAV、WebSocket 双向流、Voice Design、两种 clone、style、原生标签、
-  VoiceStore、分段、continuation 和 cancel 保持现有 canonical API；
-- 单元、API/service、companion focused tests 和一份 opt-in GPU integration
-  覆盖第 16 节的唯一行为边界；
-- 普通服务消费者只需私有 env-file 和一个固定版本 image 的 `docker run`；
-  Power user 从根 Dockerfile 构建后复用同一命令，开发者使用文档中的 sync、
-  test 和可选源码直跑命令；
-- Botified integrator 通过 checkout 内唯一 `skills.explicit` 和 companion
-  完成真实 token delta、连续播放与中断，Botified 仓库保持只读；
-- 根 package 与 companion 的 `project.version` 都是 `0.1.0`，并跟随 Git tag
-  `v0.1.0`；同一 host 验证 image 为 `healthy` 后先推送 Git tag、再推送该
-  image，GitHub Release 只指向 image，companion 不独立发布，模型权重不在
-  image 内；
-- 仓库不包含 Compose、部署或发布脚本、自动发布 workflow、`latest` tag、
-  跨源 fallback、重复 Skill 或第二套服务实现。
+- [ ] 无 CUDA 时在模型下载前非零退出且不尝试 CPU；支持表内 fresh host 可一键
+  启动、ready 并完成 smoke。
+- [ ] 音色可以创建、列出、删除；`/v1/speech` 返回可播放的 48 kHz mono WAV。
+- [ ] 普通、Voice Design、controllable clone、faithful clone、style 和官方
+  非语言标签均通过真实 GPU 验收。
+- [ ] `faithful + style` 和所有超限请求得到固定错误。
+- [ ] WebSocket 接受逐字、小 chunk 和多句大 chunk，并在 `finish` 前开始返回
+  已形成 segment 的音频。
+- [ ] 输入 chunk 边界不造成丢字、重字或重排。
+- [ ] WebSocket 输出 48 kHz mono PCM s16le；固定验收语料平均每秒音频不超过
+  10 个 binary chunks。
+- [ ] continuation 使用上一段完整 model target text + generated latents，无明显
+  click、异常静音、重复或截断音素。
+- [ ] cancel 到达实际 Nano child；输入超限和 send timeout 均能有界结束
+  session。
+- [ ] Nano child fatal 使 active/pending 调用有界失败；即使服务 idle 且没有
+  下一请求，也会撤销 ready 并非零退出；没有 worker restart 或 fallback。
+- [ ] 默认日志不包含正文、reference、audio、latent 或 secret。
+- [ ] 单元、API、同一份真实 GPU smoke 和固定样本听测通过。
+- [ ] 非保留名称的 Agent Skill 可被 Botified 加载，通过 key file 注册音色并
+  生成 WAV。
+- [ ] 本仓库 companion 在不修改 Botified 的前提下完成真实 token delta →
+  连续播放 → finish 后 barge-in cancel，并回收旧 session 和播放器。
