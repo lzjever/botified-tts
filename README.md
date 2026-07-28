@@ -8,8 +8,10 @@ streaming.
 The first release supports Linux x86_64, one selected NVIDIA GPU, a CUDA
 12-compatible driver, Docker Compose, and NVIDIA Container Toolkit. There is no
 CPU, ROCm, Windows, Apple Silicon, or multi-GPU fallback. If CUDA is unavailable
-or the selected GPU is invalid, deployment exits before building or downloading
-the model.
+or the selected GPU is invalid, deployment exits during the host GPU and NVIDIA
+container runtime preflight, before building. After the image is built, the
+application checks PyTorch CUDA before downloading the model or creating a Nano
+worker.
 
 ## Deploy
 
@@ -104,6 +106,20 @@ import wave
 from websockets.asyncio.client import connect
 
 
+async def receive_audio(websocket, pcm: bytearray) -> dict:
+    while True:
+        message = await websocket.recv()
+        if isinstance(message, bytes):
+            pcm.extend(message)
+            continue
+        event = json.loads(message)
+        if event.get("type") == "error":
+            raise RuntimeError(event)
+        if event.get("type") == "done":
+            return event
+        raise RuntimeError(f"unexpected event: {event}")
+
+
 async def main() -> None:
     base = os.environ["BOTIFIED_TTS_URL"].rstrip("/")
     scheme = "wss" if base.startswith("https://") else "ws"
@@ -117,23 +133,15 @@ async def main() -> None:
         if ready.get("type") != "ready":
             raise RuntimeError(ready)
 
-        for text in ("你好，", "这是逐块输入。", "服务会同时流式返回声音。"):
-            await websocket.send(json.dumps({"type": "append", "text": text}))
-        await websocket.send(json.dumps({"type": "finish"}))
-        # On user interruption, send {"type": "cancel"} instead of finish.
-
-        while True:
-            message = await websocket.recv()
-            if isinstance(message, bytes):
-                pcm.extend(message)
-                continue
-            event = json.loads(message)
-            if event.get("type") == "error":
-                raise RuntimeError(event)
-            if event.get("type") == "done":
-                if event.get("cancelled"):
-                    print("stream cancelled")
-                break
+        async with asyncio.TaskGroup() as tasks:
+            receiver = tasks.create_task(receive_audio(websocket, pcm))
+            for text in ("你好，", "这是逐块输入。", "服务会同时流式返回声音。"):
+                await websocket.send(json.dumps({"type": "append", "text": text}))
+            await websocket.send(json.dumps({"type": "finish"}))
+            # On user interruption, send {"type": "cancel"} instead of finish.
+        done = receiver.result()
+        if done.get("cancelled"):
+            print("stream cancelled")
 
     with wave.open("stream.wav", "wb") as output:
         output.setnchannels(ready["audio"]["channels"])
