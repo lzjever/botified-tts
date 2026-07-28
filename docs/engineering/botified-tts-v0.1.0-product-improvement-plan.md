@@ -140,7 +140,7 @@ BOTIFIED_TTS_DATA_DIR="$PWD/.data" \
 ### 3.4 Power user
 
 ```bash
-docker build --platform linux/amd64 -t botified-tts:local .
+docker build --provenance=false --platform linux/amd64 -t botified-tts:local .
 ```
 
 构建后复用普通用户的 env-file、volume、GPU、port 和 `docker run`，只替换 image。
@@ -251,7 +251,8 @@ warmup；只有 full source 运行完整路径。
   实际值正确时不制造 diff，companion 不独立发布。
 - 在最终 clean commit 创建本地 `v0.1.0` tag。
 - 同一可信、磁盘充足、有 CUDA 的 host 从该 tag clean checkout。
-- Build 最终 local tag `ghcr.io/lzjever/botified-tts:v0.1.0`。
+- 复用 3.4 的同一构建方式，把 local tag 替换为
+  `ghcr.io/lzjever/botified-tts:v0.1.0`。
 - 用唯一 `docker run` 启动 local image，等待 `healthy`。
 - 先推送 Git tag，再推送已验证 image，并设置 GHCR package public。
 - 最后创建只指向该 image 的简短 GitHub Release。

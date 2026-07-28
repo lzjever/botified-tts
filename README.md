@@ -96,7 +96,7 @@ BOTIFIED_TTS_DATA_DIR="$PWD/.data" \
 Power users can build from the repository root:
 
 ```bash
-docker build --platform linux/amd64 -t botified-tts:local .
+docker build --provenance=false --platform linux/amd64 -t botified-tts:local .
 ```
 
 Run it with the same env file, GPU, port, and volume from the service command
