@@ -71,10 +71,149 @@ creation and logs `cuda_unavailable` or `cuda_device_invalid`.
 
 ## Integrate with Botified
 
-Botified integrators check out this repository on the Botified host. Configure
-Botified `skills.explicit` to point directly to the checkout's
-[`skills/voxcpm-tts/SKILL.md`](skills/voxcpm-tts/SKILL.md). Do not copy or
-symlink the Skill.
+The `tts` Skill requires Botified Core `v0.4.45+` with its built-in `bash`
+tool enabled. The Core host needs Bash, curl, `python3`, and GNU coreutils; it
+does not need CUDA, Torch, or FFmpeg. CUDA remains a requirement of the TTS
+service host.
+
+Check out this repository on the Core host and verify the helper prerequisites:
+
+```bash
+command -v bash curl python3 mktemp ln rm cat
+ln --version
+```
+
+Install the Skill as the Core service account. First resolve the Agent root:
+
+- without `runtime.agents_dir`, use the Core service account's
+  `$HOME/.agents`;
+- use an absolute `runtime.agents_dir` directly;
+- resolve a relative `runtime.agents_dir` from the Botified configuration
+  file's directory.
+
+Set `AGENTS_DIR` below to that resolved absolute path, then install the two
+Skill files:
+
+```bash
+AGENTS_DIR=/absolute/path/to/resolved-agents-dir
+: "${AGENTS_DIR:?set AGENTS_DIR to the resolved Agent root}"
+
+install -d -m 0700 \
+  "${AGENTS_DIR}/skills/tts/scripts" \
+  "${AGENTS_DIR}/env.d"
+install -m 0644 \
+  skills/tts/SKILL.md \
+  "${AGENTS_DIR}/skills/tts/SKILL.md"
+install -m 0755 \
+  skills/tts/scripts/botified-tts \
+  "${AGENTS_DIR}/skills/tts/scripts/botified-tts"
+```
+
+The executable bit on `scripts/botified-tts` is required. Do not add this
+Skill through `skills.explicit` or install another Skill named `tts`; duplicate
+names make `$tts` ambiguous.
+
+Create the Skill client's private configuration as an atomic update:
+
+```bash
+install -m 0600 /dev/null \
+  "${AGENTS_DIR}/env.d/botified-tts.env.tmp"
+# Write exactly these two literal, unquoted NAME=VALUE entries to the .tmp file:
+# BOTIFIED_TTS_URL=http://tts-host:8000
+# BOTIFIED_TTS_API_KEY=replace_with_actual_key
+mv \
+  "${AGENTS_DIR}/env.d/botified-tts.env.tmp" \
+  "${AGENTS_DIR}/env.d/botified-tts.env"
+```
+
+The directory and file must be owned by the Core effective uid or root and
+must not be writable by group or other. When root owns them, the Core account
+must still be able to traverse the directories and read the file. Keep the URL
+and key in this one file, define each name only once across `env.d/*.env`, and
+do not add `export`, quotes, interpolation, or shell syntax.
+
+Botified grants `env.d` variables to every Core Bash process; it is not
+per-Skill isolation or a service configuration mechanism. The helper only
+reads `BOTIFIED_TTS_URL` and `BOTIFIED_TTS_API_KEY` from its process
+environment. It does not accept `--env-file`, locate `env.d`, or parse Botified
+YAML. The Docker service and companion keep their existing explicit env-file
+configuration.
+
+An installed or updated Skill is rediscovered on the next fresh provider
+request. An atomically replaced env file applies to the next Bash process.
+Neither normal update requires restarting Core.
+
+Use the installed helper for health and voice profiles:
+
+```bash
+TTS="${AGENTS_DIR}/skills/tts/scripts/botified-tts"
+
+"${TTS}" health
+"${TTS}" voice-list
+"${TTS}" voice-create \
+  --name assistant \
+  --file "${AGENT_PATH}" \
+  --filename "${ORIGINAL_FILENAME}" \
+  --prompt-text 'The exact words spoken in the reference.'
+```
+
+`voice-create` always requires both `--file` and `--filename`. For a Botified
+file ref, pass its available `agent_path` as `--file` and its manifest
+`filename` as `--filename`. The helper uses the filename only to select WAV,
+FLAC, or MP3 and sends a fixed safe multipart filename; it does not copy the
+input or store its original filename. Omit `--prompt-text` for controllable
+cloning when no exact transcript is available. Faithful cloning requires a
+transcript that exactly matches the reference recording.
+
+Generate caller-facing files inside Botified's runtime cwd. Ogg/Opus is the
+default choice for smaller attachments and voice messages:
+
+```bash
+"${TTS}" speak \
+  --text '你好。' \
+  --output reply.ogg
+```
+
+The Agent must publish generated files rather than return a server-local path.
+For an ordinary attachment, call `publish_file` with:
+
+```json
+{
+  "path": "reply.ogg",
+  "filename": "reply.ogg",
+  "mime_type": "audio/ogg"
+}
+```
+
+For a voice-message presentation request, use:
+
+```json
+{
+  "path": "reply.ogg",
+  "filename": "reply.ogg",
+  "mime_type": "audio/ogg",
+  "audio_as_voice": true
+}
+```
+
+`audio_as_voice: true` is a delivery hint; unsupported channels may present an
+ordinary attachment. The complete synthesis, voice selection, text-tag, and
+long-input workflow is in the installed [`tts` Skill](skills/tts/SKILL.md).
+
+### Upgrade an older Skill installation
+
+Upgrade Core to `v0.4.45+`, install `skills/tts`, and create the `env.d` file
+before removing the old `voxcpm-tts` Skill. Do not keep both Skills installed.
+If the old checkout path appears in `skills.explicit`, stop Core through its
+existing supervisor, remove only that old entry, and start Core again. A normal
+Agent-root installation does not require a YAML change or restart.
+
+The old helper `--env-file` option no longer exists, and every `voice-create`
+call now requires `--filename`. Do not delete an older `botified-tts.env` until
+you have confirmed that neither the Docker service nor the companion still
+uses it.
+
+### Companion
 
 Install the companion's independent lightweight environment:
 
@@ -134,7 +273,7 @@ Canonical synthesis options are top-level fields:
 
 | Use | Options |
 |---|---|
-| Ordinary speech | `{}` |
+| Ordinary speech | `{}`, with optional `"style"` |
 | Voice Design | `{"voice":{"type":"design","description":"A warm, natural voice"}}`, with optional `"style"` |
 | Controllable clone | `{"voice":{"type":"profile","id":"voice_..."},"mode":"controllable"}`, with optional `"style"` |
 | Faithful clone | `{"voice":{"type":"profile","id":"voice_..."},"mode":"faithful"}`; `"style"` is not accepted |
@@ -163,7 +302,7 @@ The service also supports VoxCPM2 native tags and cancellation, automatically
 splits input into sentence-aware segments, and uses fixed request-level
 conditioning to reduce accumulated voice drift across segments. It receives
 final speakable plain text and does not parse Markdown or SSML. The bundled
-[`voxcpm-tts` Skill](skills/voxcpm-tts/SKILL.md) provides the concise HTTP
+[`tts` Skill](skills/tts/SKILL.md) provides the concise HTTP
 workflow for synthesis and voice management. Its `speak` command requests WAV
 or Ogg/Opus from the lowercase `.wav` or `.ogg` output suffix; it does not run
 FFmpeg locally.

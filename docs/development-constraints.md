@@ -55,11 +55,19 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - 只使用 VoxCPM2 和 Nano-vLLM-VoxCPM，不建立通用模型插件系统。
 - Botified 对接只使用本仓库内的薄 companion；它使用独立轻量依赖，不加入根
   Python package 或根 uv workspace，也不引入 Torch/CUDA。
-- Docker、Skill helper 和 companion 共用同一份 `botified-tts.env`；helper 与
-  companion 只安全解析其中恰好一条 API key。token 必须是不加引号的
+- Docker 服务和 companion 保持各自现有的显式 env-file；companion 只安全解析
+  其中恰好一条 `BOTIFIED_TTS_API_KEY`。token 必须是不加引号的
   `[A-Za-z0-9._~-]+`，按第一个 `=` 后的字面值读取，不 quote、interpolate 或
-  source shell。helper 的 URL 只用 `BOTIFIED_TTS_URL`，companion 的 URL 只用
-  `--tts-url`。
+  source shell。companion 的 URL 只用 `--tts-url`。
+- Skill helper 不接受或解析 env-file，只消费进程环境中的
+  `BOTIFIED_TTS_URL`、`BOTIFIED_TTS_API_KEY`。Botified 集成只通过
+  `<resolved-agents-dir>/env.d/botified-tts.env` 注入这两个客户端变量；
+  API key 使用同一 `[A-Za-z0-9._~-]+` 格式。`env.d` 不配置 TTS 服务、
+  Botified Provider、Gateway、TUI 或 channel plugin。
+- `voice-create` 的唯一文件接口同时要求 `--file` 内容路径和 `--filename` 来源
+  名称；不从路径 basename 推导或保留 fallback。helper 只按来源名称中大小写
+  不敏感的 `.wav|.flac|.mp3` suffix 发送固定的 `reference.<ext>` multipart
+  filename，不复制输入，也不保存原始文件名。
 - 固定模型 spec 只保存 repo ID 和 revision；模型 cache 只从 `Settings` 的
   data dir 与 model source 推导，不保存第二份路径配置。
 - 只保留当前产品需要的 VoiceStore、合成、分段、音频和部署模块。
