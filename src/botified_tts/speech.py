@@ -117,6 +117,8 @@ class SpeechService:
         reference_latents: bytes | None = None
         prompt_latents: bytes | None = None
         prompt_text = ""
+        anchor_from_first_segment = False
+        control_each_segment = False
 
         voice = options.voice
         if isinstance(voice, ProfileVoice):
@@ -144,6 +146,10 @@ class SpeechService:
                     snapshot,
                     "prompt",
                 )
+            else:
+                control_each_segment = True
+        else:
+            anchor_from_first_segment = True
 
         control = _control_instruction(options)
         first_segment = True
@@ -151,9 +157,11 @@ class SpeechService:
         async for segment in segments:
             if summary is not None:
                 summary.record_segment()
+            is_first_segment = first_segment
             target_text = (
                 f"({control}){segment}"
-                if first_segment and control
+                if control
+                and (is_first_segment or control_each_segment)
                 else segment
             )
             first_segment = False
@@ -207,8 +215,9 @@ class SpeechService:
                     "engine_error",
                     "VoxCPM2 segment ended without completion",
                 )
-            prompt_latents = completion.generated_latents
-            prompt_text = target_text
+            if anchor_from_first_segment and is_first_segment:
+                prompt_latents = completion.generated_latents
+                prompt_text = segment
 
     async def _voice_latent(
         self,

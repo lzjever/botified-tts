@@ -318,11 +318,94 @@ def test_profile_must_exist_and_faithful_requires_exact_transcript(
     assert engine.generate_calls == []
 
 
-def test_segments_are_serial_and_use_only_last_complete_continuation() -> None:
+def test_controllable_segments_reuse_reference_and_control() -> None:
+    engine = FakeEngine()
+    service = SpeechService(engine, FakeVoiceStore(_snapshot()))
+    options = SynthesisOptions(
+        voice=ProfileVoice(id=VOICE_ID),
+        mode="controllable",
+        style=" (friendly) ",
+    )
+
+    output = asyncio.run(_collect(service, options, "one", "two", "three"))
+
+    assert len(output) == 3
+    assert engine.generate_calls == [
+        {
+            "target_text": "(friendly)one",
+            "prompt_latents": None,
+            "prompt_text": "",
+            "ref_audio_latents": b"reference-latents-reference-wav",
+        },
+        {
+            "target_text": "(friendly)two",
+            "prompt_latents": None,
+            "prompt_text": "",
+            "ref_audio_latents": b"reference-latents-reference-wav",
+        },
+        {
+            "target_text": "(friendly)three",
+            "prompt_latents": None,
+            "prompt_text": "",
+            "ref_audio_latents": b"reference-latents-reference-wav",
+        },
+    ]
+    assert engine.reference_audio == [b"reference-wav"]
+    assert all(stream.closed for stream in engine.streams)
+
+
+def test_faithful_segments_reuse_original_profile_conditioning() -> None:
+    engine = FakeEngine()
+    service = SpeechService(engine, FakeVoiceStore(_snapshot()))
+    options = SynthesisOptions(
+        voice=ProfileVoice(id=VOICE_ID),
+        mode="faithful",
+        style=None,
+    )
+
+    output = asyncio.run(_collect(service, options, "one", "two", "three"))
+
+    assert len(output) == 3
+    assert engine.generate_calls == [
+        {
+            "target_text": "one",
+            "prompt_latents": b"prompt-latents-reference-wav",
+            "prompt_text": "exact transcript",
+            "ref_audio_latents": b"reference-latents-reference-wav",
+        },
+        {
+            "target_text": "two",
+            "prompt_latents": b"prompt-latents-reference-wav",
+            "prompt_text": "exact transcript",
+            "ref_audio_latents": b"reference-latents-reference-wav",
+        },
+        {
+            "target_text": "three",
+            "prompt_latents": b"prompt-latents-reference-wav",
+            "prompt_text": "exact transcript",
+            "ref_audio_latents": b"reference-latents-reference-wav",
+        },
+    ]
+    assert engine.reference_audio == [b"reference-wav"]
+    assert engine.prompt_audio == [b"reference-wav"]
+    assert all(stream.closed for stream in engine.streams)
+
+
+@pytest.mark.parametrize(
+    ("voice", "expected_first_target"),
+    [
+        (None, "(calm)one"),
+        (DesignVoice(description=" (warm) "), "(warm; calm)one"),
+    ],
+)
+def test_unreferenced_segments_reuse_only_first_completion(
+    voice: DesignVoice | None,
+    expected_first_target: str,
+) -> None:
     engine = FakeEngine()
     service = SpeechService(engine, FakeVoiceStore())
     options = SynthesisOptions(
-        voice=None,
+        voice=voice,
         mode=None,
         style=" (calm) ",
     )
@@ -346,7 +429,7 @@ def test_segments_are_serial_and_use_only_last_complete_continuation() -> None:
     assert len(output) == 3
     assert engine.generate_calls == [
         {
-            "target_text": "(calm)one",
+            "target_text": expected_first_target,
             "prompt_latents": None,
             "prompt_text": "",
             "ref_audio_latents": None,
@@ -354,13 +437,13 @@ def test_segments_are_serial_and_use_only_last_complete_continuation() -> None:
         {
             "target_text": "two",
             "prompt_latents": b"generated-0",
-            "prompt_text": "(calm)one",
+            "prompt_text": "one",
             "ref_audio_latents": None,
         },
         {
             "target_text": "three",
-            "prompt_latents": b"generated-1",
-            "prompt_text": "two",
+            "prompt_latents": b"generated-0",
+            "prompt_text": "one",
             "ref_audio_latents": None,
         },
     ]
