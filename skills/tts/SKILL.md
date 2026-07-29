@@ -17,9 +17,10 @@ Resolve the helper first:
 TTS=<skill-directory>/scripts/botified-tts
 ```
 
-Before use, verify the helper is executable and the host has `python3`. If
-either prerequisite is absent, report it; do not install dependencies or
-replace the helper with ad hoc HTTP.
+Before use, verify the helper is executable and the host has Python 3.10 or
+newer. The helper uses only the Python standard library. If either prerequisite
+is absent, report it; do not install dependencies or replace the helper with
+ad hoc HTTP.
 
 Configuration comes from Botified `<resolved-agents-dir>/env.d/*.env` and is
 globally visible to every Botified Bash process, not isolated to this Skill. Before every helper call, check the URL without printing its value:
@@ -163,8 +164,8 @@ or publish a symlink. Default to Ogg/Opus unless the user explicitly requests
 WAV.
 
 Publish every caller-facing result with Botified `publish_file`; never return
-only a server-local path. For a normal attachment, match the MIME type and
-omit `audio_as_voice`:
+only a server-local path and do not upload it through Botified Runtime Data.
+For a normal attachment, match the MIME type and omit `audio_as_voice`:
 
 ```json
 {"path":"reply.ogg","filename":"reply.ogg","mime_type":"audio/ogg"}

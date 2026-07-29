@@ -71,16 +71,15 @@ creation and logs `cuda_unavailable` or `cuda_device_invalid`.
 
 ## Integrate with Botified
 
-The `tts` Skill requires Botified Core `v0.4.45+` with its built-in `bash`
-tool enabled. The Core host needs Bash, curl, `python3`, and GNU coreutils; it
-does not need CUDA, Torch, or FFmpeg. CUDA remains a requirement of the TTS
-service host.
+The `tts` Skill targets Botified Core `v0.4.47` with its built-in `bash` tool
+enabled. Its helper only requires Python 3.10 or newer and the Python standard
+library; it does not require curl, third-party Python packages, CUDA, Torch, or
+FFmpeg. CUDA remains a requirement of the TTS service host.
 
-Check out this repository on the Core host and verify the helper prerequisites:
+Check out this repository on the Core host and verify the helper runtime:
 
 ```bash
-command -v bash curl python3 mktemp ln rm cat
-ln --version
+python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'
 ```
 
 Install the Skill as the Core service account. First resolve the Agent root:
@@ -132,16 +131,18 @@ must still be able to traverse the directories and read the file. Keep the URL
 and key in this one file, define each name only once across `env.d/*.env`, and
 do not add `export`, quotes, interpolation, or shell syntax.
 
-Botified grants `env.d` variables to every Core Bash process; it is not
-per-Skill isolation or a service configuration mechanism. The helper only
-reads `BOTIFIED_TTS_URL` and `BOTIFIED_TTS_API_KEY` from its process
-environment. It does not accept `--env-file`, locate `env.d`, or parse Botified
-YAML. The Docker service and companion keep their existing explicit env-file
-configuration.
+Botified grants `env.d` variables to every new Core Bash process and managed
+task; it is not per-Skill isolation or a service configuration mechanism. The
+helper and companion both read `BOTIFIED_TTS_URL` and
+`BOTIFIED_TTS_API_KEY` from their process environment. Neither locates or
+parses `env.d`, and they do not share code or installation paths. Only the
+Docker service keeps its separate explicit `botified-tts.env`; do not use the
+Agent `env.d` file to configure the container.
 
 An installed or updated Skill is rediscovered on the next fresh provider
-request. An atomically replaced env file applies to the next Bash process.
-Neither normal update requires restarting Core.
+request. An atomically replaced env file applies to the next Bash process or
+new task. Restart a running companion task to pick up changed values. These
+normal Skill and env updates do not require restarting Core.
 
 Use the installed helper for health and voice profiles:
 
@@ -200,18 +201,21 @@ For a voice-message presentation request, use:
 ordinary attachment. The complete synthesis, voice selection, text-tag, and
 long-input workflow is in the installed [`tts` Skill](skills/tts/SKILL.md).
 
+Botified Runtime Data variables are not used for TTS file delivery. The helper
+writes the requested file in the runtime cwd and the Agent publishes it with
+`publish_file`; the companion only streams audio to a local loudspeaker.
+
 ### Upgrade an older Skill installation
 
-Upgrade Core to `v0.4.45+`, install `skills/tts`, and create the `env.d` file
+Upgrade Core to `v0.4.47`, install `skills/tts`, and create the `env.d` file
 before removing the old `voxcpm-tts` Skill. Do not keep both Skills installed.
 If the old checkout path appears in `skills.explicit`, stop Core through its
 existing supervisor, remove only that old entry, and start Core again. A normal
 Agent-root installation does not require a YAML change or restart.
 
 The old helper `--env-file` option no longer exists, and every `voice-create`
-call now requires `--filename`. Do not delete an older `botified-tts.env` until
-you have confirmed that neither the Docker service nor the companion still
-uses it.
+call now requires `--filename`. The Docker service's explicit
+`botified-tts.env` remains separate from the Agent `env.d` file.
 
 ### Companion
 
@@ -221,11 +225,18 @@ Install the companion's independent lightweight environment:
 uv sync --project companions/botified --locked --no-dev
 ```
 
-The companion turns Botified `stream_text` observations into live audio and
-cancels playback on user interruption, provider replacement, or stdin close.
-Its profile + mode + style and Voice Design + style task preset examples are in
-the [companion README](companions/botified/README.md). Both use the checkout's
-absolute `botified-tts.env` path and the complete WebSocket endpoint.
+The optional companion turns Botified `stream_text` observations into live
+audio on the Botified host's local loudspeaker and cancels playback on user
+interruption, provider replacement, or stdin close. It is not part of a normal
+TTS service deployment and does not start when installed.
+
+Its profile and Voice Design task preset examples are in the
+[companion README](companions/botified/README.md). They call the installed
+`botified-tts-companion` command without a URL, API key, or env-file argument
+and are registered with `start_on_boot: []`. Start one only when local playback
+is wanted. Adding or changing a preset requires restarting Core through its
+external supervisor; changing `env.d` only requires restarting the running
+companion task.
 
 ## Develop
 

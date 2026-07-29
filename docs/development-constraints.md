@@ -53,17 +53,25 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - HTTP 与 WebSocket 必须复用同一个 `SpeechService`。
 - 长文本和增量文本必须复用同一个 segmenter。
 - 只使用 VoxCPM2 和 Nano-vLLM-VoxCPM，不建立通用模型插件系统。
+- Botified 集成以 `v0.4.47` 为当前目标版本，不同时维护旧机制。
+- Skill helper 是只依赖 Python 3.10+ 标准库的独立可执行脚本；不得依赖 curl、
+  第三方 Python package、companion 或 companion 的安装路径。
 - Botified 对接只使用本仓库内的薄 companion；它使用独立轻量依赖，不加入根
-  Python package 或根 uv workspace，也不引入 Torch/CUDA。
-- Docker 服务和 companion 保持各自现有的显式 env-file；companion 只安全解析
-  其中恰好一条 `BOTIFIED_TTS_API_KEY`。token 必须是不加引号的
-  `[A-Za-z0-9._~-]+`，按第一个 `=` 后的字面值读取，不 quote、interpolate 或
-  source shell。companion 的 URL 只用 `--tts-url`。
-- Skill helper 不接受或解析 env-file，只消费进程环境中的
-  `BOTIFIED_TTS_URL`、`BOTIFIED_TTS_API_KEY`。Botified 集成只通过
-  `<resolved-agents-dir>/env.d/botified-tts.env` 注入这两个客户端变量；
+  Python package 或根 uv workspace，也不引入 Torch/CUDA。companion 只负责
+  Botified 主机本地扬声器实时播放，与 Skill 不共享 import、内部 package 或
+  文件路径调用。
+- Docker 服务继续使用自己的显式 env-file。Skill helper 与 companion 只消费
+  Botified 从 `<resolved-agents-dir>/env.d/botified-tts.env` 注入进程环境的
+  `BOTIFIED_TTS_URL`、`BOTIFIED_TTS_API_KEY`；两者都不定位或解析 env 文件。
   API key 使用同一 `[A-Za-z0-9._~-]+` 格式。`env.d` 不配置 TTS 服务、
   Botified Provider、Gateway、TUI 或 channel plugin。
+- Botified 管理 companion 只使用 task preset；command 不带 URL、API key 或
+  env-file，默认 `start_on_boot: []`。只有明确要求 Core 启动后自动本地朗读的
+  部署才加入 preset id。新增或修改 preset YAML 后，由外部 supervisor 重启
+  Core；`env.d` 更新对下一 Bash 或 task 生效，运行中的 companion 需重启。
+- 不使用 `BOTIFIED_RUNTIME_DATA_BASE_URL` 或
+  `BOTIFIED_RUNTIME_DATA_TOKEN` 交付 TTS 文件。Skill 生成的文件由 Agent 调用
+  `publish_file`，companion 只在本地播放。
 - `voice-create` 的唯一文件接口同时要求 `--file` 内容路径和 `--filename` 来源
   名称；不从路径 basename 推导或保留 fallback。helper 只按来源名称中大小写
   不敏感的 `.wav|.flac|.mp3` suffix 发送固定的 `reference.<ext>` multipart
@@ -103,7 +111,7 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - 最小音色创建、列表和删除；
 - CUDA-only；普通用户使用公开的固定版本镜像、私有 env-file 和唯一
   `docker run`；
-- 本仓库内的最小 Botified companion；
+- 本仓库内按需启动、只做主机本地扬声器播放的最小 Botified companion；
 - 最小 Agent Skill。
 
 OpenAI 兼容、Artifact/Job、多 GPU 调度、多租户治理、复杂播放状态、自动质量
