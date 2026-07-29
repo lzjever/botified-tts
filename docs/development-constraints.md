@@ -87,7 +87,8 @@ alias、双写、迁移框架或长期 deprecated 路径。
 - HTTP 非流式 WAV 或 Ogg/Opus 完整文件；
 - WebSocket 增量文本输入与 PCM 输出；
 - VoxCPM2 原生 Voice Design、音色克隆、style 和非语言标签；
-- 服务端分段与跨段 continuation；
+- 服务端分段；一次合成请求使用一组不可变的固定跨段锚定输入，生成片段不得滚动
+  成为下一片段的新锚点；
 - 最小音色创建、列表和删除；
 - CUDA-only；普通用户使用公开的固定版本镜像、私有 env-file 和唯一
   `docker run`；

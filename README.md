@@ -38,7 +38,7 @@ docker run -d \
   --env-file ./botified-tts.env \
   -p 8000:8000 \
   -v botified-tts-data:/data \
-  ghcr.io/lzjever/botified-tts:v0.2.0
+  ghcr.io/lzjever/botified-tts:v0.2.1
 ```
 
 Check readiness and failures with:
@@ -100,7 +100,7 @@ docker build --provenance=false --platform linux/amd64 -t botified-tts:local .
 ```
 
 Run it with the same env file, GPU, port, and volume from the service command
-above, replacing only `ghcr.io/lzjever/botified-tts:v0.2.0` with
+above, replacing only `ghcr.io/lzjever/botified-tts:v0.2.1` with
 `botified-tts:local`.
 
 ## API and capabilities
@@ -145,9 +145,10 @@ the same options, then send `append` events followed by `finish` or `cancel`.
 `prompt_text`. A profile used in faithful mode must have a `prompt_text` that
 exactly matches the words spoken in its reference recording.
 
-The service also supports VoxCPM2 native tags, sentence-aware segmentation,
-continuation, and cancellation. It receives final speakable plain text and does
-not parse Markdown or SSML. The bundled
+The service also supports VoxCPM2 native tags and cancellation, automatically
+splits input into short sentence-aware segments, and uses fixed request-level
+conditioning to reduce accumulated voice drift across segments. It receives
+final speakable plain text and does not parse Markdown or SSML. The bundled
 [`voxcpm-tts` Skill](skills/voxcpm-tts/SKILL.md) provides the concise HTTP
 workflow for synthesis and voice management. Its `speak` command requests WAV
 or Ogg/Opus from the lowercase `.wav` or `.ogg` output suffix; it does not run
