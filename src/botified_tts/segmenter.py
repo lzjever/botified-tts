@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 SOFT_MIN_CHARS = 24
 DEADLINE_MIN_CHARS = 12
-TARGET_MAX_CHARS = 100
-HARD_MAX_CHARS = 160
+TARGET_MAX_CHARS = 55
+HARD_MAX_CHARS = 80
 
 OFFICIAL_TAGS = (
     "[laughing]",
@@ -137,6 +137,13 @@ class Segmenter:
 
         if len(self._buffer) < HARD_MAX_CHARS:
             return None
+
+        for cut in range(HARD_MAX_CHARS, SOFT_MIN_CHARS - 1, -1):
+            if (
+                self._buffer[cut - 1].isspace()
+                and self._is_safe_cut(cut, protected)
+            ):
+                return cut
 
         for cut in range(HARD_MAX_CHARS, 0, -1):
             if self._is_safe_cut(cut, protected):
