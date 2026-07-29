@@ -17,8 +17,9 @@ Resolve the helper first:
 TTS=<skill-directory>/scripts/botified-tts
 ```
 
-Before use, verify the helper is executable and the host has `bash`, `curl`,
-`python3`, `mktemp`, `ln`, `rm`, and `cat`. If a prerequisite is absent, report it; do not install dependencies or replace the helper with ad hoc HTTP.
+Before use, verify the helper is executable and the host has `python3`. If
+either prerequisite is absent, report it; do not install dependencies or
+replace the helper with ad hoc HTTP.
 
 Configuration comes from Botified `<resolved-agents-dir>/env.d/*.env` and is
 globally visible to every Botified Bash process, not isolated to this Skill. Before every helper call, check the URL without printing its value:

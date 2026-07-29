@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import wave
 from contextlib import contextmanager
@@ -38,7 +39,10 @@ def _ogg() -> bytes:
 class _Server(ThreadingHTTPServer):
     records: list[tuple[str, str, dict[str, str], bytes]]
     fail_speech: bool
+    speech_error_response: bytes
     speech_response: tuple[bytes, str] | None
+    speech_started: threading.Event | None
+    speech_release: threading.Event | None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -85,10 +89,14 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/speech" and self.server.fail_speech:
             self._send(
                 400,
-                b'{"error":{"code":"invalid_request"}}',
+                self.server.speech_error_response,
                 "application/json",
             )
         elif self.path == "/v1/speech":
+            if self.server.speech_started is not None:
+                self.server.speech_started.set()
+            if self.server.speech_release is not None:
+                self.server.speech_release.wait()
             if self.server.speech_response is not None:
                 body, content_type = self.server.speech_response
             elif self.headers.get("Accept") == "audio/ogg":
@@ -112,7 +120,10 @@ def _service() -> Iterator[tuple[_Server, str]]:
     server = _Server(("127.0.0.1", 0), _Handler)
     server.records = []
     server.fail_speech = False
+    server.speech_error_response = b'{"error":{"code":"invalid_request"}}'
     server.speech_response = None
+    server.speech_started = None
+    server.speech_release = None
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
@@ -298,6 +309,36 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
     ]
 
 
+def test_helper_runs_with_only_python3_on_path(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(Path(sys.executable).resolve())
+    output = tmp_path / "speech.ogg"
+
+    with _service() as (server, url):
+        health = _run(
+            f"{url}/",
+            "health",
+            api_key=None,
+            environment_overrides={"PATH": str(bin_dir)},
+        )
+        spoken = _run(
+            url,
+            "speak",
+            "--text",
+            "standard library only",
+            "--output",
+            str(output),
+            environment_overrides={"PATH": str(bin_dir)},
+        )
+
+    assert health.returncode == 0
+    assert json.loads(health.stdout) == {"status": "ready"}
+    assert spoken.returncode == 0
+    assert spoken.stdout.strip() == str(output)
+    assert output.read_bytes() == _ogg()
+
+
 @pytest.mark.parametrize(
     ("manifest_filename", "wire_filename"),
     (
@@ -457,6 +498,45 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
     assert list(tmp_path.glob(".speech.wav.tmp.*")) == []
 
 
+def test_helper_does_not_overwrite_output_created_during_request(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "speech.ogg"
+    started = threading.Event()
+    release = threading.Event()
+    results: list[subprocess.CompletedProcess[str]] = []
+
+    with _service() as (server, url):
+        server.speech_started = started
+        server.speech_release = release
+        worker = threading.Thread(
+            target=lambda: results.append(
+                _run(
+                    url,
+                    "speak",
+                    "--text",
+                    "x",
+                    "--output",
+                    str(output),
+                )
+            )
+        )
+        worker.start()
+        try:
+            assert started.wait(timeout=5)
+            output.write_bytes(b"created-by-another-process")
+        finally:
+            release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert len(results) == 1
+    assert results[0].returncode != 0
+    assert "--output was created while speech was generated" in results[0].stderr
+    assert output.read_bytes() == b"created-by-another-process"
+    assert list(tmp_path.glob(".speech.ogg.tmp.*")) == []
+
+
 @pytest.mark.parametrize(
     ("body", "content_type", "message"),
     (
@@ -490,6 +570,33 @@ def test_helper_rejects_invalid_ogg_response_atomically(
     assert list(tmp_path.glob(".speech.ogg.tmp.*")) == []
 
 
+def test_helper_does_not_leak_key_across_bounded_error_body(
+    tmp_path: Path,
+) -> None:
+    api_key = "secret-crossing-the-boundary"
+    output = tmp_path / "speech.ogg"
+
+    with _service() as (server, url):
+        server.fail_speech = True
+        server.speech_error_response = (
+            b"x" * (64 * 1024 - 3) + api_key.encode() + b"tail"
+        )
+        result = _run(
+            url,
+            "speak",
+            "--text",
+            "x",
+            "--output",
+            str(output),
+            api_key=api_key,
+        )
+
+    assert result.returncode != 0
+    assert "response body omitted" in result.stderr
+    assert api_key not in result.stdout + result.stderr
+    assert not output.exists()
+
+
 def test_helper_rejects_invalid_direct_environment_before_request() -> None:
     with _service() as (server, url):
         cases = (
@@ -518,6 +625,25 @@ def test_helper_rejects_invalid_direct_environment_before_request() -> None:
     assert server.records == []
 
 
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://user@127.0.0.1:8000",
+        "http://127.0.0.1:8000/api",
+        "http://127.0.0.1:8000?query=1",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:",
+        "http://tts example",
+    ),
+    ids=("userinfo", "path", "query", "port-zero", "dangling-port", "whitespace"),
+)
+def test_helper_rejects_invalid_service_base_url(url: str) -> None:
+    result = _run(url, "voice-list")
+
+    assert result.returncode != 0
+    assert "BOTIFIED_TTS_URL is not a valid service base URL" in result.stderr
+
+
 def test_helper_explicitly_rejects_removed_env_file_flag(tmp_path: Path) -> None:
     legacy_file = tmp_path / "botified-tts.env"
     legacy_file.write_text(
@@ -536,43 +662,3 @@ def test_helper_explicitly_rejects_removed_env_file_flag(tmp_path: Path) -> None
     assert result.returncode != 0
     assert "unknown global argument: --env-file" in result.stderr
     assert server.records == []
-
-
-def test_helper_sends_bearer_header_over_stdin_not_argv(tmp_path: Path) -> None:
-    api_key = "Aa09._~-secret-not-in-argv"
-    curl_arguments = tmp_path / "curl-arguments"
-    curl_environment = tmp_path / "curl-environment"
-    curl_stdin = tmp_path / "curl-stdin"
-    executable_dir = tmp_path / "bin"
-    executable_dir.mkdir()
-    fake_curl = executable_dir / "curl"
-    fake_curl.write_text(
-        "#!/usr/bin/env bash\n"
-        'printf \'%s\\0\' "$@" > "${CURL_ARGUMENTS_FILE}"\n'
-        'env -0 > "${CURL_ENVIRONMENT_FILE}"\n'
-        'cat > "${CURL_STDIN_FILE}"\n'
-        'printf \'{"object":"list","data":[]}\'\n',
-        encoding="utf-8",
-    )
-    fake_curl.chmod(0o755)
-
-    result = _run(
-        "http://127.0.0.1:8000",
-        "voice-list",
-        api_key=api_key,
-        environment_overrides={
-            "PATH": f"{executable_dir}:{os.environ['PATH']}",
-            "CURL_ARGUMENTS_FILE": str(curl_arguments),
-            "CURL_ENVIRONMENT_FILE": str(curl_environment),
-            "CURL_STDIN_FILE": str(curl_stdin),
-        },
-    )
-
-    assert result.returncode == 0
-    assert api_key.encode() not in curl_arguments.read_bytes()
-    assert b"BOTIFIED_TTS_API_KEY=" not in curl_environment.read_bytes()
-    assert api_key.encode() not in curl_environment.read_bytes()
-    assert (
-        curl_stdin.read_text(encoding="ascii") == f"Authorization: Bearer {api_key}\n"
-    )
-    assert api_key not in result.stdout + result.stderr

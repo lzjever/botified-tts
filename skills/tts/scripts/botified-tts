@@ -1,293 +1,428 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+from __future__ import annotations
 
-API_KEY="${BOTIFIED_TTS_API_KEY:-}"
-unset BOTIFIED_TTS_API_KEY
-export -n API_KEY
-
-fail() {
-    printf 'botified-tts: %s\n' "$*" >&2
-    exit 2
-}
-
-require_value() {
-    [[ $# -ge 2 && -n "$2" ]] || fail "$1 requires a non-empty value"
-}
-
-set_once() {
-    local variable="$1"
-    local flag="$2"
-    local value="$3"
-    [[ -z "${!variable}" ]] || fail "${flag} may only be specified once"
-    printf -v "${variable}" '%s' "${value}"
-}
-
-require_url() {
-    [[ -n "${BOTIFIED_TTS_URL:-}" ]] || fail "BOTIFIED_TTS_URL is required"
-    BASE_URL="${BOTIFIED_TTS_URL}"
-    while [[ "${BASE_URL}" == */ ]]; do
-        BASE_URL="${BASE_URL%/}"
-    done
-    [[ "${BASE_URL}" == http://* || "${BASE_URL}" == https://* ]] \
-        || fail "BOTIFIED_TTS_URL must use http or https"
-    readonly BASE_URL
-}
-
-require_api_key() {
-    [[ -n "${API_KEY}" ]] || fail "BOTIFIED_TTS_API_KEY is required"
-    [[ "${API_KEY}" =~ ^[A-Za-z0-9._~-]+$ ]] \
-        || fail "BOTIFIED_TTS_API_KEY must match [A-Za-z0-9._~-]+"
-}
-
-curl_base() {
-    curl \
-        --disable \
-        --silent \
-        --show-error \
-        --fail-with-body \
-        --connect-timeout 5 \
-        --max-time 600 \
-        --proto '=http,https' \
-        "$@"
-}
-
-authorized_curl() {
-    printf 'Authorization: Bearer %s\n' "${API_KEY}" \
-        | curl_base --header @- "$@"
-}
-
-health() {
-    [[ $# -eq 0 ]] || fail "health accepts no arguments"
-    require_url
-    curl_base "${BASE_URL}/health"
-    printf '\n'
-}
-
-voice_create() {
-    local name=""
-    local file=""
-    local filename=""
-    local prompt_text=""
-    local wire_filename=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --name|--file|--filename|--prompt-text)
-                require_value "$@"
-                case "$1" in
-                    --name) set_once name "$1" "$2" ;;
-                    --file) set_once file "$1" "$2" ;;
-                    --filename) set_once filename "$1" "$2" ;;
-                    --prompt-text) set_once prompt_text "$1" "$2" ;;
-                esac
-                shift 2
-                ;;
-            *) fail "unknown voice-create argument: $1" ;;
-        esac
-    done
-
-    [[ -n "${name}" ]] || fail "--name is required"
-    [[ -n "${file}" ]] || fail "--file is required"
-    [[ -n "${filename}" ]] || fail "--filename is required"
-    [[ -f "${file}" && -r "${file}" ]] \
-        || fail "--file must be a readable regular file"
-    case "${filename}" in
-        *.[Ww][Aa][Vv]) wire_filename="reference.wav" ;;
-        *.[Ff][Ll][Aa][Cc]) wire_filename="reference.flac" ;;
-        *.[Mm][Pp]3) wire_filename="reference.mp3" ;;
-        *) fail "--filename must end with .wav, .flac, or .mp3" ;;
-    esac
-    require_url
-    require_api_key
-
-    local form=(
-        --request POST
-        --form-string "name=${name}"
-        --form "file=@${file};filename=${wire_filename}"
-    )
-    if [[ -n "${prompt_text}" ]]; then
-        form+=(--form-string "prompt_text=${prompt_text}")
-    fi
-    authorized_curl "${form[@]}" "${BASE_URL}/v1/voices"
-    printf '\n'
-}
-
-voice_list() {
-    [[ $# -eq 0 ]] || fail "voice-list accepts no arguments"
-    require_url
-    require_api_key
-    authorized_curl "${BASE_URL}/v1/voices"
-    printf '\n'
-}
-
-voice_delete() {
-    local voice_id=""
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --id)
-                require_value "$@"
-                set_once voice_id "$1" "$2"
-                shift 2
-                ;;
-            *) fail "unknown voice-delete argument: $1" ;;
-        esac
-    done
-    [[ "${voice_id}" =~ ^voice_[0-9a-f]{32}$ ]] \
-        || fail "--id must be a Botified TTS voice ID"
-    require_url
-    require_api_key
-    authorized_curl --request DELETE "${BASE_URL}/v1/voices/${voice_id}"
-    printf 'deleted %s\n' "${voice_id}"
-}
-
-build_speech_json() {
-    python3 - "$@" <<'PY'
+import http.client
 import json
+import os
+import re
+import secrets
+import stat
 import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, Callable, NoReturn
+from urllib.parse import urlsplit
 
-text, style, design, voice_id, mode = sys.argv[1:]
-body = {"text": text}
-if design:
-    body["voice"] = {"type": "design", "description": design}
-elif voice_id:
-    body["voice"] = {"type": "profile", "id": voice_id}
-    body["mode"] = mode
-if style:
-    body["style"] = style
-print(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
-PY
-}
 
-speak() {
-    local text=""
-    local output=""
-    local style=""
-    local design=""
-    local voice_id=""
-    local mode=""
+VOICE_ID_PATTERN = re.compile(r"voice_[0-9a-f]{32}\Z")
+API_KEY_PATTERN = re.compile(r"[A-Za-z0-9._~-]+\Z")
+API_KEY = os.environ.pop("BOTIFIED_TTS_API_KEY", "")
+CHUNK_SIZE = 64 * 1024
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --text|--output|--style|--design|--voice-id|--mode)
-                require_value "$@"
-                case "$1" in
-                    --text) set_once text "$1" "$2" ;;
-                    --output) set_once output "$1" "$2" ;;
-                    --style) set_once style "$1" "$2" ;;
-                    --design) set_once design "$1" "$2" ;;
-                    --voice-id) set_once voice_id "$1" "$2" ;;
-                    --mode) set_once mode "$1" "$2" ;;
-                esac
-                shift 2
-                ;;
-            *) fail "unknown speak argument: $1" ;;
-        esac
-    done
 
-    [[ -n "${text}" ]] || fail "--text is required"
-    [[ -n "${output}" ]] || fail "--output is required"
-    local audio_format
-    local accept
-    local validation_name
-    case "${output}" in
-        *.wav)
-            audio_format="wav"
-            accept="audio/wav"
-            validation_name="WAV"
-            ;;
-        *.ogg)
-            audio_format="ogg"
-            accept="audio/ogg"
-            validation_name="Ogg/Opus"
-            ;;
-        *) fail "--output must end with .wav or .ogg" ;;
-    esac
-    [[ -z "${design}" || -z "${voice_id}" ]] \
-        || fail "--design and --voice-id are mutually exclusive"
-    [[ -z "${mode}" || -n "${voice_id}" ]] \
-        || fail "--mode requires --voice-id"
-    if [[ -n "${voice_id}" ]]; then
-        [[ "${voice_id}" =~ ^voice_[0-9a-f]{32}$ ]] \
-            || fail "--voice-id must be a Botified TTS voice ID"
-        mode="${mode:-controllable}"
-        [[ "${mode}" == "controllable" || "${mode}" == "faithful" ]] \
-            || fail "--mode must be controllable or faithful"
-        [[ "${mode}" != "faithful" || -z "${style}" ]] \
-            || fail "faithful mode does not accept --style"
-    fi
-    [[ ! -e "${output}" && ! -L "${output}" ]] \
-        || fail "--output already exists"
+class HelperError(Exception):
+    pass
 
-    local output_dir="${output%/*}"
-    local output_name="${output##*/}"
-    [[ "${output_dir}" != "${output}" ]] || output_dir="."
-    [[ -d "${output_dir}" && -w "${output_dir}" ]] \
-        || fail "--output parent must be a writable directory"
 
-    require_url
-    require_api_key
-    command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+@dataclass(frozen=True)
+class ServiceURL:
+    scheme: str
+    host: str
+    port: int | None
 
-    local body
-    local temporary
-    local content_type
-    body="$(build_speech_json "${text}" "${style}" "${design}" "${voice_id}" "${mode}")"
-    temporary="$(mktemp -- "${output_dir}/.${output_name}.tmp.XXXXXX")"
-    trap 'rm -f -- "${temporary}"' EXIT
 
-    if ! content_type="$(
-        authorized_curl \
-            --request POST \
-            --header "Accept: ${accept}" \
-            --header 'Content-Type: application/json' \
-            --data-binary "${body}" \
-            --output "${temporary}" \
-            --write-out '%{content_type}' \
-            "${BASE_URL}/v1/speech"
-    )"; then
-        [[ ! -s "${temporary}" ]] || cat -- "${temporary}" >&2
-        fail "speech request failed"
-    fi
-    [[ "${content_type%%;*}" == "${accept}" ]] \
-        || fail "speech response is not ${accept}"
-    python3 - "${audio_format}" "${temporary}" <<'PY' \
-        || fail "speech response is not a valid ${validation_name}"
-import pathlib
-import sys
+def fail(message: str) -> NoReturn:
+    raise HelperError(message)
 
-audio_format = sys.argv[1]
-data = pathlib.Path(sys.argv[2]).read_bytes()
-if audio_format == "wav":
-    valid = len(data) > 44 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"
-else:
-    valid = data[:4] == b"OggS" and b"OpusHead" in data[:256]
-raise SystemExit(not valid)
-PY
 
-    ln --no-target-directory -- "${temporary}" "${output}" \
-        || fail "--output was created while speech was generated"
-    rm -f -- "${temporary}"
-    trap - EXIT
-    printf '%s\n' "${output}"
-}
+def safe_error(message: str) -> str:
+    if API_KEY:
+        return message.replace(API_KEY, "[redacted]")
+    return message
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --*) fail "unknown global argument: $1" ;;
-        *) break ;;
-    esac
-done
 
-command -v curl >/dev/null 2>&1 || fail "curl is required"
-[[ $# -gt 0 ]] || fail "a command is required"
-command="$1"
-shift
+def require_url() -> ServiceURL:
+    base_url = os.environ.get("BOTIFIED_TTS_URL", "")
+    if not base_url:
+        fail("BOTIFIED_TTS_URL is required")
+    if not base_url.startswith(("http://", "https://")):
+        fail("BOTIFIED_TTS_URL must use http or https")
+    if base_url.endswith("/"):
+        base_url = base_url[:-1]
+    parsed = urlsplit(base_url)
+    try:
+        port = parsed.port
+    except ValueError:
+        fail("BOTIFIED_TTS_URL is not a valid service base URL")
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc.endswith(":")
+        or port == 0
+        or any(character.isspace() for character in base_url)
+    ):
+        fail("BOTIFIED_TTS_URL is not a valid service base URL")
+    return ServiceURL(
+        scheme=parsed.scheme,
+        host=parsed.hostname,
+        port=port,
+    )
 
-case "${command}" in
-    health) health "$@" ;;
-    voice-create) voice_create "$@" ;;
-    voice-list) voice_list "$@" ;;
-    voice-delete) voice_delete "$@" ;;
-    speak) speak "$@" ;;
-    *) fail "unknown command: ${command}" ;;
-esac
+
+def require_api_key() -> str:
+    if not API_KEY:
+        fail("BOTIFIED_TTS_API_KEY is required")
+    if API_KEY_PATTERN.fullmatch(API_KEY) is None:
+        fail("BOTIFIED_TTS_API_KEY must match [A-Za-z0-9._~-]+")
+    return API_KEY
+
+
+def parse_flags(
+    command: str,
+    arguments: list[str],
+    accepted: set[str],
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    position = 0
+    while position < len(arguments):
+        flag = arguments[position]
+        if flag not in accepted:
+            fail(f"unknown {command} argument: {flag}")
+        if position + 1 >= len(arguments) or not arguments[position + 1]:
+            fail(f"{flag} requires a non-empty value")
+        if flag in values:
+            fail(f"{flag} may only be specified once")
+        values[flag] = arguments[position + 1]
+        position += 2
+    return values
+
+
+def request(
+    service: ServiceURL,
+    path: str,
+    *,
+    method: str = "GET",
+    authorized: bool = False,
+    body: bytes | None = None,
+    body_length: int | None = None,
+    send_body: Callable[[http.client.HTTPConnection], None] | None = None,
+    headers: dict[str, str] | None = None,
+    response_file: BinaryIO | None = None,
+) -> tuple[bytes, str]:
+    if body is not None:
+        body_length = len(body)
+    if body is not None and send_body is not None:
+        raise AssertionError("request body has two sources")
+
+    request_headers = dict(headers or {})
+    if authorized:
+        request_headers["Authorization"] = f"Bearer {require_api_key()}"
+    connection_type = (
+        http.client.HTTPSConnection
+        if service.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_type(service.host, service.port, timeout=5)
+    try:
+        connection.connect()
+        if connection.sock is not None:
+            connection.sock.settimeout(600)
+        connection.putrequest(method, path)
+        for name, value in request_headers.items():
+            connection.putheader(name, value)
+        if body_length is not None:
+            connection.putheader("Content-Length", str(body_length))
+        connection.endheaders()
+        if body is not None:
+            connection.send(body)
+        elif send_body is not None:
+            send_body(connection)
+
+        response = connection.getresponse()
+        if not 200 <= response.status < 300:
+            _write_error_body(response)
+            fail(f"request failed with HTTP {response.status}")
+        content_type = response.getheader("Content-Type", "")
+        if response_file is None:
+            response_body = response.read()
+        else:
+            response_body = b""
+            while chunk := response.read(CHUNK_SIZE):
+                response_file.write(chunk)
+    except HelperError:
+        raise
+    except (http.client.HTTPException, OSError, ValueError) as error:
+        fail(f"request failed: {safe_error(str(error))}")
+    finally:
+        connection.close()
+    return response_body, content_type
+
+
+def _write_error_body(response: http.client.HTTPResponse) -> None:
+    body = response.read(CHUNK_SIZE + 1)
+    if len(body) > CHUNK_SIZE:
+        sys.stderr.buffer.write(
+            b"[response body omitted: exceeds 65536 bytes]\n"
+        )
+        return
+    if API_KEY:
+        body = body.replace(API_KEY.encode(), b"[redacted]")
+    if body:
+        sys.stderr.buffer.write(body)
+        sys.stderr.buffer.write(b"\n")
+
+
+def write_response(body: bytes) -> None:
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.write(b"\n")
+
+
+def health(arguments: list[str]) -> None:
+    if arguments:
+        fail("health accepts no arguments")
+    body, _ = request(require_url(), "/health")
+    write_response(body)
+
+
+def voice_create(arguments: list[str]) -> None:
+    values = parse_flags(
+        "voice-create",
+        arguments,
+        {"--name", "--file", "--filename", "--prompt-text"},
+    )
+    name = values.get("--name", "")
+    reference_path = values.get("--file", "")
+    filename = values.get("--filename", "")
+    prompt_text = values.get("--prompt-text", "")
+    if not name:
+        fail("--name is required")
+    if not reference_path:
+        fail("--file is required")
+    if not filename:
+        fail("--filename is required")
+
+    reference = Path(reference_path)
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".wav", ".flac", ".mp3"}:
+        fail("--filename must end with .wav, .flac, or .mp3")
+
+    try:
+        reference_file = reference.open("rb")
+    except OSError:
+        fail("--file must be a readable regular file")
+    reference_stat = os.fstat(reference_file.fileno())
+    if not stat.S_ISREG(reference_stat.st_mode):
+        reference_file.close()
+        fail("--file must be a readable regular file")
+
+    boundary = f"botified-tts-{secrets.token_hex(16)}"
+    before_file = _form_field(boundary, "name", name.encode()) + _form_file_header(
+        boundary,
+        "file",
+        f"reference{suffix}",
+    )
+    after_file = b"\r\n"
+    if prompt_text:
+        after_file += _form_field(boundary, "prompt_text", prompt_text.encode())
+    after_file += f"--{boundary}--\r\n".encode()
+
+    def send_multipart(connection: http.client.HTTPConnection) -> None:
+        connection.send(before_file)
+        remaining = reference_stat.st_size
+        while remaining:
+            chunk = reference_file.read(min(CHUNK_SIZE, remaining))
+            if not chunk:
+                fail("--file changed while request was sent")
+            connection.send(chunk)
+            remaining -= len(chunk)
+        connection.send(after_file)
+
+    try:
+        response, _ = request(
+            require_url(),
+            "/v1/voices",
+            method="POST",
+            authorized=True,
+            body_length=len(before_file) + reference_stat.st_size + len(after_file),
+            send_body=send_multipart,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+    finally:
+        reference_file.close()
+    write_response(response)
+
+
+def _form_field(boundary: str, name: str, value: bytes) -> bytes:
+    return (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+        "\r\n\r\n"
+    ).encode() + value + b"\r\n"
+
+
+def _form_file_header(
+    boundary: str,
+    name: str,
+    filename: str,
+) -> bytes:
+    return (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; '
+        f'filename="{filename}"\r\nContent-Type: application/octet-stream'
+        "\r\n\r\n"
+    ).encode()
+
+
+def voice_list(arguments: list[str]) -> None:
+    if arguments:
+        fail("voice-list accepts no arguments")
+    body, _ = request(require_url(), "/v1/voices", authorized=True)
+    write_response(body)
+
+
+def voice_delete(arguments: list[str]) -> None:
+    values = parse_flags("voice-delete", arguments, {"--id"})
+    voice_id = values.get("--id", "")
+    if VOICE_ID_PATTERN.fullmatch(voice_id) is None:
+        fail("--id must be a Botified TTS voice ID")
+    request(
+        require_url(),
+        f"/v1/voices/{voice_id}",
+        method="DELETE",
+        authorized=True,
+    )
+    print(f"deleted {voice_id}")
+
+
+def speak(arguments: list[str]) -> None:
+    values = parse_flags(
+        "speak",
+        arguments,
+        {"--text", "--output", "--style", "--design", "--voice-id", "--mode"},
+    )
+    text = values.get("--text", "")
+    output_value = values.get("--output", "")
+    style = values.get("--style", "")
+    design = values.get("--design", "")
+    voice_id = values.get("--voice-id", "")
+    mode = values.get("--mode", "")
+
+    if not text:
+        fail("--text is required")
+    if not output_value:
+        fail("--output is required")
+    if output_value.endswith(".wav"):
+        audio_format, accept, validation_name = "wav", "audio/wav", "WAV"
+    elif output_value.endswith(".ogg"):
+        audio_format, accept, validation_name = "ogg", "audio/ogg", "Ogg/Opus"
+    else:
+        fail("--output must end with .wav or .ogg")
+    if design and voice_id:
+        fail("--design and --voice-id are mutually exclusive")
+    if mode and not voice_id:
+        fail("--mode requires --voice-id")
+    if voice_id:
+        if VOICE_ID_PATTERN.fullmatch(voice_id) is None:
+            fail("--voice-id must be a Botified TTS voice ID")
+        mode = mode or "controllable"
+        if mode not in {"controllable", "faithful"}:
+            fail("--mode must be controllable or faithful")
+        if mode == "faithful" and style:
+            fail("faithful mode does not accept --style")
+
+    output = Path(output_value)
+    if os.path.lexists(output):
+        fail("--output already exists")
+    output_parent = output.parent
+    if not output_parent.is_dir() or not os.access(output_parent, os.W_OK):
+        fail("--output parent must be a writable directory")
+
+    payload: dict[str, object] = {"text": text}
+    if design:
+        payload["voice"] = {"type": "design", "description": design}
+    elif voice_id:
+        payload["voice"] = {"type": "profile", "id": voice_id}
+        payload["mode"] = mode
+    if style:
+        payload["style"] = style
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+
+    temporary_fd, temporary_value = tempfile.mkstemp(
+        prefix=f".{output.name}.tmp.",
+        dir=output_parent,
+    )
+    temporary = Path(temporary_value)
+    try:
+        with os.fdopen(temporary_fd, "wb") as temporary_file:
+            _, content_type = request(
+                require_url(),
+                "/v1/speech",
+                method="POST",
+                authorized=True,
+                body=body,
+                headers={
+                    "Accept": accept,
+                    "Content-Type": "application/json",
+                },
+                response_file=temporary_file,
+            )
+        if content_type.partition(";")[0].strip().lower() != accept:
+            fail(f"speech response is not {accept}")
+        if not _valid_audio(audio_format, temporary):
+            fail(f"speech response is not a valid {validation_name}")
+        try:
+            os.link(temporary, output)
+        except OSError:
+            fail("--output was created while speech was generated")
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    print(output_value)
+
+
+def _valid_audio(audio_format: str, path: Path) -> bool:
+    with path.open("rb") as audio:
+        data = audio.read(256)
+    if audio_format == "wav":
+        return (
+            path.stat().st_size > 44
+            and data[:4] == b"RIFF"
+            and data[8:12] == b"WAVE"
+        )
+    return data[:4] == b"OggS" and b"OpusHead" in data[:256]
+
+
+def main(arguments: list[str]) -> None:
+    if arguments and arguments[0].startswith("--"):
+        fail(f"unknown global argument: {arguments[0]}")
+    if not arguments:
+        fail("a command is required")
+    command, *command_arguments = arguments
+    commands = {
+        "health": health,
+        "voice-create": voice_create,
+        "voice-list": voice_list,
+        "voice-delete": voice_delete,
+        "speak": speak,
+    }
+    handler = commands.get(command)
+    if handler is None:
+        fail(f"unknown command: {command}")
+    handler(command_arguments)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except HelperError as error:
+        print(f"botified-tts: {safe_error(str(error))}", file=sys.stderr)
+        raise SystemExit(2) from None
