@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+API_KEY="${BOTIFIED_TTS_API_KEY:-}"
 unset BOTIFIED_TTS_API_KEY
-ENV_FILE=""
-API_KEY=""
+export -n API_KEY
 
 fail() {
     printf 'botified-tts: %s\n' "$*" >&2
@@ -34,45 +34,9 @@ require_url() {
 }
 
 require_api_key() {
-    [[ -n "${ENV_FILE}" ]] || fail "--env-file is required"
-    [[ -f "${ENV_FILE}" && -r "${ENV_FILE}" ]] \
-        || fail "--env-file must be a readable regular file"
-    command -v python3 >/dev/null 2>&1 || fail "python3 is required"
-    API_KEY="$(
-        python3 - "${ENV_FILE}" <<'PY'
-import pathlib
-import re
-import sys
-
-try:
-    data = pathlib.Path(sys.argv[1]).read_bytes()
-except OSError:
-    print("botified-tts: could not read --env-file", file=sys.stderr)
-    raise SystemExit(2)
-
-prefix = b"BOTIFIED_TTS_API_KEY="
-values = [
-    line.split(b"=", 1)[1]
-    for line in data.split(b"\n")
-    if line.startswith(prefix)
-]
-if len(values) != 1:
-    print(
-        "botified-tts: --env-file must contain exactly one "
-        "BOTIFIED_TTS_API_KEY entry",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-value = values[0]
-if re.fullmatch(rb"[A-Za-z0-9._~-]+", value) is None:
-    print(
-        "botified-tts: BOTIFIED_TTS_API_KEY must match [A-Za-z0-9._~-]+",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-sys.stdout.buffer.write(value)
-PY
-    )" || exit $?
+    [[ -n "${API_KEY}" ]] || fail "BOTIFIED_TTS_API_KEY is required"
+    [[ "${API_KEY}" =~ ^[A-Za-z0-9._~-]+$ ]] \
+        || fail "BOTIFIED_TTS_API_KEY must match [A-Za-z0-9._~-]+"
 }
 
 curl_base() {
@@ -102,15 +66,18 @@ health() {
 voice_create() {
     local name=""
     local file=""
+    local filename=""
     local prompt_text=""
+    local wire_filename=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --name|--file|--prompt-text)
+            --name|--file|--filename|--prompt-text)
                 require_value "$@"
                 case "$1" in
                     --name) set_once name "$1" "$2" ;;
                     --file) set_once file "$1" "$2" ;;
+                    --filename) set_once filename "$1" "$2" ;;
                     --prompt-text) set_once prompt_text "$1" "$2" ;;
                 esac
                 shift 2
@@ -121,15 +88,22 @@ voice_create() {
 
     [[ -n "${name}" ]] || fail "--name is required"
     [[ -n "${file}" ]] || fail "--file is required"
+    [[ -n "${filename}" ]] || fail "--filename is required"
     [[ -f "${file}" && -r "${file}" ]] \
         || fail "--file must be a readable regular file"
+    case "${filename}" in
+        *.[Ww][Aa][Vv]) wire_filename="reference.wav" ;;
+        *.[Ff][Ll][Aa][Cc]) wire_filename="reference.flac" ;;
+        *.[Mm][Pp]3) wire_filename="reference.mp3" ;;
+        *) fail "--filename must end with .wav, .flac, or .mp3" ;;
+    esac
     require_url
     require_api_key
 
     local form=(
         --request POST
         --form-string "name=${name}"
-        --form "file=@${file}"
+        --form "file=@${file};filename=${wire_filename}"
     )
     if [[ -n "${prompt_text}" ]]; then
         form+=(--form-string "prompt_text=${prompt_text}")
@@ -299,11 +273,6 @@ PY
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --env-file)
-            require_value "$@"
-            set_once ENV_FILE "$1" "$2"
-            shift 2
-            ;;
         --*) fail "unknown global argument: $1" ;;
         *) break ;;
     esac

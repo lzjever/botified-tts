@@ -124,24 +124,22 @@ def _service() -> Iterator[tuple[_Server, str]]:
 
 
 def _run(
-    url: str,
+    url: str | None,
     *args: str,
-    env_file: Path | None = None,
-    include_env_file: bool = True,
+    api_key: str | None = "test-key",
     environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
-    environment["BOTIFIED_TTS_URL"] = url
-    environment["BOTIFIED_TTS_API_KEY"] = "ignored-legacy-key"
+    environment.pop("BOTIFIED_TTS_URL", None)
+    environment.pop("BOTIFIED_TTS_API_KEY", None)
+    if url is not None:
+        environment["BOTIFIED_TTS_URL"] = url
+    if api_key is not None:
+        environment["BOTIFIED_TTS_API_KEY"] = api_key
     if environment_overrides:
         environment.update(environment_overrides)
-    command = [str(HELPER)]
-    if include_env_file:
-        assert env_file is not None
-        command.extend(("--env-file", str(env_file)))
-    command.extend(args)
     return subprocess.run(
-        command,
+        [str(HELPER), *args],
         cwd=ROOT,
         env=environment,
         check=False,
@@ -150,7 +148,10 @@ def _run(
     )
 
 
-def _multipart(body: bytes, content_type: str) -> dict[str, bytes]:
+def _multipart(
+    body: bytes,
+    content_type: str,
+) -> dict[str, tuple[str | None, bytes]]:
     message = BytesParser(policy=policy.default).parsebytes(
         b"Content-Type: "
         + content_type.encode()
@@ -158,60 +159,40 @@ def _multipart(body: bytes, content_type: str) -> dict[str, bytes]:
         + body
     )
     return {
-        part.get_param("name", header="content-disposition"): part.get_payload(
-            decode=True
+        part.get_param("name", header="content-disposition"): (
+            part.get_filename(),
+            part.get_payload(decode=True),
         )
         for part in message.iter_parts()
     }
 
 
 def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_text(
-        "BOTIFIED_TTS_MODEL_SOURCE=modelscope\n"
-        "BOTIFIED_TTS_API_KEY=test-key\n"
-        "BOTIFIED_TTS_LOG_LEVEL=INFO\n",
-        encoding="ascii",
-    )
-    reference = tmp_path / "reference.wav"
-    reference.write_bytes(b"reference-audio")
     outputs = [
         tmp_path / f"{name}.wav" for name in ("normal", "design", "clone", "faithful")
     ]
     ogg_output = tmp_path / "publish.ogg"
+    tagged_text = "normal [laughing] text"
 
     with _service() as (server, url):
-        health = _run(url, "health", env_file=env_file)
-        created = _run(
-            url,
-            "voice-create",
-            "--name",
-            "assistant",
-            "--file",
-            str(reference),
-            "--prompt-text",
-            "精确文本",
-            env_file=env_file,
-        )
-        listed = _run(url, "voice-list", env_file=env_file)
+        health = _run(url, "health", api_key=None)
+        listed = _run(url, "voice-list")
         deleted = _run(
             url,
             "voice-delete",
             "--id",
             VOICE_ID,
-            env_file=env_file,
         )
         spoken = [
             _run(
                 url,
                 "speak",
                 "--text",
-                "normal",
+                tagged_text,
                 "--output",
                 str(outputs[0]),
                 "--style",
                 "calm",
-                env_file=env_file,
             ),
             _run(
                 url,
@@ -224,7 +205,6 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
                 "warm voice",
                 "--style",
                 "slow",
-                env_file=env_file,
             ),
             _run(
                 url,
@@ -235,7 +215,6 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
                 str(outputs[2]),
                 "--voice-id",
                 VOICE_ID,
-                env_file=env_file,
             ),
             _run(
                 url,
@@ -248,7 +227,6 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
                 VOICE_ID,
                 "--mode",
                 "faithful",
-                env_file=env_file,
             ),
         ]
         ogg = _run(
@@ -258,15 +236,12 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
             "publish",
             "--output",
             str(ogg_output),
-            env_file=env_file,
         )
 
     assert all(
-        result.returncode == 0
-        for result in (health, created, listed, deleted, *spoken, ogg)
+        result.returncode == 0 for result in (health, listed, deleted, *spoken, ogg)
     )
     assert json.loads(health.stdout) == {"status": "ready"}
-    assert json.loads(created.stdout) == {"id": VOICE_ID}
     assert json.loads(listed.stdout) == {"object": "list", "data": []}
     assert deleted.stdout.strip() == f"deleted {VOICE_ID}"
     assert [result.stdout.strip() for result in spoken] == [
@@ -277,12 +252,11 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
     assert ogg_output.read_bytes() == _ogg()
     assert all(
         "test-key" not in result.stdout + result.stderr
-        for result in (health, created, listed, deleted, *spoken, ogg)
+        for result in (health, listed, deleted, *spoken, ogg)
     )
 
     assert [(method, path) for method, path, _, _ in server.records] == [
         ("GET", "/health"),
-        ("POST", "/v1/voices"),
         ("GET", "/v1/voices"),
         ("DELETE", f"/v1/voices/{VOICE_ID}"),
         ("POST", "/v1/speech"),
@@ -296,24 +270,15 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
         headers["Authorization"] == "Bearer test-key"
         for _, _, headers, _ in server.records[1:]
     )
-    assert [record[2]["Accept"] for record in server.records[4:]] == [
+    assert [record[2]["Accept"] for record in server.records[3:]] == [
         "audio/wav",
         "audio/wav",
         "audio/wav",
         "audio/wav",
         "audio/ogg",
     ]
-    form = _multipart(
-        server.records[1][3],
-        server.records[1][2]["Content-Type"],
-    )
-    assert form == {
-        "name": b"assistant",
-        "file": b"reference-audio",
-        "prompt_text": "精确文本".encode(),
-    }
-    assert [json.loads(record[3]) for record in server.records[4:]] == [
-        {"text": "normal", "style": "calm"},
+    assert [json.loads(record[3]) for record in server.records[3:]] == [
+        {"text": tagged_text, "style": "calm"},
         {
             "text": "design",
             "voice": {"type": "design", "description": "warm voice"},
@@ -333,11 +298,93 @@ def test_helper_routes_commands_and_all_speak_modes(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("manifest_filename", "wire_filename"),
+    (
+        (
+            '中文 空格,逗号;分号"引号\\反斜杠.WaV',
+            "reference.wav",
+        ),
+        ("reference.flac", "reference.flac"),
+        ("reference.mp3", "reference.mp3"),
+    ),
+)
+def test_voice_create_maps_manifest_suffix_to_wire_filename(
+    tmp_path: Path,
+    manifest_filename: str,
+    wire_filename: str,
+) -> None:
+    reference = tmp_path / "file_0123456789abcdef0123456789abcdef"
+    reference_bytes = b"reference-audio"
+    reference.write_bytes(reference_bytes)
+
+    with _service() as (server, url):
+        result = _run(
+            url,
+            "voice-create",
+            "--name",
+            "assistant",
+            "--file",
+            str(reference),
+            "--filename",
+            manifest_filename,
+            "--prompt-text",
+            "精确文本",
+        )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"id": VOICE_ID}
+    assert len(server.records) == 1
+    method, path, headers, body = server.records[0]
+    assert (method, path) == ("POST", "/v1/voices")
+    assert headers["Authorization"] == "Bearer test-key"
+    form = _multipart(body, headers["Content-Type"])
+    assert form == {
+        "name": (None, b"assistant"),
+        "file": (wire_filename, reference_bytes),
+        "prompt_text": (None, "精确文本".encode()),
+    }
+
+
+@pytest.mark.parametrize(
+    ("filename_args", "message"),
+    (
+        ((), "--filename is required"),
+        (("--filename", "reference"), "--filename must end with .wav, .flac, or .mp3"),
+        (
+            ("--filename", "reference.ogg"),
+            "--filename must end with .wav, .flac, or .mp3",
+        ),
+    ),
+    ids=("missing", "no-suffix", "ogg"),
+)
+def test_voice_create_rejects_missing_or_unsupported_manifest_filename(
+    tmp_path: Path,
+    filename_args: tuple[str, ...],
+    message: str,
+) -> None:
+    reference = tmp_path / "file_0123456789abcdef0123456789abcdef"
+    reference.write_bytes(b"reference-audio")
+
+    with _service() as (server, url):
+        result = _run(
+            url,
+            "voice-create",
+            "--name",
+            "assistant",
+            "--file",
+            str(reference),
+            *filename_args,
+        )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert server.records == []
+
+
 def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
     tmp_path: Path,
 ) -> None:
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_text("BOTIFIED_TTS_API_KEY=test-key\n", encoding="ascii")
     output = tmp_path / "speech.wav"
     unsupported_output = tmp_path / "speech.mp3"
     invalid = [
@@ -375,7 +422,7 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
 
     with _service() as (server, url):
         for args in invalid:
-            assert _run(url, *args, env_file=env_file).returncode != 0
+            assert _run(url, *args).returncode != 0
         assert server.records == []
 
         output.write_bytes(b"keep")
@@ -387,28 +434,12 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
                 "x",
                 "--output",
                 str(output),
-                env_file=env_file,
             ).returncode
             != 0
         )
         assert output.read_bytes() == b"keep"
         assert server.records == []
         output.unlink()
-
-        assert _run("", "health", env_file=env_file).returncode != 0
-        missing_flag = _run(url, "voice-list", include_env_file=False)
-        assert missing_flag.returncode != 0
-        assert "--env-file is required" in missing_flag.stderr
-        legacy_flag = _run(
-            url,
-            "--api-key-file",
-            str(env_file),
-            "voice-list",
-            include_env_file=False,
-        )
-        assert legacy_flag.returncode != 0
-        assert "unknown global argument: --api-key-file" in legacy_flag.stderr
-        assert server.records == []
 
         server.fail_speech = True
         failed = _run(
@@ -418,7 +449,6 @@ def test_helper_rejects_invalid_arguments_and_keeps_output_atomic(
             "x",
             "--output",
             str(output),
-            env_file=env_file,
         )
 
     assert failed.returncode != 0
@@ -441,8 +471,6 @@ def test_helper_rejects_invalid_ogg_response_atomically(
     content_type: str,
     message: str,
 ) -> None:
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_text("BOTIFIED_TTS_API_KEY=test-key\n", encoding="ascii")
     output = tmp_path / "speech.ogg"
 
     with _service() as (server, url):
@@ -454,7 +482,6 @@ def test_helper_rejects_invalid_ogg_response_atomically(
             "x",
             "--output",
             str(output),
-            env_file=env_file,
         )
 
     assert result.returncode != 0
@@ -463,103 +490,58 @@ def test_helper_rejects_invalid_ogg_response_atomically(
     assert list(tmp_path.glob(".speech.ogg.tmp.*")) == []
 
 
-def test_helper_rejects_invalid_env_files_without_evaluating_them(
-    tmp_path: Path,
-) -> None:
-    shell_marker = tmp_path / "shell-was-evaluated"
-    invalid_files = {
-        "missing-file": (tmp_path / "missing", "must be a readable regular file"),
-        "missing-key": (
-            tmp_path / "missing-key",
-            "must contain exactly one BOTIFIED_TTS_API_KEY entry",
-        ),
-        "duplicate-key": (
-            tmp_path / "duplicate-key",
-            "must contain exactly one BOTIFIED_TTS_API_KEY entry",
-        ),
-        "empty-key": (
-            tmp_path / "empty-key",
-            "BOTIFIED_TTS_API_KEY must match",
-        ),
-        "quoted-key": (
-            tmp_path / "quoted-key",
-            "BOTIFIED_TTS_API_KEY must match",
-        ),
-        "illegal-key": (
-            tmp_path / "illegal-key",
-            "BOTIFIED_TTS_API_KEY must match",
-        ),
-        "shell-text": (
-            tmp_path / "shell-text",
-            "BOTIFIED_TTS_API_KEY must match",
-        ),
-    }
-    (tmp_path / "missing-key").write_text(
-        "BOTIFIED_TTS_MODEL_SOURCE=modelscope\n",
-        encoding="ascii",
-    )
-    (tmp_path / "duplicate-key").write_text(
-        "BOTIFIED_TTS_API_KEY=first\nBOTIFIED_TTS_API_KEY=second\n",
-        encoding="ascii",
-    )
-    (tmp_path / "empty-key").write_text(
-        "BOTIFIED_TTS_API_KEY=\n",
-        encoding="ascii",
-    )
-    (tmp_path / "quoted-key").write_text(
-        'BOTIFIED_TTS_API_KEY="quoted"\n',
-        encoding="ascii",
-    )
-    (tmp_path / "illegal-key").write_text(
-        "BOTIFIED_TTS_API_KEY=bad value\n",
-        encoding="ascii",
-    )
-    (tmp_path / "shell-text").write_text(
-        f"BOTIFIED_TTS_API_KEY=$(touch {shell_marker})\n",
+def test_helper_rejects_invalid_direct_environment_before_request() -> None:
+    with _service() as (server, url):
+        cases = (
+            (
+                _run(None, "voice-list"),
+                "BOTIFIED_TTS_URL is required",
+            ),
+            (
+                _run(url, "voice-list", api_key=None),
+                "BOTIFIED_TTS_API_KEY is required",
+            ),
+            (
+                _run("ftp://127.0.0.1:21", "voice-list"),
+                "BOTIFIED_TTS_URL must use http or https",
+            ),
+            (
+                _run(url, "voice-list", api_key="bad value"),
+                "BOTIFIED_TTS_API_KEY must match",
+            ),
+        )
+
+    for result, message in cases:
+        assert result.returncode != 0
+        assert message in result.stderr
+        assert "bad value" not in result.stdout + result.stderr
+    assert server.records == []
+
+
+def test_helper_explicitly_rejects_removed_env_file_flag(tmp_path: Path) -> None:
+    legacy_file = tmp_path / "botified-tts.env"
+    legacy_file.write_text(
+        "BOTIFIED_TTS_API_KEY=legacy-key\n",
         encoding="ascii",
     )
 
     with _service() as (server, url):
-        for path, message in invalid_files.values():
-            result = _run(url, "voice-list", env_file=path)
-            assert result.returncode != 0
-            assert message in result.stderr
-            output = result.stdout + result.stderr
-            assert all(
-                value not in output
-                for value in ("first", "second", "quoted", "bad value", "$(touch")
-            )
-        assert server.records == []
-    assert not shell_marker.exists()
-
-
-@pytest.mark.parametrize("line_ending", [b"\r\n", b"\r"])
-def test_helper_rejects_carriage_return_in_literal_api_key_value(
-    tmp_path: Path,
-    line_ending: bytes,
-) -> None:
-    api_key = b"secret-with-carriage-return"
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_bytes(b"BOTIFIED_TTS_API_KEY=" + api_key + line_ending)
-
-    with _service() as (server, url):
-        result = _run(url, "voice-list", env_file=env_file)
+        result = _run(
+            url,
+            "--env-file",
+            str(legacy_file),
+            "voice-list",
+        )
 
     assert result.returncode != 0
-    assert "BOTIFIED_TTS_API_KEY must match" in result.stderr
-    assert api_key.decode() not in result.stdout + result.stderr
+    assert "unknown global argument: --env-file" in result.stderr
     assert server.records == []
 
 
 def test_helper_sends_bearer_header_over_stdin_not_argv(tmp_path: Path) -> None:
     api_key = "Aa09._~-secret-not-in-argv"
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_text(
-        f"BOTIFIED_TTS_API_KEY={api_key}\n"
-        "BOTIFIED_TTS_MODEL_SOURCE=huggingface\n",
-        encoding="ascii",
-    )
     curl_arguments = tmp_path / "curl-arguments"
+    curl_environment = tmp_path / "curl-environment"
     curl_stdin = tmp_path / "curl-stdin"
     executable_dir = tmp_path / "bin"
     executable_dir.mkdir()
@@ -567,6 +549,7 @@ def test_helper_sends_bearer_header_over_stdin_not_argv(tmp_path: Path) -> None:
     fake_curl.write_text(
         "#!/usr/bin/env bash\n"
         'printf \'%s\\0\' "$@" > "${CURL_ARGUMENTS_FILE}"\n'
+        'env -0 > "${CURL_ENVIRONMENT_FILE}"\n'
         'cat > "${CURL_STDIN_FILE}"\n'
         'printf \'{"object":"list","data":[]}\'\n',
         encoding="utf-8",
@@ -576,16 +559,19 @@ def test_helper_sends_bearer_header_over_stdin_not_argv(tmp_path: Path) -> None:
     result = _run(
         "http://127.0.0.1:8000",
         "voice-list",
-        env_file=env_file,
+        api_key=api_key,
         environment_overrides={
             "PATH": f"{executable_dir}:{os.environ['PATH']}",
             "CURL_ARGUMENTS_FILE": str(curl_arguments),
+            "CURL_ENVIRONMENT_FILE": str(curl_environment),
             "CURL_STDIN_FILE": str(curl_stdin),
         },
     )
 
     assert result.returncode == 0
     assert api_key.encode() not in curl_arguments.read_bytes()
+    assert b"BOTIFIED_TTS_API_KEY=" not in curl_environment.read_bytes()
+    assert api_key.encode() not in curl_environment.read_bytes()
     assert (
         curl_stdin.read_text(encoding="ascii") == f"Authorization: Bearer {api_key}\n"
     )
