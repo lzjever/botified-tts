@@ -1,10 +1,17 @@
 [project]
-name = "botified-tts-sidecar"
+name = "botified-tts-companion"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "websockets>=15,<16",
 ]
+
+[project.scripts]
+botified-tts-companion = "botified_tts_companion.cli:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
@@ -14,7 +21,6 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
 
 [tool.ruff]
 line-length = 88

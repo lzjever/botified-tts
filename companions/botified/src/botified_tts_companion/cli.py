@@ -7,7 +7,8 @@ import json
 import os
 import re
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -21,6 +22,7 @@ APLAYER = Path("/usr/bin/aplay")
 API_KEY_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 DEFAULT_START_MESSAGE = '{"type":"start"}'
 _EOF = object()
+_NO_FRAME = object()
 
 
 class AudioSink(Protocol):
@@ -116,6 +118,10 @@ class _PreviewAssembler:
         self._provider_request_id: str | None = None
         self._next_index = 0
         self._parts: list[str] = []
+
+    @property
+    def provider_request_id(self) -> str | None:
+        return self._provider_request_id
 
     def feed(self, frame: dict[str, object]) -> tuple[str, str] | None:
         observation_id = frame.get("id")
@@ -338,6 +344,11 @@ class _TtsManager:
             return active.drain_task
         return active.session.watcher
 
+    @property
+    def provider_request_id(self) -> str | None:
+        active = self._active
+        return active.provider_request_id if active is not None else None
+
     async def append(self, provider_request_id: str, text: str) -> None:
         active = self._active
         if active is None or active.provider_request_id != provider_request_id:
@@ -444,37 +455,95 @@ class PreviewSidecar:
             asyncio.Queue()
         )
         reader = asyncio.create_task(_drain_frames(frames, queue))
+        frame_task: asyncio.Task[dict[str, object] | BaseException | object] | None
+        frame_task = None
+        pending_observations: deque[dict[str, object]] = deque()
+        operation: asyncio.Task[None] | None = None
+        operation_provider: str | None = None
         configured = False
         active_error: BaseException | None = None
         try:
             while True:
-                frame_task = asyncio.create_task(queue.get())
-                monitor = self._manager.monitor
-                watched: set[asyncio.Task[Any]] = {frame_task}
-                if monitor is not None:
-                    watched.add(monitor)
-                done, _ = await asyncio.wait(
-                    watched,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if monitor is not None and monitor in done:
-                    self._manager.reap_monitor()
-                    if frame_task not in done:
+                done: set[asyncio.Task[Any]] = set()
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    item = _NO_FRAME
+                    if operation is None and pending_observations:
+                        pending = pending_observations.popleft()
+                        operation = asyncio.create_task(self._handle_observe(pending))
+                        operation_provider = _assistant_provider_request_id(pending)
+
+                    monitor = self._manager.monitor if operation is None else None
+                    frame_task = asyncio.create_task(queue.get())
+                    watched: set[asyncio.Task[Any]] = {frame_task}
+                    if operation is not None:
+                        watched.add(operation)
+                    elif monitor is not None:
+                        watched.add(monitor)
+                    done, _ = await asyncio.wait(
+                        watched,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if frame_task in done:
+                        item = frame_task.result()
+                    else:
                         frame_task.cancel()
-                        await asyncio.gather(
-                            frame_task,
-                            return_exceptions=True,
-                        )
-                        continue
-                item = frame_task.result()
+                        await asyncio.gather(frame_task, return_exceptions=True)
+                        try:
+                            item = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    frame_task = None
+                else:
+                    monitor = self._manager.monitor if operation is None else None
+                    if operation is not None and operation.done():
+                        done.add(operation)
+                    elif monitor is not None and monitor.done():
+                        done.add(monitor)
+
                 if item is _EOF:
+                    await self._cancel_operation(operation)
+                    operation = None
                     if not configured:
                         raise RuntimeError("stdin closed before observer configuration")
                     return
                 if isinstance(item, BaseException):
+                    await self._cancel_operation(operation)
+                    operation = None
                     raise item
-                frame = item
-                if not isinstance(frame, dict):
+                frame = item if isinstance(item, dict) else None
+                active_provider = (
+                    operation_provider
+                    if operation_provider is not None
+                    else (
+                        self._assembler.provider_request_id
+                        if self._assembler.provider_request_id is not None
+                        else self._manager.provider_request_id
+                    )
+                )
+                preempts = (
+                    configured
+                    and frame is not None
+                    and frame.get("op") == "observe"
+                    and _preempts_tts_operation(frame, active_provider)
+                )
+                if preempts:
+                    await self._cancel_operation(operation)
+                    operation = None
+                    operation_provider = None
+                    pending_observations.clear()
+                    self._assembler.reset()
+                elif operation is not None and operation in done:
+                    operation.result()
+                    operation = None
+                    operation_provider = None
+                elif monitor is not None and monitor in done:
+                    self._manager.reap_monitor()
+
+                if item is _NO_FRAME:
+                    continue
+                if frame is None:
                     raise TypeError("invalid Botified stdin frame")
                 if (
                     frame.get("op") == "observe_result"
@@ -491,18 +560,40 @@ class PreviewSidecar:
                     configured = True
                     continue
                 if configured and frame.get("op") == "observe":
-                    await self._handle_observe(frame)
+                    if operation is None and not pending_observations:
+                        operation = asyncio.create_task(self._handle_observe(frame))
+                        operation_provider = _assistant_provider_request_id(frame)
+                    else:
+                        pending_observations.append(frame)
         except BaseException as error:
             active_error = error
             raise
         finally:
+            if frame_task is not None:
+                frame_task.cancel()
             reader.cancel()
-            await asyncio.gather(reader, return_exceptions=True)
+            if operation is not None:
+                operation.cancel()
+            await asyncio.gather(
+                reader,
+                *([frame_task] if frame_task is not None else []),
+                *([operation] if operation is not None else []),
+                return_exceptions=True,
+            )
             try:
                 await self._manager.cancel()
             except BaseException:
                 if active_error is None:
                     raise
+
+    async def _cancel_operation(
+        self,
+        operation: asyncio.Task[None] | None,
+    ) -> None:
+        if operation is not None:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        await self._manager.cancel()
 
     async def _handle_observe(self, frame: dict[str, object]) -> None:
         source = frame.get("source")
@@ -539,6 +630,31 @@ async def _drain_frames(
         queue.put_nowait(error)
     finally:
         queue.put_nowait(_EOF)
+
+
+def _assistant_provider_request_id(frame: dict[str, object]) -> str | None:
+    if frame.get("source") != "assistant":
+        return None
+    provider_request_id = frame.get("provider_request_id")
+    return provider_request_id if isinstance(provider_request_id, str) else None
+
+
+def _preempts_tts_operation(
+    frame: dict[str, object],
+    operation_provider: str | None,
+) -> bool:
+    source = frame.get("source")
+    event = frame.get("event")
+    if source == "user" and event == "text":
+        return True
+    if operation_provider is None:
+        return False
+    if source != "assistant":
+        return False
+    provider_request_id = frame.get("provider_request_id")
+    return (event == "text" and provider_request_id != operation_provider) or (
+        event == "error" and provider_request_id == operation_provider
+    )
 
 
 def _json_event(raw: object) -> dict[str, object]:
@@ -597,24 +713,6 @@ async def stdin_frames() -> AsyncIterator[dict[str, object]]:
             yield frame
 
 
-def read_api_key_from_env_file(path: Path) -> str:
-    try:
-        contents = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise RuntimeError(f"could not read env file: {path}") from error
-    keys: list[str] = []
-    for line in contents.split("\n"):
-        name, separator, value = line.partition("=")
-        if separator and name == "BOTIFIED_TTS_API_KEY":
-            keys.append(value)
-    if len(keys) != 1 or API_KEY_PATTERN.fullmatch(keys[0]) is None:
-        raise RuntimeError(
-            "env file must contain exactly one literal BOTIFIED_TTS_API_KEY "
-            "matching [A-Za-z0-9._~-]+"
-        )
-    return keys[0]
-
-
 def build_start_message(
     *,
     voice_id: str | None,
@@ -624,6 +722,10 @@ def build_start_message(
 ) -> str:
     if voice_id is not None and design is not None:
         raise ValueError("voice_id and design are mutually exclusive")
+    if mode is not None and voice_id is None:
+        raise ValueError("mode requires a voice profile")
+    if mode == "faithful" and style is not None:
+        raise ValueError("faithful mode does not accept style")
     event: dict[str, object] = {"type": "start"}
     if voice_id is not None:
         event["voice"] = {"type": "profile", "id": voice_id}
@@ -636,42 +738,52 @@ def build_start_message(
     return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
 
 
-def parse_tts_url(value: str) -> str:
+def _websocket_url_from_service_base(value: str) -> str:
     try:
-        endpoint = urlsplit(value)
-        port = endpoint.port
+        base = urlsplit(value)
+        port = base.port
     except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "--tts-url must be a complete ws:// or wss:// endpoint"
+        raise RuntimeError(
+            "BOTIFIED_TTS_URL must be an HTTP(S) service base URL"
         ) from error
     if (
-        endpoint.scheme not in {"ws", "wss"}
-        or not endpoint.hostname
+        base.scheme not in {"http", "https"}
+        or not base.hostname
         or port == 0
-        or endpoint.path != "/v1/speech/stream"
-        or "?" in value
-        or "#" in value
-        or endpoint.username is not None
-        or endpoint.password is not None
-        or any(character.isspace() for character in endpoint.netloc)
+        or base.netloc.endswith(":")
+        or base.path not in {"", "/"}
+        or base.query
+        or base.fragment
+        or base.username is not None
+        or base.password is not None
+        or any(character.isspace() for character in value)
     ):
-        raise argparse.ArgumentTypeError(
-            "--tts-url must be a complete ws:// or wss:// host"
-            "/v1/speech/stream endpoint without query or fragment"
+        raise RuntimeError(
+            "BOTIFIED_TTS_URL must be an HTTP(S) service base URL without "
+            "userinfo, path, query, or fragment"
         )
-    return value
+    scheme = "wss" if base.scheme == "https" else "ws"
+    return f"{scheme}://{base.netloc}/v1/speech/stream"
+
+
+def load_tts_environment(
+    environment: Mapping[str, str] = os.environ,
+) -> tuple[str, str]:
+    base_url = environment.get("BOTIFIED_TTS_URL")
+    if not base_url:
+        raise RuntimeError("BOTIFIED_TTS_URL is required")
+    api_key = environment.get("BOTIFIED_TTS_API_KEY")
+    if api_key is None or API_KEY_PATTERN.fullmatch(api_key) is None:
+        raise RuntimeError(
+            "BOTIFIED_TTS_API_KEY is required and must match [A-Za-z0-9._~-]+"
+        )
+    return _websocket_url_from_service_base(base_url), api_key
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Speak Botified assistant preview through botified-tts.",
     )
-    parser.add_argument(
-        "--tts-url",
-        type=parse_tts_url,
-        default="ws://127.0.0.1:8000/v1/speech/stream",
-    )
-    parser.add_argument("--env-file", type=Path, required=True)
     voice = parser.add_mutually_exclusive_group()
     voice.add_argument("--voice-id")
     voice.add_argument("--design")
@@ -681,15 +793,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 async def async_main(args: argparse.Namespace) -> None:
-    api_key = read_api_key_from_env_file(args.env_file)
     start_message = build_start_message(
         voice_id=args.voice_id,
         design=args.design,
         mode=args.mode,
         style=args.style,
     )
+    tts_url, api_key = load_tts_environment()
     sidecar = PreviewSidecar(
-        tts_url=args.tts_url,
+        tts_url=tts_url,
         api_key=api_key,
         start_message=start_message,
     )
@@ -700,7 +812,7 @@ def main() -> None:
     try:
         asyncio.run(async_main(parse_args()))
     except Exception as error:  # noqa: BLE001 - process boundary
-        print(f"botified-tts-sidecar: {error}", file=sys.stderr, flush=True)
+        print(f"botified-tts-companion: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from None
 
 

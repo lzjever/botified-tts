@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -9,12 +11,12 @@ from typing import Any
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
 
-from sidecar import (
+from botified_tts_companion.cli import (
     AplaySink,
     PreviewSidecar,
     build_start_message,
+    load_tts_environment,
     parse_args,
-    read_api_key_from_env_file,
 )
 
 
@@ -196,25 +198,26 @@ def test_reassembles_preview_and_switches_provider_with_full_duplex_audio() -> N
         )
 
         async def normal_finish_frames() -> AsyncIterator[dict[str, object]]:
-            for frame in (
-                observe_result(),
-                assistant_text(
-                    "obs-1",
-                    "provider-1",
-                    "你",
-                    is_last_chunk=False,
-                ),
-                assistant_text(
-                    "obs-1",
-                    "provider-1",
-                    "好。",
-                    chunk_index=1,
-                ),
-                assistant_text("obs-2", "provider-2", "新的回答。"),
-                assistant_terminal("provider-1", "error"),
-                assistant_terminal("provider-2", "done"),
-            ):
-                yield frame
+            yield observe_result()
+            yield assistant_text(
+                "obs-1",
+                "provider-1",
+                "你",
+                is_last_chunk=False,
+            )
+            yield assistant_text(
+                "obs-1",
+                "provider-1",
+                "好。",
+                chunk_index=1,
+            )
+            while len(sinks) != 1:
+                await asyncio.sleep(0)
+            yield assistant_text("obs-2", "provider-2", "新的回答。")
+            while len(sinks) != 2:
+                await asyncio.sleep(0)
+            yield assistant_terminal("provider-1", "error")
+            yield assistant_terminal("provider-2", "done")
             while len(sinks) != 2 or not sinks[1].finished:
                 await asyncio.sleep(0)
 
@@ -284,20 +287,190 @@ def test_user_interrupt_and_stdin_eof_cancel_active_speech() -> None:
             sink_factory=open_sink,
             emit=lambda _: None,
         )
-        await sidecar.run(
-            frames(
-                observe_result(),
-                assistant_text("obs-1", "provider-1", "第一条回答。"),
-                user_text(),
-                assistant_text("obs-2", "provider-2", "第二条回答。"),
-            )
-        )
+
+        async def interrupting_frames() -> AsyncIterator[dict[str, object]]:
+            yield observe_result()
+            yield assistant_text("obs-1", "provider-1", "第一条回答。")
+            while len(sinks) != 1:
+                await asyncio.sleep(0)
+            yield user_text()
+            yield assistant_text("obs-2", "provider-2", "第二条回答。")
+            while len(sinks) != 2:
+                await asyncio.sleep(0)
+
+        await sidecar.run(interrupting_frames())
 
         assert [session[-1] for session in sessions] == [
             {"type": "cancel"},
             {"type": "cancel"},
         ]
         assert all(sink.cancelled for sink in sinks)
+
+    asyncio.run(run_fake_server(scenario))
+
+
+def test_user_interrupt_cancels_slow_handshake_before_player_opens() -> None:
+    async def exercise() -> None:
+        start_received = asyncio.Event()
+        connection_closed = asyncio.Event()
+        sink_opened = False
+
+        async def handler(websocket: ServerConnection) -> None:
+            assert json.loads(await websocket.recv()) == {"type": "start"}
+            start_received.set()
+            await websocket.wait_closed()
+            connection_closed.set()
+
+        async def interrupt_during_handshake() -> AsyncIterator[dict[str, object]]:
+            yield observe_result()
+            yield assistant_text("obs-1", "provider-1", "请开始播放。")
+            await start_received.wait()
+            yield user_text()
+
+        async def open_sink() -> FakeSink:
+            nonlocal sink_opened
+            sink_opened = True
+            return FakeSink()
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            sidecar = PreviewSidecar(
+                tts_url=f"ws://127.0.0.1:{port}/v1/speech/stream",
+                api_key="secret",
+                sink_factory=open_sink,
+                emit=lambda _: None,
+            )
+            await asyncio.wait_for(
+                sidecar.run(interrupt_during_handshake()),
+                timeout=1,
+            )
+            await asyncio.wait_for(connection_closed.wait(), timeout=1)
+
+        assert not sink_opened
+
+    asyncio.run(exercise())
+
+
+def test_user_interrupt_wins_when_append_and_input_complete_together() -> None:
+    class BlockingAppendWebsocket:
+        def __init__(self) -> None:
+            self.append_started = asyncio.Event()
+            self.append_release = asyncio.Event()
+            self.messages: list[dict[str, object]] = []
+            self._ready = True
+
+        async def send(self, raw: str) -> None:
+            message = json.loads(raw)
+            self.messages.append(message)
+            if message == {"type": "append", "text": "旧文本一"}:
+                self.append_started.set()
+                await self.append_release.wait()
+
+        async def recv(self) -> str:
+            if self._ready:
+                self._ready = False
+                return json.dumps(
+                    {
+                        "type": "ready",
+                        "audio": {
+                            "encoding": "pcm_s16le",
+                            "sample_rate": 48_000,
+                            "channels": 1,
+                        },
+                    }
+                )
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        async def close(self) -> None:
+            pass
+
+    async def exercise() -> None:
+        websocket = BlockingAppendWebsocket()
+        sink = FakeSink()
+
+        async def connector(*_: object, **__: object) -> BlockingAppendWebsocket:
+            return websocket
+
+        async def simultaneous_interrupt() -> AsyncIterator[dict[str, object]]:
+            yield observe_result()
+            yield assistant_text("obs-1", "provider-1", "旧文本一")
+            await websocket.append_started.wait()
+            yield assistant_text("obs-2", "provider-1", "旧文本二")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            websocket.append_release.set()
+            yield user_text()
+            while not sink.cancelled:
+                await asyncio.sleep(0)
+
+        sidecar = PreviewSidecar(
+            tts_url="ws://tts.example/v1/speech/stream",
+            api_key="secret",
+            sink_factory=lambda: asyncio.sleep(0, result=sink),
+            connector=connector,
+            emit=lambda _: None,
+        )
+        await asyncio.wait_for(sidecar.run(simultaneous_interrupt()), timeout=1)
+
+        assert {"type": "append", "text": "旧文本二"} not in websocket.messages
+        assert websocket.messages[-1] == {"type": "cancel"}
+        assert sink.cancelled
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "interrupt_with_user",
+    [True, False],
+    ids=["user-interrupt", "provider-replacement"],
+)
+def test_interrupt_resets_incomplete_multi_chunk_observation(
+    interrupt_with_user: bool,
+) -> None:
+    async def scenario(
+        url: str,
+        sessions: list[list[dict[str, object]]],
+    ) -> None:
+        sink = FakeSink()
+
+        async def interrupted_frames() -> AsyncIterator[dict[str, object]]:
+            yield observe_result()
+            yield assistant_text(
+                "obs-old",
+                "provider-old",
+                "未完成的旧文本",
+                is_last_chunk=False,
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            if interrupt_with_user:
+                yield user_text()
+                for _ in range(3):
+                    await asyncio.sleep(0)
+            yield assistant_text("obs-new", "provider-new", "新的回答。")
+            while not sessions or len(sessions[0]) != 2:
+                await asyncio.sleep(0)
+            yield assistant_terminal("provider-new", "done")
+            while not sink.finished:
+                await asyncio.sleep(0)
+
+        sidecar = PreviewSidecar(
+            tts_url=url,
+            api_key="secret",
+            sink_factory=lambda: asyncio.sleep(0, result=sink),
+            emit=lambda _: None,
+        )
+        await sidecar.run(interrupted_frames())
+
+        assert sessions == [
+            [
+                {"type": "start"},
+                {"type": "append", "text": "新的回答。"},
+                {"type": "finish"},
+            ]
+        ]
+        assert sink.finished
 
     asyncio.run(run_fake_server(scenario))
 
@@ -351,11 +524,12 @@ def test_user_interrupt_cancels_session_while_finish_is_draining() -> None:
     asyncio.run(exercise())
 
 
-def test_new_provider_waits_for_old_drain_before_opening_and_finishes() -> None:
+def test_new_provider_cancels_old_session_before_opening_and_finishes() -> None:
     async def exercise() -> None:
         sessions: list[list[dict[str, object]]] = []
         old_sink = BlockingCancelSink()
-        sinks: list[FakeSink] = [old_sink, FakeSink()]
+        new_sink = FakeSink()
+        sinks: list[FakeSink] = [old_sink, new_sink]
 
         async def handler(websocket: ServerConnection) -> None:
             index = len(sessions)
@@ -386,6 +560,8 @@ def test_new_provider_waits_for_old_drain_before_opening_and_finishes() -> None:
         async def provider_frames() -> AsyncIterator[dict[str, object]]:
             yield observe_result()
             yield assistant_text("obs-1", "provider-1", "旧回答。")
+            while not sessions or len(sessions[0]) != 1:
+                await asyncio.sleep(0)
             yield assistant_terminal("provider-1", "done")
             yield assistant_text("obs-2", "provider-2", "新回答。")
             await old_sink.cancel_started.wait()
@@ -394,6 +570,8 @@ def test_new_provider_waits_for_old_drain_before_opening_and_finishes() -> None:
             while len(sessions) != 2:
                 await asyncio.sleep(0)
             yield assistant_terminal("provider-2", "done")
+            while not new_sink.finished:
+                await asyncio.sleep(0)
 
         async with serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
@@ -407,7 +585,6 @@ def test_new_provider_waits_for_old_drain_before_opening_and_finishes() -> None:
 
         assert [item["type"] for item in sessions[0]] == [
             "append",
-            "finish",
             "cancel",
         ]
         assert [item["type"] for item in sessions[1]] == [
@@ -448,14 +625,18 @@ def test_stdin_eof_cancels_draining_session_without_task_leaks() -> None:
                 sink_factory=lambda: asyncio.sleep(0, result=sink),
                 emit=lambda _: None,
             )
+
+            async def eof_while_draining() -> AsyncIterator[dict[str, object]]:
+                yield observe_result()
+                yield assistant_text("obs-1", "provider-1", "播放尾部。")
+                while not received:
+                    await asyncio.sleep(0)
+                yield assistant_terminal("provider-1", "done")
+                while received[-1]["type"] != "finish":
+                    await asyncio.sleep(0)
+
             await asyncio.wait_for(
-                sidecar.run(
-                    frames(
-                        observe_result(),
-                        assistant_text("obs-1", "provider-1", "播放尾部。"),
-                        assistant_terminal("provider-1", "done"),
-                    )
-                ),
+                sidecar.run(eof_while_draining()),
                 timeout=1,
             )
             await asyncio.sleep(0)
@@ -611,34 +792,26 @@ def test_builds_default_and_design_start_messages() -> None:
     }
 
 
-def test_cli_accepts_start_options_and_rejects_conflicts(tmp_path: Path) -> None:
-    env_file = tmp_path / "botified-tts.env"
+def test_cli_accepts_start_options_and_rejects_conflicts() -> None:
     args = parse_args(
         [
-            "--env-file",
-            str(env_file),
-            "--tts-url",
-            "wss://tts.example/v1/speech/stream",
             "--voice-id",
             "voice_" + "1" * 32,
             "--mode",
-            "faithful",
+            "controllable",
             "--style",
             "calm",
         ]
     )
-    assert args.env_file == env_file
-    assert args.tts_url == "wss://tts.example/v1/speech/stream"
-    assert args.mode == "faithful"
+    assert args.mode == "controllable"
 
-    defaults = parse_args(["--env-file", str(env_file)])
-    assert defaults.tts_url == "ws://127.0.0.1:8000/v1/speech/stream"
+    defaults = parse_args([])
+    assert defaults.voice_id is None
+    assert defaults.design is None
 
     with pytest.raises(SystemExit):
         parse_args(
             [
-                "--env-file",
-                str(env_file),
                 "--voice-id",
                 "voice_" + "1" * 32,
                 "--design",
@@ -646,73 +819,132 @@ def test_cli_accepts_start_options_and_rejects_conflicts(tmp_path: Path) -> None
             ]
         )
     with pytest.raises(SystemExit):
-        parse_args(["--env-file", str(env_file), "--mode", "unsupported"])
+        parse_args(["--mode", "unsupported"])
+    with pytest.raises(SystemExit):
+        parse_args(["--env-file", "botified-tts.env"])
+    with pytest.raises(SystemExit):
+        parse_args(["--tts-url", "ws://tts.example/v1/speech/stream"])
 
 
 @pytest.mark.parametrize(
-    "tts_url",
+    ("base_url", "expected"),
     [
-        "http://tts.example/v1/speech/stream",
-        "ws://tts.example",
-        "not-a-url",
-        "ws://tts.example/v1/speech/stream?voice=test",
-        "wss://tts.example/v1/speech/stream#fragment",
+        ("http://tts.example", "ws://tts.example/v1/speech/stream"),
+        ("https://tts.example:8443/", "wss://tts.example:8443/v1/speech/stream"),
     ],
 )
-def test_cli_rejects_incomplete_or_non_websocket_tts_urls(
-    tmp_path: Path,
-    tts_url: str,
+def test_environment_derives_websocket_endpoint_from_service_base(
+    base_url: str,
+    expected: str,
 ) -> None:
-    with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--env-file",
-                str(tmp_path / "botified-tts.env"),
-                "--tts-url",
-                tts_url,
-            ]
+    assert load_tts_environment(
+        {
+            "BOTIFIED_TTS_URL": base_url,
+            "BOTIFIED_TTS_API_KEY": "AbC.0_~-z",
+        }
+    ) == (
+        expected,
+        "AbC.0_~-z",
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "ws://tts.example",
+        "http://tts.example/v1/speech",
+        "http://user@tts.example",
+        "http://tts.example?voice=test",
+        "http://tts.example#fragment",
+        "http://tts.example:0",
+        "http://tts.example:",
+        "not-a-url",
+        "http://tts example",
+    ],
+)
+def test_environment_rejects_invalid_service_base_without_leaking_key(
+    base_url: str,
+) -> None:
+    api_key = "secret-not-in-error"
+    with pytest.raises(RuntimeError, match="BOTIFIED_TTS_URL") as caught:
+        load_tts_environment(
+            {
+                "BOTIFIED_TTS_URL": base_url,
+                "BOTIFIED_TTS_API_KEY": api_key,
+            }
+        )
+    assert api_key not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("environment", "missing_name"),
+    [
+        ({"BOTIFIED_TTS_API_KEY": "secret"}, "BOTIFIED_TTS_URL"),
+        ({"BOTIFIED_TTS_URL": "http://tts.example"}, "BOTIFIED_TTS_API_KEY"),
+        (
+            {
+                "BOTIFIED_TTS_URL": "http://tts.example",
+                "BOTIFIED_TTS_API_KEY": "line1\nline2",
+            },
+            "BOTIFIED_TTS_API_KEY",
+        ),
+        (
+            {
+                "BOTIFIED_TTS_URL": "http://tts.example",
+                "BOTIFIED_TTS_API_KEY": "not+the+shared+format",
+            },
+            "BOTIFIED_TTS_API_KEY",
+        ),
+    ],
+)
+def test_environment_failure_names_variable_without_printing_key(
+    environment: dict[str, str],
+    missing_name: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=missing_name) as caught:
+        load_tts_environment(environment)
+    assert environment.get("BOTIFIED_TTS_API_KEY", "secret") not in str(caught.value)
+
+
+def test_start_options_match_tts_api_combinations() -> None:
+    profile = "voice_" + "1" * 32
+
+    with pytest.raises(ValueError, match="mode requires"):
+        build_start_message(
+            voice_id=None,
+            design=None,
+            mode="controllable",
+            style=None,
+        )
+    with pytest.raises(ValueError, match="mode requires"):
+        build_start_message(
+            voice_id=None,
+            design="warm",
+            mode="controllable",
+            style=None,
+        )
+    with pytest.raises(ValueError, match="faithful.*style"):
+        build_start_message(
+            voice_id=profile,
+            design=None,
+            mode="faithful",
+            style="calm",
         )
 
 
-def test_reads_api_key_literal_from_shared_env_file(tmp_path: Path) -> None:
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_text(
-        "BOTIFIED_TTS_MODEL_SOURCE=modelscope\n"
-        "BOTIFIED_TTS_API_KEY=AbC.0_~-z\n"
-        "BOTIFIED_TTS_LOG_LEVEL=INFO\n",
-        encoding="utf-8",
+def test_installed_console_command_can_start() -> None:
+    executable = shutil.which("botified-tts-companion")
+    assert executable is not None
+    result = subprocess.run(
+        [executable, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
     )
-
-    assert read_api_key_from_env_file(env_file) == "AbC.0_~-z"
-
-
-@pytest.mark.parametrize(
-    "contents",
-    [
-        "BOTIFIED_TTS_LOG_LEVEL=INFO\n",
-        "BOTIFIED_TTS_API_KEY=first\nBOTIFIED_TTS_API_KEY=second\n",
-        "BOTIFIED_TTS_API_KEY=\n",
-        'BOTIFIED_TTS_API_KEY="quoted"\n',
-        "BOTIFIED_TTS_API_KEY=has space\n",
-        "BOTIFIED_TTS_API_KEY=$(command)\n",
-        "BOTIFIED_TTS_API_KEY=${SECRET}\n",
-        "BOTIFIED_TTS_API_KEY=内部密钥\n",
-    ],
-)
-def test_rejects_unsafe_or_ambiguous_api_key_env_files(
-    tmp_path: Path,
-    contents: str,
-) -> None:
-    env_file = tmp_path / "botified-tts.env"
-    env_file.write_text(contents, encoding="utf-8")
-
-    with pytest.raises(RuntimeError, match="BOTIFIED_TTS_API_KEY"):
-        read_api_key_from_env_file(env_file)
-
-
-def test_missing_env_file_failure_is_explicit(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="could not read env file"):
-        read_api_key_from_env_file(tmp_path / "missing.env")
+    assert result.returncode == 0
+    assert "--voice-id" in result.stdout
+    assert "--env-file" not in result.stdout
+    assert "--tts-url" not in result.stdout
 
 
 def test_handshake_error_preserves_code_and_message_without_opening_player() -> None:
@@ -738,6 +970,11 @@ def test_handshake_error_preserves_code_and_message_without_opening_player() -> 
             sink_opened = True
             return FakeSink()
 
+        async def wait_for_handshake_error() -> AsyncIterator[dict[str, object]]:
+            yield observe_result()
+            yield assistant_text("obs-1", "provider-1", "hello")
+            await asyncio.sleep(5)
+
         async with serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             sidecar = PreviewSidecar(
@@ -750,12 +987,7 @@ def test_handshake_error_preserves_code_and_message_without_opening_player() -> 
                 RuntimeError,
                 match="invalid_voice.*Voice profile not found",
             ) as caught:
-                await sidecar.run(
-                    frames(
-                        observe_result(),
-                        assistant_text("obs-1", "provider-1", "hello"),
-                    )
-                )
+                await sidecar.run(wait_for_handshake_error())
 
         assert not sink_opened
         assert "secret-not-in-error" not in str(caught.value)
