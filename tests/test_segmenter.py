@@ -59,30 +59,42 @@ def test_soft_boundary_requires_24_characters() -> None:
     assert segmenter.append("b" * 23 + ",") == ["a" * 22 + "," + "b" * 23 + ","]
 
 
-def test_target_55_waits_without_boundary_and_hard_80_forces_split() -> None:
+def test_natural_target_100_waits_and_hard_160_forces_split() -> None:
     segmenter = Segmenter()
 
-    assert segmenter.append("x" * 55) == []
-    assert segmenter.append("y" * 24) == []
-    assert segmenter.append("z") == ["x" * 55 + "y" * 24 + "z"]
+    assert segmenter.append("x" * 100) == []
+    assert segmenter.append("y" * 59) == []
+    assert segmenter.append("z") == ["x" * 100 + "y" * 59 + "z"]
     assert segmenter.finish() == []
 
 
-def test_target_55_uses_the_latest_soft_boundary_at_or_before_target() -> None:
+def test_natural_target_uses_latest_soft_boundary_at_or_before_100() -> None:
     segmenter = Segmenter()
-    text = "a" * 29 + " " + "b" * 14 + " " + "c" * 10
+    text = "a" * 29 + " " + "b" * 39 + " " + "c" * 30
 
-    assert len(text) == 55
-    assert segmenter.append(text) == [text[:45]]
-    assert segmenter.finish() == [text[45:]]
+    assert len(text) == 100
+    assert segmenter.append(text) == [text[:70]]
+    assert segmenter.finish() == [text[70:]]
+
+
+def test_short_profile_uses_target_55_and_hard_80() -> None:
+    target = Segmenter(profile="short")
+    target_text = "a" * 29 + " " + "b" * 14 + " " + "c" * 10
+
+    assert target.append(target_text) == [target_text[:45]]
+    assert target.finish() == [target_text[45:]]
+
+    hard = Segmenter(profile="short")
+    assert hard.append("x" * 80) == ["x" * 80]
+    assert hard.finish() == []
 
 
 def test_hard_limit_prefers_recent_whitespace_over_splitting_a_word() -> None:
     segmenter = Segmenter()
-    text = "a" * 64 + " " + "longenglishword" * 2
+    text = "a" * 124 + " " + "longenglishword" * 3
 
-    assert segmenter.append(text) == [text[:65]]
-    assert segmenter.finish() == [text[65:]]
+    assert segmenter.append(text) == [text[:125]]
+    assert segmenter.finish() == [text[125:]]
 
 
 def test_trailing_digit_dot_waits_for_the_next_append() -> None:
@@ -99,7 +111,7 @@ def test_trailing_digit_dot_waits_for_the_next_append() -> None:
 @pytest.mark.parametrize("tag", OFFICIAL_TAGS)
 def test_complete_official_tag_is_never_split(tag: str) -> None:
     segmenter = Segmenter()
-    prefix = "x" * 78
+    prefix = "x" * 158
 
     assert segmenter.append(prefix + tag) == [prefix]
     assert segmenter.finish() == [tag]
@@ -107,7 +119,7 @@ def test_complete_official_tag_is_never_split(tag: str) -> None:
 
 def test_possible_official_tag_prefix_is_protected_across_appends() -> None:
     segmenter = Segmenter()
-    prefix = "x" * 75
+    prefix = "x" * 155
 
     assert segmenter.append(prefix + "[laugh") == [prefix]
     assert segmenter.append("ing]结束。") == ["[laughing]结束。"]

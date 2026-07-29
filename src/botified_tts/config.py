@@ -18,10 +18,12 @@ ENV_NAMES = {
     "BOTIFIED_TTS_DATA_DIR",
     "BOTIFIED_TTS_API_KEY",
     "BOTIFIED_TTS_LOG_LEVEL",
+    "BOTIFIED_TTS_SEGMENT_PROFILE",
 }
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 API_KEY_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 ModelSource = Literal["modelscope", "huggingface"]
+SegmentProfile = Literal["natural", "short"]
 CudaErrorCode = Literal["cuda_unavailable", "cuda_device_invalid"]
 
 
@@ -46,6 +48,7 @@ class Settings:
     data_dir: Path
     api_key: str
     log_level: str
+    segment_profile: SegmentProfile = "natural"
 
     @classmethod
     def from_env(
@@ -125,6 +128,16 @@ class Settings:
                 "ERROR, or CRITICAL"
             )
 
+        segment_profile = _plain_value(
+            values,
+            "BOTIFIED_TTS_SEGMENT_PROFILE",
+            "natural",
+        )
+        if segment_profile not in ("natural", "short"):
+            raise InvalidConfiguration(
+                "BOTIFIED_TTS_SEGMENT_PROFILE must be natural or short"
+            )
+
         return cls(
             host=host,
             port=port,
@@ -133,6 +146,7 @@ class Settings:
             data_dir=data_dir,
             api_key=api_key,
             log_level=log_level,
+            segment_profile=segment_profile,
         )
 
 

@@ -5,11 +5,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from botified_tts.config import SegmentProfile
 
 SOFT_MIN_CHARS = 24
 DEADLINE_MIN_CHARS = 12
-TARGET_MAX_CHARS = 55
-HARD_MAX_CHARS = 80
+TARGET_MAX_CHARS = 100
+HARD_MAX_CHARS = 160
+SHORT_TARGET_MAX_CHARS = 55
+SHORT_HARD_MAX_CHARS = 80
+
+_PROFILE_LIMITS: dict[SegmentProfile, tuple[int, int]] = {
+    "natural": (TARGET_MAX_CHARS, HARD_MAX_CHARS),
+    "short": (SHORT_TARGET_MAX_CHARS, SHORT_HARD_MAX_CHARS),
+}
 
 OFFICIAL_TAGS = (
     "[laughing]",
@@ -46,7 +54,12 @@ class _ProtectedRange:
 class Segmenter:
     """Synchronously segment text appended at arbitrary chunk boundaries."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        profile: SegmentProfile = "natural",
+    ) -> None:
+        self._target_max_chars, self._hard_max_chars = _PROFILE_LIMITS[profile]
         self._buffer = ""
         self._deadline_expired = False
 
@@ -116,16 +129,19 @@ class Segmenter:
 
     def _regular_cut(self) -> int | None:
         protected = self._protected_ranges()
-        upper = min(len(self._buffer), HARD_MAX_CHARS)
+        upper = min(len(self._buffer), self._hard_max_chars)
 
         for cut in range(1, upper + 1):
             if self._is_strong_cut(cut) and self._is_safe_cut(cut, protected):
                 return cut
 
-        if len(self._buffer) >= TARGET_MAX_CHARS:
+        if len(self._buffer) >= self._target_max_chars:
             target_soft_cuts = [
                 cut
-                for cut in range(SOFT_MIN_CHARS, TARGET_MAX_CHARS + 1)
+                for cut in range(
+                    SOFT_MIN_CHARS,
+                    self._target_max_chars + 1,
+                )
                 if self._is_soft_cut(cut) and self._is_safe_cut(cut, protected)
             ]
             if target_soft_cuts:
@@ -135,21 +151,25 @@ class Segmenter:
                 if self._is_soft_cut(cut) and self._is_safe_cut(cut, protected):
                     return cut
 
-        if len(self._buffer) < HARD_MAX_CHARS:
+        if len(self._buffer) < self._hard_max_chars:
             return None
 
-        for cut in range(HARD_MAX_CHARS, SOFT_MIN_CHARS - 1, -1):
+        for cut in range(
+            self._hard_max_chars,
+            SOFT_MIN_CHARS - 1,
+            -1,
+        ):
             if (
                 self._buffer[cut - 1].isspace()
                 and self._is_safe_cut(cut, protected)
             ):
                 return cut
 
-        for cut in range(HARD_MAX_CHARS, 0, -1):
+        for cut in range(self._hard_max_chars, 0, -1):
             if self._is_safe_cut(cut, protected):
                 return cut
         official_tags = self._official_tag_ranges()
-        for cut in range(HARD_MAX_CHARS, 0, -1):
+        for cut in range(self._hard_max_chars, 0, -1):
             if self._is_safe_cut(cut, official_tags):
                 return cut
         return None

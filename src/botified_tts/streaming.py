@@ -9,6 +9,7 @@ from typing import Literal
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from botified_tts.config import SegmentProfile
 from botified_tts.engine import EngineError
 from botified_tts.schemas import (
     AppendMessage,
@@ -61,12 +62,14 @@ class _StreamingSession:
         authorize: Callable[[WebSocket], tuple[str, str] | None],
         try_acquire: Callable[[], bool],
         release: Callable[[], None],
+        segment_profile: SegmentProfile,
     ) -> None:
         self._websocket = websocket
         self._speech = speech
         self._authorize = authorize
         self._try_acquire = try_acquire
         self._release = release
+        self._segment_profile = segment_profile
 
     async def run(self) -> None:
         acquired = False
@@ -227,7 +230,7 @@ class _StreamingSession:
         idle_deadline: float,
         summary: SynthesisSummary,
     ) -> Literal["cancel"]:
-        segmenter = Segmenter()
+        segmenter = Segmenter(profile=self._segment_profile)
         loop = asyncio.get_running_loop()
         segment_deadline: float | None = None
         accepted_bytes = 0

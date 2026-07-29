@@ -23,7 +23,7 @@ from botified_tts.audio import (
     pcm_s16le_chunks_to_ogg_opus,
     pcm_s16le_chunks_to_wav,
 )
-from botified_tts.config import MAX_CONCURRENT_SYNTHESIS
+from botified_tts.config import MAX_CONCURRENT_SYNTHESIS, SegmentProfile
 from botified_tts.engine import EngineError
 from botified_tts.schemas import (
     InputTooLarge,
@@ -88,6 +88,7 @@ def create_app(
     readiness: Readiness,
     voices: VoiceStore,
     speech: SpeechService,
+    segment_profile: SegmentProfile = "natural",
 ) -> Starlette:
     if not api_key:
         raise ValueError("api_key must not be empty")
@@ -174,7 +175,7 @@ def create_app(
             speech_request = await _parse_speech_body(request)
             summary.set_options(speech_request.options)
             summary.accept_text(speech_request.text)
-            segments = _segment_text(speech_request)
+            segments = _segment_text(speech_request, segment_profile)
             try:
                 chunks = [
                     chunk
@@ -276,6 +277,7 @@ def create_app(
             authorize=authorize_stream,
             try_acquire=admission.try_acquire,
             release=admission.release,
+            segment_profile=segment_profile,
         ).run()
 
     app = Starlette(
@@ -342,8 +344,11 @@ async def _parse_speech_body(request: Request) -> SpeechRequest:
         raise _ApiError(400, "invalid_request", str(error)) from error
 
 
-async def _segment_text(request: SpeechRequest) -> AsyncIterator[str]:
-    segmenter = Segmenter()
+async def _segment_text(
+    request: SpeechRequest,
+    segment_profile: SegmentProfile,
+) -> AsyncIterator[str]:
+    segmenter = Segmenter(profile=segment_profile)
     for segment in (*segmenter.append(request.text), *segmenter.finish()):
         yield segment
 

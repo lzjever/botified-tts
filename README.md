@@ -28,6 +28,20 @@ umask 077
 There is no automatic detection or cross-source fallback. The API key must be
 unquoted and match `[A-Za-z0-9._~-]+`.
 
+`BOTIFIED_TTS_SEGMENT_PROFILE` is optional and accepts `natural` or `short`.
+The default `natural` profile uses 100/160-character target/hard limits for
+fewer, more natural boundaries. `short` uses 55/80-character limits to reduce
+the generation span, at the cost of more frequent boundaries that may sound
+less natural. To select it, add this line to the env file before starting the
+container:
+
+```bash
+printf '%s\n' 'BOTIFIED_TTS_SEGMENT_PROFILE=short' >> botified-tts.env
+```
+
+The selected profile is fixed at startup and applies to both HTTP and
+WebSocket synthesis.
+
 Start the fixed release image:
 
 ```bash
@@ -146,7 +160,7 @@ the same options, then send `append` events followed by `finish` or `cancel`.
 exactly matches the words spoken in its reference recording.
 
 The service also supports VoxCPM2 native tags and cancellation, automatically
-splits input into short sentence-aware segments, and uses fixed request-level
+splits input into sentence-aware segments, and uses fixed request-level
 conditioning to reduce accumulated voice drift across segments. It receives
 final speakable plain text and does not parse Markdown or SSML. The bundled
 [`voxcpm-tts` Skill](skills/voxcpm-tts/SKILL.md) provides the concise HTTP

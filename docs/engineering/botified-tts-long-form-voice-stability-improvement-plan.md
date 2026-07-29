@@ -46,9 +46,10 @@ OpenBMB/VoxCPM Issue #302 对 VoxCPM2 的单次长生成漂移给出了与源码
   transcript。
 - 没有原始声音参考的 Voice Design 和默认声音使用请求内固定首段，尽力减少逐段
   变化；默认声音跨请求仍可能随机。
-- 缩短单次生成文本，降低 VoxCPM2 在片段内部发生长程漂移的机会。
+- 默认保留较自然的分段跨度，同时提供一个固定 short profile，供更重视缩短单次
+  生成跨度的部署选择。
 - HTTP 非流式与 WebSocket 双向流继续共用同一个 `SpeechService` 和 segmenter。
-- 不改变任何公开 API、Voice Profile 数据、Docker 配置、Skill 或 companion
+- 不改变 HTTP/WS API、Voice Profile 数据、Docker 构建、Skill 或 companion
   用法。
 
 ## 3. 范围边界
@@ -56,7 +57,8 @@ OpenBMB/VoxCPM Issue #302 对 VoxCPM2 的单次长生成漂移给出了与源码
 ### 3.1 本轮包含
 
 - 原地替换 `SpeechService` 的跨段锚定方式。
-- 收紧现有 segmenter 的单段长度，并避免英文单词中间硬切。
+- 比较 100/160 与 55/80 两个固定分段候选，保留 natural 默认并提供 short
+  启动选项；两者都避免在有合适空白时从英文单词中间硬切。
 - 修改直接拥有上述行为的最小单元测试。
 - 更新现有真实 GPU integration 中的跨段用例。
 - 更新开发约束和 README 中与跨段 continuation 不再相符的当前事实。
@@ -66,7 +68,8 @@ OpenBMB/VoxCPM Issue #302 对 VoxCPM2 的单次长生成漂移给出了与源码
 - 不修改 VoxCPM2、Nano-vLLM-VoxCPM 或 `.reference/**`。
 - 不加入 Issue #302 提出的 decoder latent 混合或 `voice_anchor_strength`。
 - 不直接合入、复制或依赖 PR #313。
-- 不新增 long-form endpoint、请求字段、mode、strategy 或 segment 配置。
+- 不新增 long-form endpoint、请求字段、mode、strategy、热更新或任意数字
+  segment 配置；只增加一个服务启动级二选一 profile。
 - 不公开 CFG、temperature、inference steps 或 seed。
 - 不增加自动说话人相似度服务、质量评分平台、测试矩阵或开发治理产物。
 - 不增加 SSML、Markdown parser、语言检测器或第三方 NLP 分句依赖。
@@ -152,12 +155,18 @@ Nano 已支持直接复用 generated latent，不写临时 WAV，也不重复 en
 
 继续使用唯一的 `Segmenter`，不增加 long-form 专用分段器。
 
-固定内部常量调整为：
+最终产品决定保留两个固定启动 profile：
 
-```text
-TARGET_MAX_CHARS = 55
-HARD_MAX_CHARS = 80
-```
+| profile | 目标长度 | 硬上限 | 用途 |
+|---|---:|---:|---|
+| `natural` | 100 | 160 | 默认；减少分段边界，优先自然度 |
+| `short` | 55 | 80 | 可选；缩短单次生成跨度，但边界更频繁 |
+
+唯一服务配置为
+`BOTIFIED_TTS_SEGMENT_PROFILE=natural|short`。缺省为 `natural`；非法值在启动时
+以 `invalid_configuration` fail-fast。配置只在启动时读取，HTTP 与 WebSocket
+共用同一值，不进入请求 schema、不支持热更新，也不接受任意数字阈值。ready
+日志记录最终 profile，`/health` schema 不变。
 
 其余原则：
 
@@ -169,25 +178,29 @@ HARD_MAX_CHARS = 80
 6. 保持输入文本逐字符守恒，不增加文本归一化或改写。
 7. 保持现有 0.8 秒增量输入 deadline、flush、finish 和短回复行为。
 
-官方只建议使用短句，没有规定字符阈值。55/80 是本项目参考现有故障和 PR #313
-候选默认值作出的固定内部选择，不进入配置或公共协议。它用于显著缩短当前允许的
-单次生成跨度，同时不改变自然句末优先和流式输入语义。
+官方只建议使用短句，没有规定字符阈值。100/160 与 55/80 都是本项目固定选择，
+不是 VoxCPM2 官方默认值。A/B 讨论最终选择 100/160 作为 Candidate A
+`natural` 默认，以避免过多边界影响自然度；55/80 作为 `short` 保留给更重视
+缩短生成跨度的部署。两者使用同一套自然边界和流式输入语义。
 
 ## 6. 实现位置
 
 | 文件 | 改动 |
 |---|---|
 | `src/botified_tts/speech.py` | 保存不可变原始锚点；按现有 voice/mode 选择唯一固定锚点；删除滚动 prompt 覆盖；对每段 controllable clone 重复 control |
-| `src/botified_tts/segmenter.py` | 收紧目标/硬上限；硬切前优先英文单词边界 |
+| `src/botified_tts/segmenter.py` | 唯一保存 natural 100/160 与 short 55/80 映射；硬切前优先英文单词边界 |
+| `src/botified_tts/config.py` | 启动时解析并校验唯一 segment profile env；缺省 natural |
+| `src/botified_tts/runtime.py`、`app.py`、`streaming.py` | 把同一 profile 传给 HTTP/WS；ready 日志记录最终值 |
 | `tests/test_speech.py` | 证明三类固定锚点行为和 control 文本语义 |
-| `tests/test_segmenter.py` | 更新长度边界并证明文本守恒和英文单词边界 |
+| `tests/test_segmenter.py` | 证明两个固定 profile、文本守恒和英文单词边界 |
+| `tests/test_config.py`、`test_api.py`、`test_runtime.py` | 证明 env fail-fast、HTTP/WS 共用值和 ready 日志 |
 | `tests/gpu_integration.py` | 用现有 full-source 路径运行真实多段固定锚定，不新增 GPU 文件或矩阵 |
 | `docs/development-constraints.md` | 把“跨段 continuation”更新为固定跨段锚定的当前产品边界 |
-| `README.md` | 只说明服务自动短句分段并保持请求内声音连续，更新固定镜像版本，不展开内部策略表 |
+| `README.md` | 说明可选 profile、short 的边界代价和固定镜像版本，不展开声音模式内部策略 |
 | `pyproject.toml`、`uv.lock` | 根包版本更新到 `0.2.1`，不改变依赖 |
 
-`schemas.py`、`app.py`、`streaming.py`、`engine.py`、`audio.py`、VoiceStore、Skill、
-companion 和 Docker 不改。
+`schemas.py`、`engine.py`、`audio.py`、VoiceStore、Skill、companion 和 Docker
+不改。
 
 ## 7. 最小测试
 
@@ -213,10 +226,12 @@ companion 和 Docker 不改。
 
 在现有 `tests/test_segmenter.py` 中：
 
-- 更新目标 55、硬上限 80 的边界断言。
+- 证明默认 natural 使用目标 100、硬上限 160，short 使用目标 55、硬上限 80。
 - 增加一个超过硬上限的英文句子，证明有可用空白时不从单词中间切断。
 - 保留随机 append、文本守恒、小数和官方标签测试。
 - 不增加语言、标点和缩写组合矩阵，不测试正则内部步骤。
+- 在现有配置、runtime 与 API owner 中分别证明 env 缺省/非法值、ready 日志，
+  以及同一个 short 设置同时到达 HTTP 与 WebSocket；不复制协议矩阵。
 
 ### 7.3 真实 GPU
 
@@ -235,7 +250,8 @@ companion 和 Docker 不改。
 开发前先用已发布 `v0.2.0` 保存基线。阶段一完成后保留现有 100/160 分段常量，
 用同一 GPU、同一 Voice Profile 和同一段 60–90 秒中文对比固定锚点；阶段二再用
 同一输入对比 55/80。这样分别确认锚点和分段变化，不把两个质量变量混在一次判断
-中。阶段二不得明显增加不自然边界、异常停顿或总生成时长。
+中。由于 55/80 会增加边界，最终产品选择 100/160 作为 natural 默认，并把
+55/80 保留为显式 short 选项；选择 short 时接受更频繁、可能较不自然的边界。
 
 最终使用同一份 60–90 秒文本分别完成 controllable 和 faithful clone，直接听
 开头、中段、结尾及分段边界。Voice Design/default 只提供 best-effort 请求内
@@ -265,24 +281,28 @@ uv run pytest -q
 
 阶段结果：服务不再跨段累积模型生成误差，公开协议不变。
 
-### 阶段二：限制单次生成跨度
+### 阶段二：确定分段 profile
 
 - 使用阶段一相同输入先保存固定锚点 + 100/160 的结果。
-- 收紧现有 segmenter 常量。
+- 使用同一 Segmenter 增加固定 55/80 候选。
 - 在硬上限回退时优先英文空白。
 - 更新现有 segmenter 测试。
 - 使用相同输入生成 55/80 结果，确认段内稳定性改善且边界、停顿和总时长没有
   明显倒退。
+- 最终选择 100/160 为 natural 默认，并仅用启动级 env 提供 55/80 short；HTTP
+  与 WebSocket 共用，不增加数字配置。
 
-阶段结果：HTTP 完整文本和 WebSocket 增量文本都以同一规则生成较短片段。
+阶段结果：HTTP 完整文本和 WebSocket 增量文本共用一个启动时固定的分段
+profile；默认优先自然边界，需要时可显式选择更短跨度。
 
 ### 阶段三：真实模型、当前文档与发布
 
 - 更新并运行现有 GPU integration 的多段路径。
 - 使用同一文本分别完成 controllable 和 faithful 的 60–90 秒实际试听。
 - 只更新 README 和开发约束中的当前事实。
-- 删除被新规则替代的 continuation 描述，不保留旧策略、fallback 或开关。
+- 删除被新规则替代的 continuation 描述，不保留旧锚定策略或 fallback。
 - 根包和 lock 更新到 `0.2.1`。
+- README 说明可选 short profile 及其边界代价；发布镜像缺省使用 natural。
 - 从同一 clean commit 创建并推送 `v0.2.1` tag，按现有唯一方式构建和发布
   `ghcr.io/lzjever/botified-tts:v0.2.1`，匿名拉取后使用现有 Docker 启动方式
   达到 `healthy`，最后创建只指向固定镜像的简短 GitHub Release。
@@ -300,8 +320,10 @@ uv run pytest -q
 - Voice Design/默认声音后续片段只使用固定第一段，不滚动更新。
 - Voice Design/default 的固定首段只提供请求内 best effort；默认声音跨请求仍可
   随机，不把它验收为 Voice Profile 等级的一致性。
-- 单段目标上限为 55 字符、硬上限为 80 字符；自然边界优先，英文有空白时不从
-  单词中间硬切，所有输入文本完整且顺序不变。
+- 缺省 natural 的目标长度为 100、硬上限为 160；显式 short 为 55/80。两者都
+  优先自然边界，英文有合适空白时不从单词中间硬切，所有输入文本完整且顺序不变。
+- `BOTIFIED_TTS_SEGMENT_PROFILE` 只接受 `natural|short`，缺省 natural，非法值
+  启动 fail-fast；HTTP/WS 共用最终值，ready 日志可见，health schema 不变。
 - HTTP WAV/Ogg 和 WebSocket PCM 的 endpoint、schema、MIME、帧格式、错误语义
   和取消行为不变。
 - WebSocket 在第一个可提交 segment 后即可持续出音，不等待 finish/全文；
@@ -311,7 +333,8 @@ uv run pytest -q
 - 普通测试通过；现有 GPU integration 完成真实多段生成。
 - 60–90 秒实际 clone 不再呈现由服务滚动 continuation 导致的逐段累积恶化，
   分段边界没有明显到不可接受的音色跳变。
-- 没有新增公开配置、第二套 pipeline、上游 fork、质量平台、报告或治理文件。
+- 没有新增请求级或任意数字配置、第二套 segmenter/pipeline、上游 fork、质量
+  平台、报告或治理文件。
 - 根包、Git tag、公开 GHCR 固定镜像和 GitHub Release 均为 `v0.2.1`，旧
   `v0.2.0` tag 和镜像保持不变。
 - 只修改当前仓库；`.reference/**` 和所有仓库外项目保持只读。

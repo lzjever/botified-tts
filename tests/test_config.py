@@ -29,6 +29,7 @@ def test_settings_load_product_defaults() -> None:
     assert settings.data_dir == Path("/data")
     assert settings.api_key == "test-secret"
     assert settings.log_level == "INFO"
+    assert settings.segment_profile == "natural"
     with pytest.raises(FrozenInstanceError):
         settings.port = 9000  # type: ignore[misc]
 
@@ -44,6 +45,7 @@ def test_settings_load_supported_overrides() -> None:
             "BOTIFIED_TTS_DATA_DIR": "/srv/tts",
             "BOTIFIED_TTS_API_KEY": "another-secret",
             "BOTIFIED_TTS_LOG_LEVEL": "DEBUG",
+            "BOTIFIED_TTS_SEGMENT_PROFILE": "short",
         }
     )
 
@@ -54,6 +56,7 @@ def test_settings_load_supported_overrides() -> None:
     assert settings.data_dir == Path("/srv/tts")
     assert settings.api_key == "another-secret"
     assert settings.log_level == "DEBUG"
+    assert settings.segment_profile == "short"
 
 
 @pytest.mark.parametrize(
@@ -67,6 +70,7 @@ def test_settings_load_supported_overrides() -> None:
         ("BOTIFIED_TTS_LOG_LEVEL", "TRACE"),
         ("BOTIFIED_TTS_HOST", ""),
         ("BOTIFIED_TTS_MODEL_SOURCE", "auto"),
+        ("BOTIFIED_TTS_SEGMENT_PROFILE", "custom"),
         ("BOTIFIED_TTS_DATA_DIR", "relative/path"),
         ("BOTIFIED_TTS_API_KEY", ""),
     ],

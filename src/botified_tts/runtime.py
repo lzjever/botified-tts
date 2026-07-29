@@ -10,7 +10,11 @@ from collections.abc import Generator, Iterable
 import uvicorn
 
 from botified_tts.app import Readiness, create_app
-from botified_tts.config import CudaPreflightError, Settings
+from botified_tts.config import (
+    CudaPreflightError,
+    InvalidConfiguration,
+    Settings,
+)
 from botified_tts.engine import EngineError, VoxCPMEngine
 from botified_tts.speech import SpeechService
 from botified_tts.voices import VoiceStore
@@ -49,6 +53,7 @@ async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
         readiness=readiness,
         voices=voices,
         speech=speech,
+        segment_profile=settings.segment_profile,
     )
     config = uvicorn.Config(
         app,
@@ -78,7 +83,16 @@ async def _serve(settings: Settings, engine: VoxCPMEngine) -> None:
             installed_signals.append(handled_signal)
 
         readiness.ready = True
-        _LOGGER.info('{"event":"ready"}')
+        _LOGGER.info(
+            json.dumps(
+                {
+                    "event": "ready",
+                    "segment_profile": settings.segment_profile,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         http_task = asyncio.create_task(server.serve())
         fatal_task = asyncio.create_task(engine.wait_for_fatal())
         done, _ = await asyncio.wait(
@@ -207,6 +221,8 @@ def main() -> None:
 
 
 def _fatal_result(error: Exception) -> str:
+    if isinstance(error, InvalidConfiguration):
+        return "invalid_configuration"
     if isinstance(error, (CudaPreflightError, EngineError)):
         return error.code
     return "engine_error"

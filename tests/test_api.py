@@ -13,6 +13,7 @@ from starlette.testclient import TestClient
 import botified_tts.app as app_module
 from botified_tts.app import Readiness, create_app
 from botified_tts.audio import AudioEncodingError
+from botified_tts.config import SegmentProfile
 from botified_tts.engine import EngineError
 from botified_tts.schemas import SynthesisOptions
 from botified_tts.speech import SynthesisSummary
@@ -89,12 +90,14 @@ def _client(
     readiness: Readiness | None = None,
     voices: FakeVoices | None = None,
     speech: FakeSpeech | None = None,
+    segment_profile: SegmentProfile = "natural",
 ) -> TestClient:
     app = create_app(
         api_key=api_key,
         readiness=readiness or Readiness(ready=True),
         voices=voices or FakeVoices(),
         speech=speech or FakeSpeech(),
+        segment_profile=segment_profile,
     )
     return TestClient(app, raise_server_exceptions=False)
 
@@ -246,6 +249,39 @@ def test_speech_uses_the_segmenter_and_returns_one_canonical_wav(
     assert summary["audio_duration"] == pytest.approx(len(PCM) / 96_000)
     assert summary["rtf"] == 0.0
     assert summary["result"] == "ok"
+
+
+def test_short_segment_profile_is_shared_by_http_and_websocket() -> None:
+    speech = FakeSpeech()
+    http_text = "x" * 81
+    stream_text = "y" * 81
+
+    with _client(speech=speech, segment_profile="short") as client:
+        response = client.post(
+            "/v1/speech",
+            headers=AUTH,
+            json={"text": http_text},
+        )
+        with client.websocket_connect(
+            "/v1/speech/stream",
+            headers=AUTH,
+        ) as websocket:
+            websocket.send_json({"type": "start"})
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json({"type": "append", "text": stream_text})
+            websocket.send_json({"type": "finish"})
+            assert websocket.receive_bytes() == PCM[:2]
+            assert websocket.receive_bytes() == PCM[2:]
+            assert websocket.receive_json() == {
+                "type": "done",
+                "cancelled": False,
+            }
+
+    assert response.status_code == 200
+    assert [segments for _, segments in speech.calls] == [
+        ["x" * 80, "x"],
+        ["y" * 80, "y"],
+    ]
 
 
 def test_speech_accepts_ogg_with_exact_content_type_and_vary(

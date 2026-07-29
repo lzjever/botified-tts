@@ -10,7 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 import botified_tts.runtime as runtime
-from botified_tts.config import CudaPreflightError, Settings
+from botified_tts.config import (
+    CudaPreflightError,
+    InvalidConfiguration,
+    Settings,
+)
 from botified_tts.engine import EngineError
 
 
@@ -23,6 +27,7 @@ def _settings(tmp_path: Path) -> Settings:
         data_dir=tmp_path,
         api_key="test-secret",
         log_level="INFO",
+        segment_profile="short",
     )
 
 
@@ -94,6 +99,7 @@ def _install_composition(
             "readiness": captured.readiness,
             "voices": voice_store,
             "speech": speech,
+            "segment_profile": settings.segment_profile,
         }
         assert captured.readiness.ready is False
         return app
@@ -170,7 +176,9 @@ def test_normal_http_shutdown_cancels_fatal_waiter_and_closes_once(
         if record.name == "uvicorn.error.botified_tts"
         and json.loads(record.getMessage()).get("event") == "ready"
     ]
-    assert ready_logs == [{"event": "ready"}]
+    assert ready_logs == [
+        {"event": "ready", "segment_profile": "short"}
+    ]
 
 
 def test_http_error_is_propagated_after_fatal_waiter_is_cancelled(
@@ -660,6 +668,10 @@ def test_main_loads_environment_and_runs_serve(
         (
             EngineError("engine_error", "RAW_FATAL_SENTINEL"),
             "engine_error",
+        ),
+        (
+            InvalidConfiguration("RAW_FATAL_SENTINEL"),
+            "invalid_configuration",
         ),
         (RuntimeError("RAW_FATAL_SENTINEL"), "engine_error"),
     ],
