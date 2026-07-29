@@ -8,7 +8,7 @@
 
 ## 1. 问题与目标
 
-当前 Skill 存在四个直接影响使用的问题：
+当前 Skill 存在五个直接影响使用的问题：
 
 1. `voxcpm-tts` 暴露底层模型，而用户需要的是稳定的 TTS 能力；
 2. README 和 Skill 仍要求 `skills.explicit` 指向 repo checkout，没有使用最新版
@@ -16,7 +16,9 @@
 3. helper 主动清除继承的 API key，强制解析 `--env-file`，与 Botified
    `env.d` 的 Bash 注入机制冲突；
 4. Skill 只报告生成文件的本地路径，没有使用 `publish_file` 完成普通文件或语音
-   消息交付。
+   消息交付；
+5. Botified file ref 的 `agent_path` 没有原文件扩展名，当前 helper 又从
+   `--file` 路径生成 multipart filename，导致合法参考音频无法创建 profile。
 
 本轮交付后，Botified Agent 通过唯一的 `tts` Skill 使用现有 Botified TTS
 服务。Skill 安装在 resolved Agent root，helper 只消费进程环境，面向调用方的
@@ -34,6 +36,8 @@
   `<resolved-agents-dir>/env.d/botified-tts.env`；
 - 删除 helper 的 `--env-file` 和 env-file parser，直接读取
   `BOTIFIED_TTS_URL`、`BOTIFIED_TTS_API_KEY`；
+- 让 `voice-create` 分别消费 manifest `agent_path` 和 `filename`，按 filename
+  suffix 生成固定且安全的 multipart filename；
 - 保留普通合成、Voice Design、两种克隆、音色管理和 WAV/Ogg 输出；
 - 在 Skill 工作流中加入普通音频发布和 Ogg 语音消息发布；
 - 原地调整现有 helper 测试、README 和 `docs/development-constraints.md`。
@@ -96,6 +100,12 @@ Resolved Agent root 按 Botified 的真实规则确定：
     └── botified-tts.env
 ```
 
+运行前置固定为 Botified Core `v0.4.45+`，启用 Botified 内置 `bash`，并在 Core
+主机提供 Bash、curl、`python3` 和 helper 已使用的 GNU coreutils。安装必须保留
+`scripts/botified-tts` 的 executable bit。Skill host 只是轻量 HTTP 客户端，不
+需要 CUDA、Torch 或 FFmpeg；这些不是 Skill 安装项，也不改变 TTS 服务自身的
+运行要求。只有部署已启用 `bash` 时，常规 Skill 安装才不需要修改 Botified YAML。
+
 Env 文件只放 Skill 客户端需要的配置：
 
 ```dotenv
@@ -125,6 +135,26 @@ Helper 不查找、读取或解析 `env.d`，也不解析 Botified YAML。开发
 保留 `health`、`voice-create`、`voice-list`、`voice-delete` 和 `speak`。删除
 `--env-file`、`ENV_FILE` 及其 Python parser，不增加第二个配置入口。
 
+`voice-create` 的唯一文件输入为：
+
+```text
+voice-create --name <profile-name> --file <agent_path> --filename <manifest.filename>
+```
+
+`--file` 提供可读的文件字节，`--filename` 对所有 `voice-create` 调用必填；不从
+`--file` basename 推导，也不保留旧 fallback。Helper 只按大小写不敏感的 suffix
+接受 `.wav`、`.flac` 或 `.mp3`，并分别使用固定 multipart filename
+`reference.wav`、`reference.flac` 或 `reference.mp3`。Manifest 原始 filename
+不进入 curl form 表达式，也不保存为 profile metadata；中文、空格、逗号、分号、
+引号、反斜杠等字符只要最终 suffix 有效就不导致失败。Helper 不复制输入，不创建
+临时副本，也没有成功、失败或取消后的输入清理流程。
+
+缺少 `--filename` 时在网络请求前报告 `--filename is required`；无 suffix 或
+`.ogg` 等不支持的 suffix 报告
+`--filename must end with .wav, .flac, or .mp3`。除既定删除全局
+`--env-file` 外，必填 `--filename` 是本轮唯一新增的 breaking CLI change；
+其他命令和参数保持不变。
+
 Helper 启动时把 `BOTIFIED_TTS_API_KEY` 复制到进程内变量，随后从导出环境清除
 原变量，避免继续传给 `curl`、`python3` 等子进程。请求前验证 URL 非空且使用
 HTTP(S) scheme；认证请求还验证 key 存在并匹配 `[A-Za-z0-9._~-]+`。其他 URL
@@ -150,15 +180,27 @@ Skill 正文保持简短，但必须给 Agent 足够的模式选择信息：
 
 | 用户意图 | 唯一做法 |
 | --- | --- |
-| 不指定声音，只需朗读 | `speak`，不传 `--design` 或 `--voice-id` |
+| 不指定声音，只需朗读 | `speak`，不传 `--design` 或 `--voice-id`；需要情绪、语速或表达时可选 `--style` |
 | 从描述创造新声音 | `--design` 描述身份与声音质感；需要时用 `--style` 描述表达状态 |
 | 保留已有音色并改变情绪、语速或表达 | `--voice-id`，使用默认 controllable mode，并按需传 `--style` |
 | 最大程度延续参考音频的音色、节奏、情绪和风格 | 使用带精确转写的 profile，加 `--mode faithful`，不得传 `--style` |
 | 加入笑声、叹息、迟疑、疑问或惊讶等局部表达 | 将官方非语言标签直接放进 `--text`，不增加新参数 |
 
-高保真模式所需的 `prompt_text` 必须是参考音频的逐字转写。没有精确转写时不得
-猜测或伪造，也不在本 Skill 中调用 ASR；改用 controllable mode，或请用户提供
-准确文本。
+用户提供参考音频时，Botified file ref 必须同时为 available 并包含
+`agent_path` 和 `filename`。Agent 将只读 `agent_path` 直接传给
+`voice-create --file`，并将 manifest `filename` 原样传给必填的
+`--filename`；manifest unavailable 或没有 `agent_path` 时不调用 helper，请用户
+重新上传。`agent_path` 可以是绝对路径；runtime cwd 内相对路径的限制只适用于准备
+通过 `publish_file` 交付的新生成音频。创建 profile 后读取返回 JSON 的 `id`，
+向用户报告，并在后续合成中作为 `--voice-id`。
+
+用户按名称指定已有 profile 时先调用 `voice-list`：没有匹配或出现重名时不得猜测
+ID，应让用户确认。Controllable mode 可使用没有转写的 profile；faithful mode
+所需的 `prompt_text` 必须是参考音频的精确逐字转写。没有精确转写时不得猜测、
+伪造或在本 Skill 中调用 ASR；改用 controllable mode，或请用户提供准确文本。
+
+普通默认声音和 Voice Design 都不承诺跨请求保持同一音色；需要多次复用稳定身份时
+创建并使用 voice profile。
 
 ### 3.5 文本与表达指导
 
@@ -224,9 +266,12 @@ Voice Design 的 `--design` 应用一条简洁且不矛盾的描述组合：
 
 1. 只处理已经适合朗读的纯文本，不解析 Markdown 或 SSML；
 2. 根据意图选择普通合成、Voice Design、controllable clone 或 faithful clone；
-3. 8 KiB UTF-8 限制内的一次完整话语只调用一次 helper；服务内部负责长文本切句
-   和跨段声音锚定，不为“模型稳定”在 Agent 侧手工拆成多次独立合成；超过限制
-   时不得擅自生成多个独立文件冒充一个连续结果；
+3. 不超过 8192 UTF-8 bytes 的一次完整话语只调用一次 helper；服务内部负责长文本
+   切句和跨段声音锚定，不为“模型稳定”在 Agent 侧手工拆成多次独立合成。文本超过
+   限制或服务返回 `input_too_large` 时，明确报告限制，让用户缩短文本，或明确确认
+   拆成多个独立文件；未经确认不得截断或拆分。用户确认后按自然边界拆分并编号，
+   每份不超过限制，复用已选择的 voice/mode/style/design options，分别生成和
+   `publish_file`，并明确不承诺跨文件的音色、韵律或听感连续性；
 4. 准备发布的文件直接生成到 runtime cwd 内的新相对 `.wav` 或 `.ogg` regular
    file，不覆盖已有文件，不使用绝对路径、`..`、cwd 外路径或 symlink；
 5. 面向调用方的结果必须调用 `publish_file`，不能只报告服务端路径；
@@ -254,18 +299,8 @@ Agent 只能使用 helper 已有参数。上游 VoxCPM2 还提供 CFG、扩散�
 规范化、降噪、bad-case retry、音素输入、LoRA 和 batch 等能力，但本服务没有把
 它们作为请求能力暴露；Skill 不得虚构对应 flags、环境变量或 API 字段。
 
-`seed` 是控制生成随机性的随机种子，适合复现和调试，但不能代替 voice profile
-提供跨文本的稳定音色。本服务正式合成不传 seed 时保持上游随机行为；模型 warmup
-使用的固定 seed 不是请求默认值。本轮不为低频调试用途扩展 HTTP、WebSocket 和
-helper。后续若出现明确的外部复现需求，唯一兼容设计是接受可选的非负整数：省略时
-继续传 `None`，提供时由服务从请求 seed 为每个内部分段派生不同且可复现的 seed，
-不得给所有分段重复传同一个值，也不得增加全局固定 seed 环境变量。
-
-其余未公开参数同样保持内部边界：`cfg_value` 和扩散步数是质量、稳定性与吞吐的
-服务实现选择；文本规范化由 Agent 在可朗读纯文本中完成；参考音频降噪会增加模型
-和依赖且可能改变声线；bad-case retry 不适合已开始输出的流式请求；音素、LoRA、
-batch 和 timestamps 不属于 Botified Agent 的稳定 TTS 闭环。当前没有遗漏必须由
-Agent 控制的重要上游参数。
+这些未公开参数继续属于服务内部或上游边界。本轮不为它们预先设计 API、helper
+flags、环境变量、兼容规则或测试。
 
 本节能力依据为 VoxCPM2 官方
 [使用指南](https://voxcpm.readthedocs.io/zh-cn/latest/usage_guide.html)和
@@ -277,10 +312,10 @@ Agent 控制的重要上游参数。
 | 文件 | 改动与边界 |
 | --- | --- |
 | `skills/voxcpm-tts/` | Git move 为 `skills/tts/`，不保留旧目录 |
-| `skills/tts/SKILL.md` | 修改名称、metadata、env.d、模式选择、原生标签、表达指导和 `publish_file` 工作流；删除 checkout + `skills.explicit` 与 `--env-file` 安装示例 |
-| `skills/tts/scripts/botified-tts` | 只消费进程环境；其余命令和 HTTP 行为保持 |
-| `tests/test_skill_helper.py` | 更新路径和环境注入，保留 helper 行为测试，删除 env-file parser 测试 |
-| `README.md` | 写明 Botified 版本、resolved Agent root、唯一安装配置、升级和调用方式 |
+| `skills/tts/SKILL.md` | 修改名称、metadata、env.d、模式选择、file ref/profile、原生标签、超限处理和 `publish_file` 工作流；删除 checkout + `skills.explicit` 与 `--env-file` 安装示例 |
+| `skills/tts/scripts/botified-tts` | 只消费进程环境；`voice-create` 必填 `--filename` 并按 suffix 发送固定 `reference.<ext>`；不复制输入；其余命令和 HTTP 行为保持 |
+| `tests/test_skill_helper.py` | 更新路径和环境注入，TDD 覆盖新的 filename/wire 行为，保留 helper 行为测试，删除 env-file parser 测试 |
+| `README.md` | 写明 Core 版本、bash/host 依赖、executable bit、resolved Agent root、唯一安装配置、breaking CLI、升级和调用方式 |
 | `docs/development-constraints.md` | 区分服务/companion env-file 与 Skill 的 env.d 客户端环境 |
 
 测试只覆盖本项目拥有的行为：
@@ -291,6 +326,22 @@ Agent 控制的重要上游参数。
 - helper 从环境读取 URL/key，且 `health` 在完全没有 key 时仍可成功；
 - 认证命令缺 URL/key、URL 非 HTTP(S) 或 key 非法时不发请求；
 - key 不进入 curl argv、stdout、stderr 或 curl 子进程环境。
+
+现有 helper 测试层使用一个参数化/表驱动成功用例覆盖三行映射：
+
+| `--file` / `--filename` 场景 | Multipart wire filename |
+| --- | --- |
+| 无扩展名路径；filename 包含中文、空格、逗号、分号、引号、反斜杠并以混合大小写 `.WaV` 结尾 | `reference.wav` |
+| 普通 filename 以 `.flac` 结尾 | `reference.flac` |
+| 普通 filename 以 `.mp3` 结尾 | `reference.mp3` |
+
+每行只断言上传 payload 与原文件一致，以及 wire filename 匹配；不把格式、特殊字符、
+大小写、profile mode 或服务解码扩成笛卡尔积。失败用例仍只覆盖缺少
+`--filename`、无 suffix 和 `.ogg`，并确认请求未发送。
+
+不测试 Botified 如何生成 manifest 或 `agent_path`，也不为用户确认拆分、
+`publish_file` 或服务解码增加新的自动测试；它们是 Skill 工作流或既有 Botified/
+服务边界。B2 只扩充现有 helper 测试，不新增服务、GPU、E2E 测试或测试层。
 
 删除 env-file 缺失、重复 key、CRLF、引号和 shell 文本测试；这些格式现在由
 Botified env.d 拥有。标签验证复用现有 `tests/test_segmenter.py` 对完整列表的
@@ -320,10 +371,12 @@ env-file；Skill helper 只消费 Botified Bash 注入的 URL/key。Env.d 不配
 
 共同前置步骤：
 
-1. 将 Botified Core 升级到 `v0.4.45+`；
-2. 确认真实 resolved Agent root，并检查发现根中没有另一个 `name: tts`；
-3. 安装完整的 `skills/tts`；
-4. 原子创建 `env.d/botified-tts.env`，只写 URL 和 key。
+1. 将 Botified Core 升级到 `v0.4.45+`，确认内置 `bash` 已启用；
+2. 确认 Core host 有 Bash、curl、`python3` 和 GNU coreutils；无需安装 CUDA、
+   Torch 或 FFmpeg；
+3. 确认真实 resolved Agent root，并检查发现根中没有另一个 `name: tts`；
+4. 安装完整的 `skills/tts` 并保留 helper executable bit；
+5. 原子创建 `env.d/botified-tts.env`，只写 URL 和 key。
 
 旧 Skill 位于 Agent root 时，删除安装目标中的 `skills/voxcpm-tts` 后发起新的
 provider request，再运行一次新的 Bash 调用验证；不修改 YAML，不重启 Core。
@@ -344,7 +397,19 @@ operator 才能清理旧文件。迁移不保留新旧 Skill 并行、alias 或 
 - 仅存在 `skills/tts/SKILL.md`，其目录名、`name: tts`、description 和
   `when_to_use` 一致；
 - 不存在旧 Skill、alias、兼容 wrapper 或第二个配置入口；
-- `scripts/botified-tts` 不再包含或接受 `--env-file`；
+- README 明确 Core `v0.4.45+`、Botified `bash` enabled、Core host 的
+  Bash/curl/`python3`/GNU coreutils 前置，并说明 Skill host 不需要 CUDA、Torch
+  或 FFmpeg；
+- `scripts/botified-tts` 保持 executable，且不再包含或接受 `--env-file`；
+- `voice-create` 对所有调用要求 `--file` 和 `--filename`，不从 file basename
+  推导；有效 suffix 大小写不敏感，wire filename 固定为
+  `reference.wav|reference.flac|reference.mp3`，原始 filename 不进入 curl 或
+  profile metadata，也不产生输入副本或清理流程；
+- 同一 helper 测试层的一个参数化/表驱动成功用例覆盖：复杂的无扩展名路径与特殊
+  字符 `.WaV` filename 映射为 `reference.wav`、简单 `.flac` 映射为
+  `reference.flac`、简单 `.mp3` 映射为 `reference.mp3`；每行只验证 payload 与
+  wire filename，不做笛卡尔积；缺 filename、无 suffix 和 `.ogg` 在请求前失败；
+  不增加服务、GPU、E2E 测试或新测试层；
 - 仅设置 URL/key 后，helper 可完成 health、音色管理和四种模式的 WAV/Ogg 合成；
 - `health` 在 key 完全缺失时仍成功；认证命令缺 URL/key、URL 非 HTTP(S) 或 key
   非法时在请求前失败，错误不回显 key；
@@ -361,8 +426,16 @@ operator 才能清理旧文件。迁移不保留新旧 Skill 并行、alias 或 
   ASR 和已有音频处理；
 - Skill 完整列出 11 个官方标签及其使用约束，说明多语言、方言、标点、Voice
   Design、style、参考音频和四种模式的选择规则；
+- Skill 说明 available file ref 的 `agent_path` 和 `filename` 必须分别传给
+  `--file` 与 `--filename`；unavailable 或缺少 `agent_path` 时请用户重传；创建
+  后读取返回 JSON `id`，报告并作为后续 `--voice-id`；按名称查找时先 list，
+  零匹配或重名不猜；controllable 不要求转写，faithful 要求精确逐字转写且不调用
+  ASR；
+- 默认声音允许可选 `--style` 但不承诺跨请求音色一致，需复用身份时使用 profile；
 - Skill 不出现当前 helper 未实现的 VoxCPM2 参数或 flags；
 - 新 Bash 中 helper 无 `--env-file` 即可使用 env.d 配置；
+- 超过 8192 UTF-8 bytes 或收到 `input_too_large` 时，未经用户确认不截断或拆分；
+  确认后按自然边界编号、复用已选 options、分别生成并发布，且不承诺跨文件连续性；
 - 普通 WAV/Ogg 通过 `publish_file` 使用匹配 MIME 发布，不携带
   `audio_as_voice: true`；
 - Ogg 语音消息通过 `publish_file` 使用 `audio/ogg` 和
