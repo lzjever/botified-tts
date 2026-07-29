@@ -25,11 +25,12 @@ from botified_tts.voices import VoiceStore
 SAMPLES_PER_CHUNK = 7_680
 PCM_BYTES_PER_CHUNK = SAMPLES_PER_CHUNK * 2
 MODEL_SOURCES: tuple[ModelSource, ...] = ("modelscope", "huggingface")
-DESIGN_SPOKEN_TEXT = (
-    "你好，我是 Botified 的语音助手。"
-    "今天我会用温暖自然的声音，陪你一起了解这项语音服务。"
-    "希望接下来的交流清晰轻松，也让每一句回应都保持真诚和亲切。"
+DESIGN_SPOKEN_SEGMENTS = (
+    "你好，我是 Botified 的语音助手。",
+    "今天我会用温暖自然的声音，陪你一起了解这项语音服务。",
+    "希望接下来的交流清晰轻松，也让每一句回应都保持真诚和亲切。",
 )
+DESIGN_SPOKEN_TEXT = "".join(DESIGN_SPOKEN_SEGMENTS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,7 +148,7 @@ async def check_full_source(source: ModelSource, data_dir: Path) -> None:
                     mode=None,
                     style=None,
                 ),
-                text_segments=(DESIGN_SPOKEN_TEXT,),
+                text_segments=DESIGN_SPOKEN_SEGMENTS,
             )
             profile = voices.create(
                 name="gpu-integration-reference",
@@ -169,7 +170,11 @@ async def check_full_source(source: ModelSource, data_dir: Path) -> None:
                     mode="controllable",
                     style="平静亲切，语速稍慢，带一点微笑",
                 ),
-                text_segments=("这是使用参考音色生成的可控表达。",),
+                text_segments=(
+                    "这是使用参考音色生成的第一段可控表达。",
+                    "第二段继续保持平静亲切的说话方式，[laughing]表达也更轻松。",
+                    "第三段确认多段内容始终使用同一份参考音色。",
+                ),
             )
             await synthesize(
                 speech,
@@ -179,19 +184,9 @@ async def check_full_source(source: ModelSource, data_dir: Path) -> None:
                     mode="faithful",
                     style=None,
                 ),
-                text_segments=("这是忠实复刻参考音色的语音。",),
-            )
-            await synthesize(
-                speech,
-                name="two-segment-continuation",
-                options=SynthesisOptions(
-                    voice=None,
-                    mode=None,
-                    style=None,
-                ),
                 text_segments=(
-                    "第一段先介绍今天的语音内容。",
-                    "第二段自然延续刚才的表达，[laughing]气氛也更轻松了。",
+                    "这是忠实复刻参考音色的第一段语音。",
+                    "第二段仍然使用原始参考音频和精确文本。",
                 ),
             )
             await check_cancellation_recovery(speech)
