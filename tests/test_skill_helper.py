@@ -17,7 +17,7 @@ import pytest
 
 
 ROOT = Path(__file__).parents[1]
-HELPER = ROOT / "skills/voxcpm-tts/scripts/botified-tts"
+HELPER = ROOT / "skills/tts/scripts/botified-tts"
 VOICE_ID = "voice_" + "1" * 32
 
 
