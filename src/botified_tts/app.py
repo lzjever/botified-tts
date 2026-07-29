@@ -4,24 +4,29 @@ import asyncio
 import hashlib
 import hmac
 import json
+import shutil
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from contextlib import suppress
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from botified_tts.audio import (
     AudioEncodingError,
-    pcm_s16le_chunks_to_ogg_opus,
-    pcm_s16le_chunks_to_wav,
+    pcm_s16le_file_to_ogg_opus,
+    pcm_s16le_file_to_wav,
 )
 from botified_tts.config import MAX_CONCURRENT_SYNTHESIS, SegmentProfile
 from botified_tts.engine import EngineError
@@ -33,7 +38,11 @@ from botified_tts.schemas import (
 )
 from botified_tts.segmenter import Segmenter
 from botified_tts.speech import SpeechService, SynthesisSummary
-from botified_tts.streaming import _StreamingSession
+from botified_tts.streaming import (
+    _CleanupFailed,
+    _StreamingSession,
+    _bounded_cleanup,
+)
 from botified_tts.voices import (
     MAX_UPLOAD_BYTES,
     InvalidVoice,
@@ -80,6 +89,29 @@ class _Admission:
 
     def release(self) -> None:
         self._active -= 1
+
+
+class _OwnedFileResponse(FileResponse):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        owned_directory: Path,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(path, **kwargs)
+        self._owned_directory = owned_directory
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+    ) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            shutil.rmtree(self._owned_directory, ignore_errors=True)
 
 
 def create_app(
@@ -170,21 +202,31 @@ def create_app(
             id=f"req_{uuid.uuid4().hex}",
             ttfb_started_at=time.monotonic(),
         )
+        owned_directory: Path | None = None
         result = "engine_error"
         try:
             speech_request = await _parse_speech_body(request)
             summary.set_options(speech_request.options)
             summary.accept_text(speech_request.text)
             segments = _segment_text(speech_request, segment_profile)
+            owned_directory = Path(
+                tempfile.mkdtemp(prefix="botified-tts-speech-")
+            )
+            pcm_path = owned_directory / "speech.pcm"
+            chunks = speech.synthesize(
+                speech_request.options,
+                segments,
+                summary=summary,
+            )
             try:
-                chunks = [
-                    chunk
-                    async for chunk in speech.synthesize(
-                        speech_request.options,
-                        segments,
-                        summary=summary,
-                    )
-                ]
+                with pcm_path.open("wb") as pcm:
+                    async for chunk in chunks:
+                        try:
+                            pcm.write(chunk)
+                        except Exception:
+                            with suppress(_CleanupFailed):
+                                await _bounded_cleanup(chunks.aclose())
+                            raise
             except InvalidVoice as error:
                 result = "invalid_voice"
                 raise _ApiError(404, "invalid_voice", str(error)) from error
@@ -199,11 +241,14 @@ def create_app(
                     "Speech synthesis failed",
                     error_type="server_error",
                 ) from error
+
             if media_type == "audio/ogg":
+                output_path = owned_directory / "speech.ogg"
                 try:
-                    content = await run_in_threadpool(
-                        pcm_s16le_chunks_to_ogg_opus,
-                        chunks,
+                    await run_in_threadpool(
+                        pcm_s16le_file_to_ogg_opus,
+                        pcm_path,
+                        output_path,
                     )
                 except AudioEncodingError as error:
                     raise _ApiError(
@@ -213,12 +258,20 @@ def create_app(
                         error_type="server_error",
                     ) from error
             else:
-                content = pcm_s16le_chunks_to_wav(chunks)
-            response = Response(
-                content,
+                output_path = owned_directory / "speech.wav"
+                await run_in_threadpool(
+                    pcm_s16le_file_to_wav,
+                    pcm_path,
+                    output_path,
+                )
+            pcm_path.unlink()
+            response = _OwnedFileResponse(
+                output_path,
+                owned_directory=owned_directory,
                 media_type=media_type,
                 headers={"Vary": "Accept"},
             )
+            owned_directory = None
             result = "ok"
             return response
         except _ApiError as error:
@@ -228,8 +281,12 @@ def create_app(
             result = "cancelled"
             raise
         finally:
-            admission.release()
-            summary.log_terminal(result)
+            try:
+                if owned_directory is not None:
+                    shutil.rmtree(owned_directory, ignore_errors=True)
+            finally:
+                admission.release()
+                summary.log_terminal(result)
 
     async def create_voice(request: Request) -> Response:
         authorize(request)

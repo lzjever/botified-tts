@@ -140,10 +140,11 @@ def test_http_speech_body_rejects_missing_empty_and_unknown_text_fields() -> Non
 
 
 def test_http_text_limit_counts_utf8_bytes() -> None:
-    exact = "a" * (HTTP_TEXT_MAX_BYTES - 3) + "语"
+    assert HTTP_TEXT_MAX_BYTES == 16 * 1024
+    exact = "a" * (16 * 1024 - 3) + "语"
     too_large = exact + "a"
 
-    assert len(exact.encode("utf-8")) == HTTP_TEXT_MAX_BYTES
+    assert len(exact.encode("utf-8")) == 16 * 1024
     assert parse_speech_request({"text": exact}).text == exact
     with pytest.raises(InputTooLarge):
         parse_speech_request({"text": too_large})

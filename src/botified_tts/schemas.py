@@ -7,7 +7,7 @@ from typing import Literal
 
 STYLE_MAX_BYTES = 512
 DESCRIPTION_MAX_BYTES = 1024
-HTTP_TEXT_MAX_BYTES = 8 * 1024
+HTTP_TEXT_MAX_BYTES = 16 * 1024
 WS_APPEND_MAX_BYTES = 16 * 1024
 ProfileMode = Literal["controllable", "faithful"]
 
@@ -130,7 +130,9 @@ def parse_speech_request(value: Mapping[str, object]) -> SpeechRequest:
     )
     text = _required_string(value, "text", "speech request")
     if len(text.encode("utf-8")) > HTTP_TEXT_MAX_BYTES:
-        raise InputTooLarge("speech request text exceeds 8192 UTF-8 bytes")
+        raise InputTooLarge(
+            f"speech request text exceeds {HTTP_TEXT_MAX_BYTES} UTF-8 bytes"
+        )
     if not text.strip():
         raise InvalidSynthesisOptions(
             "speech request text must be a non-empty string"

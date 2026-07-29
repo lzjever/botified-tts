@@ -146,17 +146,14 @@ bracketed forms. The helper passes tags unchanged.
 
 ## Handle length and publish
 
-Send one complete utterance of at most 8192 UTF-8 bytes in one `speak` call.
-The service performs sentence-aware internal segmentation; do not split within
-the limit for perceived stability.
+Send one complete speakable response intended to become one audio file in one
+`speak` call. The service accepts at most 16384 UTF-8 bytes and performs
+sentence-aware internal segmentation. Do not estimate the byte size, truncate,
+pre-split, or automatically retry the text.
 
-If text exceeds the limit or the service returns `input_too_large`, report the
-limit and let the user either shorten it or explicitly approve multiple
-independent files. Do not truncate or split before approval. After approval,
-split at natural boundaries, number the files, keep each part within the
-limit, reuse the selected voice/mode/style/design options, synthesize and
-publish every part separately, and state that identity, rhythm, and listening
-continuity across files are not guaranteed.
+If the service returns `input_too_large`, report the 16 KiB limit and ask the
+user to shorten the response. Do not create numbered parts or multiple
+independent files.
 
 Create every result as a new relative `.wav` or `.ogg` regular file under the
 runtime cwd. Never overwrite, use an absolute or `..` path, write outside cwd,
@@ -165,7 +162,11 @@ WAV.
 
 Publish every caller-facing result with Botified `publish_file`; never return
 only a server-local path and do not upload it through Botified Runtime Data.
-For a normal attachment, match the MIME type and omit `audio_as_voice`:
+Call `publish_file` once for the one generated file. If publication fails or
+its result is unknown, report the failure and stop; do not retry, read channel
+configuration or credentials, use an access token, or call a channel API
+directly. For a normal attachment, match the MIME type and omit
+`audio_as_voice`:
 
 ```json
 {"path":"reply.ogg","filename":"reply.ogg","mime_type":"audio/ogg"}

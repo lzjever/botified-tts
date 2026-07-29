@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import wave
 from collections.abc import Iterable
+from typing import BinaryIO
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +17,9 @@ class InvalidWaveform(ValueError):
 
 class AudioEncodingError(RuntimeError):
     """The audio encoder failed to produce a complete output."""
+
+
+_FILE_CHUNK_BYTES = 64 * 1024
 
 
 def float32_to_pcm_s16le(waveform: NDArray[np.float32]) -> bytes:
@@ -34,17 +39,38 @@ def float32_to_pcm_s16le(waveform: NDArray[np.float32]) -> bytes:
 
 def pcm_s16le_chunks_to_wav(chunks: Iterable[bytes]) -> bytes:
     output = io.BytesIO()
+    _write_wav(chunks, output)
+    return output.getvalue()
+
+
+def pcm_s16le_file_to_wav(
+    pcm_path: str | os.PathLike[str],
+    wav_path: str | os.PathLike[str],
+) -> None:
+    with open(pcm_path, "rb") as source, open(wav_path, "wb") as output:
+        chunks = iter(lambda: source.read(_FILE_CHUNK_BYTES), b"")
+        _write_wav(chunks, output)
+
+
+def _write_wav(chunks: Iterable[bytes], output: BinaryIO) -> None:
     with wave.open(output, "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(48_000)
         for chunk in _validated_pcm_s16le_chunks(chunks):
             wav.writeframesraw(chunk)
-    return output.getvalue()
 
 
-def pcm_s16le_chunks_to_ogg_opus(chunks: Iterable[bytes]) -> bytes:
-    pcm = b"".join(_validated_pcm_s16le_chunks(chunks))
+def pcm_s16le_file_to_ogg_opus(
+    pcm_path: str | os.PathLike[str],
+    ogg_path: str | os.PathLike[str],
+) -> None:
+    try:
+        if os.path.getsize(pcm_path) % 2 != 0:
+            raise ValueError("PCM file must contain complete 16-bit samples")
+    except OSError as error:
+        raise AudioEncodingError("FFmpeg failed to encode audio") from error
+
     try:
         result = subprocess.run(
             [
@@ -60,7 +86,7 @@ def pcm_s16le_chunks_to_ogg_opus(chunks: Iterable[bytes]) -> bytes:
                 "-ac",
                 "1",
                 "-i",
-                "pipe:0",
+                os.fspath(pcm_path),
                 "-map",
                 "0:a:0",
                 "-ac",
@@ -77,19 +103,21 @@ def pcm_s16le_chunks_to_ogg_opus(chunks: Iterable[bytes]) -> bytes:
                 "on",
                 "-f",
                 "ogg",
-                "pipe:1",
+                os.fspath(ogg_path),
             ],
-            input=pcm,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             check=False,
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise AudioEncodingError("FFmpeg failed to encode audio") from error
-    if result.returncode != 0 or not result.stdout:
+    try:
+        valid_output = os.path.getsize(ogg_path) > 0
+    except OSError:
+        valid_output = False
+    if result.returncode != 0 or not valid_output:
         raise AudioEncodingError("FFmpeg failed to encode audio")
-    return result.stdout
 
 
 def _validated_pcm_s16le_chunks(chunks: Iterable[bytes]) -> Iterable[bytes]:

@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import wave
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,8 +14,9 @@ from botified_tts.audio import (
     AudioEncodingError,
     InvalidWaveform,
     float32_to_pcm_s16le,
-    pcm_s16le_chunks_to_ogg_opus,
     pcm_s16le_chunks_to_wav,
+    pcm_s16le_file_to_ogg_opus,
+    pcm_s16le_file_to_wav,
 )
 
 
@@ -36,17 +38,23 @@ def test_float32_to_pcm_s16le_rejects_non_finite_values(sample: float) -> None:
         float32_to_pcm_s16le(np.array([sample], dtype=np.float32))
 
 
-def test_pcm_s16le_chunks_to_wav_preserves_order_and_sets_fixed_format() -> None:
+def test_pcm_s16le_file_to_wav_preserves_order_and_sets_fixed_format(
+    tmp_path: Path,
+) -> None:
     chunks = [b"\x01\x02\x03\x04", b"\x05\x06", b"\x07\x08\x09\x0a"]
+    pcm_path = tmp_path / "speech.pcm"
+    wav_path = tmp_path / "speech.wav"
+    pcm_path.write_bytes(b"".join(chunks))
 
-    encoded = pcm_s16le_chunks_to_wav(iter(chunks))
+    pcm_s16le_file_to_wav(pcm_path, wav_path)
 
-    with wave.open(io.BytesIO(encoded), "rb") as wav:
+    with wave.open(str(wav_path), "rb") as wav:
         assert wav.getnchannels() == 1
         assert wav.getsampwidth() == 2
         assert wav.getframerate() == 48_000
         assert wav.getnframes() == 5
         assert wav.readframes(wav.getnframes()) == b"".join(chunks)
+    assert pcm_s16le_chunks_to_wav(iter(chunks)) == wav_path.read_bytes()
 
 
 def test_pcm_s16le_chunks_to_wav_allows_empty_audio() -> None:
@@ -65,17 +73,21 @@ def test_pcm_s16le_chunks_to_wav_rejects_each_odd_sized_chunk() -> None:
         pcm_s16le_chunks_to_wav([b"\x00", b"\x01"])
 
 
-def test_pcm_s16le_chunks_to_ogg_opus_produces_decodable_fixed_format() -> None:
+def test_pcm_s16le_file_to_ogg_opus_produces_decodable_fixed_format(
+    tmp_path: Path,
+) -> None:
     sample_count = 12_000
     t = np.arange(sample_count, dtype=np.float32) / 48_000
     pcm = float32_to_pcm_s16le(
         (0.2 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
     )
+    pcm_path = tmp_path / "speech.pcm"
+    ogg_path = tmp_path / "speech.ogg"
+    pcm_path.write_bytes(pcm)
 
-    encoded = pcm_s16le_chunks_to_ogg_opus(
-        [pcm[:4_000], pcm[4_000:16_000], pcm[16_000:]]
-    )
+    pcm_s16le_file_to_ogg_opus(pcm_path, ogg_path)
 
+    encoded = ogg_path.read_bytes()
     assert encoded.startswith(b"OggS")
     assert b"OpusHead" in encoded[:256]
 
@@ -88,9 +100,8 @@ def test_pcm_s16le_chunks_to_ogg_opus_produces_decodable_fixed_format() -> None:
             "format=format_name:stream=codec_name,sample_rate,channels",
             "-of",
             "json",
-            "pipe:0",
+            str(ogg_path),
         ],
-        input=encoded,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -126,8 +137,9 @@ def test_pcm_s16le_chunks_to_ogg_opus_produces_decodable_fixed_format() -> None:
     assert len(decoded.stdout) == len(pcm)
 
 
-def test_pcm_s16le_chunks_to_ogg_opus_maps_encoder_failure(
+def test_pcm_s16le_file_to_ogg_opus_maps_encoder_failure(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(
         audio.subprocess,
@@ -136,6 +148,8 @@ def test_pcm_s16le_chunks_to_ogg_opus_maps_encoder_failure(
             args[0], 1, b"", b"private"
         ),
     )
+    pcm_path = tmp_path / "speech.pcm"
+    pcm_path.write_bytes(b"\x00\x00")
 
     with pytest.raises(AudioEncodingError, match="FFmpeg failed to encode audio"):
-        pcm_s16le_chunks_to_ogg_opus([b"\x00\x00"])
+        pcm_s16le_file_to_ogg_opus(pcm_path, tmp_path / "speech.ogg")

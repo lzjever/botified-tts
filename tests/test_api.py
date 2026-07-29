@@ -5,6 +5,7 @@ import io
 import json
 import wave
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -251,6 +252,25 @@ def test_speech_uses_the_segmenter_and_returns_one_canonical_wav(
     assert summary["result"] == "ok"
 
 
+def test_http_accepts_text_above_legacy_limit_in_one_synthesis_call() -> None:
+    text = "This is one complete response. " * 300
+    assert 8 * 1024 < len(text.encode("utf-8")) < 16 * 1024
+    speech = FakeSpeech()
+
+    with _client(speech=speech) as client:
+        response = client.post(
+            "/v1/speech",
+            headers=AUTH,
+            json={"text": text},
+        )
+
+    assert response.status_code == 200
+    assert len(speech.calls) == 1
+    _, segments = speech.calls[0]
+    assert len(segments) > 1
+    assert "".join(segments) == text
+
+
 def test_short_segment_profile_is_shared_by_http_and_websocket() -> None:
     speech = FakeSpeech()
     http_text = "x" * 81
@@ -288,15 +308,17 @@ def test_speech_accepts_ogg_with_exact_content_type_and_vary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     encoded = b"OggS\x00OpusHead"
-    received_chunks: list[list[bytes]] = []
+    received_pcm: list[bytes] = []
+    owned_directories: list[Path] = []
 
-    def encode(chunks: list[bytes]) -> bytes:
-        received_chunks.append(chunks)
-        return encoded
+    def encode(pcm_path: Path, output_path: Path) -> None:
+        received_pcm.append(pcm_path.read_bytes())
+        owned_directories.append(pcm_path.parent)
+        output_path.write_bytes(encoded)
 
     monkeypatch.setattr(
         app_module,
-        "pcm_s16le_chunks_to_ogg_opus",
+        "pcm_s16le_file_to_ogg_opus",
         encode,
     )
     with _client() as client:
@@ -308,20 +330,26 @@ def test_speech_accepts_ogg_with_exact_content_type_and_vary(
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "audio/ogg"
+    assert response.headers["content-length"] == str(len(encoded))
     assert response.headers["vary"] == "Accept"
     assert response.content == encoded
-    assert received_chunks == [[PCM[:2], PCM[2:]]]
+    assert received_pcm == [PCM]
+    assert len(owned_directories) == 1
+    assert not owned_directories[0].exists()
 
 
 def test_ogg_encoder_failure_maps_to_engine_error_and_releases_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_encoding(_: list[bytes]) -> bytes:
+    owned_directories: list[Path] = []
+
+    def fail_encoding(pcm_path: Path, _output_path: Path) -> None:
+        owned_directories.append(pcm_path.parent)
         raise AudioEncodingError
 
     monkeypatch.setattr(
         app_module,
-        "pcm_s16le_chunks_to_ogg_opus",
+        "pcm_s16le_file_to_ogg_opus",
         fail_encoding,
     )
     speech = FakeSpeech()
@@ -352,6 +380,57 @@ def test_ogg_encoder_failure_maps_to_engine_error_and_releases_admission(
     )
     assert recovered.status_code == 200
     assert len(speech.calls) == 17
+    assert len(owned_directories) == 16
+    assert all(not directory.exists() for directory in owned_directories)
+
+
+def test_owned_file_response_cleans_directory_when_send_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    owned_directory = tmp_path / "request"
+    owned_directory.mkdir()
+    audio_path = owned_directory / "speech.wav"
+    audio_path.write_bytes(b"audio")
+
+    async def exercise() -> None:
+        response = app_module._OwnedFileResponse(
+            audio_path,
+            owned_directory=owned_directory,
+            media_type="audio/wav",
+        )
+
+        async def receive() -> dict[str, object]:
+            return {
+                "type": "http.request",
+                "body": b"",
+                "more_body": False,
+            }
+
+        async def send(message: dict[str, object]) -> None:
+            if message["type"] == "http.response.body":
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": "/speech.wav",
+                    "raw_path": b"/speech.wav",
+                    "query_string": b"",
+                    "headers": [],
+                    "client": ("127.0.0.1", 1234),
+                    "server": ("testserver", 80),
+                },
+                receive,
+                send,
+            )
+
+    asyncio.run(exercise())
+    assert not owned_directory.exists()
 
 
 @pytest.mark.parametrize(
@@ -365,7 +444,7 @@ def test_ogg_encoder_failure_maps_to_engine_error_and_releases_admission(
             "invalid_request",
         ),
         (
-            ('{"text":"' + "你" * 2731 + '"}').encode(),
+            ('{"text":"' + "你" * ((16 * 1024) // 3 + 1) + '"}').encode(),
             None,
             413,
             "input_too_large",

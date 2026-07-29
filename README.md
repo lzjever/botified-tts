@@ -52,7 +52,7 @@ docker run -d \
   --env-file ./botified-tts.env \
   -p 8000:8000 \
   -v botified-tts-data:/data \
-  ghcr.io/lzjever/botified-tts:v0.2.1
+  ghcr.io/lzjever/botified-tts:v0.2.2
 ```
 
 Check readiness and failures with:
@@ -264,7 +264,7 @@ docker build --provenance=false --platform linux/amd64 -t botified-tts:local .
 ```
 
 Run it with the same env file, GPU, port, and volume from the service command
-above, replacing only `ghcr.io/lzjever/botified-tts:v0.2.1` with
+above, replacing only `ghcr.io/lzjever/botified-tts:v0.2.2` with
 `botified-tts:local`.
 
 ## API and capabilities
@@ -323,9 +323,11 @@ events, followed by `finish` or `cancel`. The server returns JSON lifecycle
 events and binary mono 48 kHz PCM s16le chunks. Text segmentation is internal,
 so callers may append token-sized input or larger chunks.
 
-HTTP text is limited to 8 KiB UTF-8. Each WebSocket append is limited to 16 KiB
-and each session to 64 KiB. Reference uploads are limited to 25 MiB. Synthesis
-capacity is bounded at 16 concurrent requests; callers should handle
-`service_busy`. Stable errors include `invalid_api_key`, `invalid_request`,
-`invalid_voice`, `input_too_large`, `service_busy`, `engine_error`, and
-WebSocket `client_too_slow`.
+HTTP text is limited to 16 KiB UTF-8. Send the complete speakable text for one
+output file in one request; the service performs sentence-aware internal
+segmentation and returns one complete WAV or Ogg. Each WebSocket append is
+limited to 16 KiB and each session to 64 KiB. Reference uploads are limited to
+25 MiB. Synthesis capacity is bounded at 16 concurrent requests; callers
+should handle `service_busy`. Stable errors include `invalid_api_key`,
+`invalid_request`, `invalid_voice`, `input_too_large`, `service_busy`,
+`engine_error`, and WebSocket `client_too_slow`.
